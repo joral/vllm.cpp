@@ -330,6 +330,20 @@ the four #41 boards are likelier-supported RDNA3/CDNA parts, but none has run
 this. Records say gfx1200; the other boards stay `PENDING-community` exactly as
 the W1 approach-(b) delta does today.
 
+**D6 — `DestroyGraph`/`EndCapture` `Check()` the destroy where CUDA silently
+ignores it.** `rocm_backend.hip`'s `DestroyGraph` and the prior-`exec_` destroy
+inside `EndCapture` both `Check()` `hipGraphExecDestroy`'s return and throw on
+failure; the CUDA leg ignores it. Destroying (or recapturing over) an exec still
+in flight would throw on HIP where CUDA would succeed silently. Not a W1 defect
+— the model-level path is not engaged (`support_static_graph_mode()` is false
+until W2), and W1's tests always `Synchronize` before destroying or recapturing.
+Found in the W1 review (`review-rocm-decode-graph-w1.md`, INFO-1).
+
+*Consequence for W2:* the decode-graph class must synchronize before destroying
+or recapturing an exec on HIP — a teardown or column-change recapture that races
+an in-flight replay is exactly the case this asymmetry would surface as a thrown
+`Check()` instead of a silent no-op.
+
 ## 9. Work breakdown
 
 - **W0 — DONE.** [#332](https://github.com/mudler/vllm.cpp/issues/332) filed and
