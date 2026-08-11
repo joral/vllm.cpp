@@ -280,6 +280,30 @@ capture, which should grow `cap` to its high-water mark. *If it does not:*
 direction. **W1 verifies this rather than trusting it**; a shape appearing only
 at capture time would be a latent, board-specific trap.
 
+**VERIFIED in W1 on gfx1200, and it is worse than written above — there are TWO
+lazy initialisations, not one.** Capturing a cold `MatmulBT` ([1,2048] x
+[2048,2048]^T) fails with all three of:
+
+```text
+vt rocm: hipMalloc: operation not permitted when stream is capturing
+vt rocm: hipFree:   operation not permitted when stream is capturing
+vt rocm: matmul: hipblasCreate: hipblas 6 (INTERNAL_ERROR)
+```
+
+`hipblasCreate` was not anticipated: the handle initialises on first use in the
+same path, so a pre-warm must cover **handle creation as well as workspace
+growth**. Both fail loudly; neither corrupts. Running the identical GEMM once
+beforehand clears both, and the captured graph then replays numerically correct
+(0.409606 vs 0.409600 expected, f32). Pinned by `ROCm backend: a pre-warmed GEMM
+captures and replays` in `test_rocm_backend.cpp`, which asserts the MITIGATION
+rather than the hazard — a future capture-safe allocator would be an
+improvement, and a test forbidding it would ratchet the wrong way.
+
+*Consequence for W2:* the decode-graph pre-warm must reach every GEMM shape the
+captured region will execute, including the first call that creates the handle.
+A shape reached only under capture still aborts, so W2's gate 4 replay count is
+what proves the pre-warm was complete.
+
 **D2 — the Qwen3-0.6B near-tie may move.** Covered by gate 3. Separate because
 it is the one outcome that could look like a regression while being nothing of
 the kind, and quietly re-baselining a golden is what "never weaken a checker"
