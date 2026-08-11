@@ -284,10 +284,15 @@ class RocmBackend final : public Backend {
     Check(hipGraphLaunch(reinterpret_cast<hipGraphExec_t>(graph), AsStream(q)),
           "hipGraphLaunch");
   }
-  // hipGraphExecDestroy is [[nodiscard]] where cudaGraphExecDestroy is not, so
-  // the CUDA leg's bare call would not compile here. Checked rather than
-  // discarded, matching Free/FreePinned above: a failing destroy is a leak this
-  // backend would rather report than swallow.
+  // hipError_t itself — not hipGraphExecDestroy specifically — is
+  // [[nodiscard]] at C++17+ ($ROCM_PATH/include/hip/hip_runtime_api.h:293-305,
+  // __HIP_NODISCARD on the `typedef enum ... hipError_t` line; the function
+  // declaration at line ~8321 carries no attribute of its own). CUDA's
+  // cudaError_t has no such attribute, so the mirrored bare call compiles
+  // there and not here: under this project's -Werror it is a hard error
+  // (-Werror,-Wunused-value). Checked rather than discarded, matching
+  // Free/FreePinned above: a failing destroy is a leak this backend would
+  // rather report than swallow.
   void DestroyGraph(void* graph) override {
     if (graph != nullptr) {
       Check(hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph)),
