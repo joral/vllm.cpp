@@ -288,11 +288,16 @@ class RocmBackend final : public Backend {
   // [[nodiscard]] at C++17+ ($ROCM_PATH/include/hip/hip_runtime_api.h:293-305,
   // __HIP_NODISCARD on the `typedef enum ... hipError_t` line; the function
   // declaration at line ~8321 carries no attribute of its own). CUDA's
-  // cudaError_t has no such attribute, so the mirrored bare call compiles
-  // there and not here: under this project's -Werror it is a hard error
-  // (-Werror,-Wunused-value). Checked rather than discarded, matching
-  // Free/FreePinned above: a failing destroy is a leak this backend would
-  // rather report than swallow.
+  // cudaError_t has no such attribute, so the mirrored bare call diagnoses
+  // here (-Wunused-value) and not there. This project's -Werror does NOT
+  // reach it, though: vllm_cpp_set_warnings (cmake/CompilerWarnings.cmake)
+  // gates -Werror on COMPILE_LANGUAGE CXX/OBJCXX/CUDA only, no HIP branch, so
+  // a bare call here would warn, not fail the build (verified against the
+  // actual compile_commands.json entry for this file, and by building a
+  // scratch bare-call mutation through this project's own cmake target).
+  // Checked anyway, matching Free/FreePinned above: a failing destroy is a
+  // leak this backend would rather report than swallow, independent of what
+  // the build flags happen to enforce.
   void DestroyGraph(void* graph) override {
     if (graph != nullptr) {
       Check(hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph)),
