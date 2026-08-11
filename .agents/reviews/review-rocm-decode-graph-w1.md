@@ -5,16 +5,23 @@
 **Diff range:** `a706350d..150b8f40` (3 files, +260/-4)
 **Board:** AMD Radeon RX 9060 XT, `gfx1200`, Navi 44, RDNA4, discrete, ROCm 7.2.3
 
+**Revision history.** This file was originally written into the reviewed
+worktree (`rocm-w1`), which violates `REV-WORKTREE`. Corrected and relocated
+to the reviewer's own worktree after the author identified two issues in the
+original: an incorrect evidence paragraph in LOW-1, and the worktree placement.
+The original LOW-1 evidence ("compiled with 0 warnings") was wrong — the
+mutation produces a warning that was missed by only scanning the build tail.
+
 ### `REV-STATIC` — Complete
 
-**Faithfulness to the CUDA mirror (`cuda_backend.cu`).** I diffed all six virtuals
-line by line against the `--- CUDA-graph capture/replay` block. The port is
-call-for-call. Three deviations exist, all identified and assessed:
+**Faithfulness to the CUDA mirror (`cuda_backend.cu`).** I diffed all six
+virtuals line by line against the `--- CUDA-graph capture/replay` block. The
+port is call-for-call. Three deviations exist, all identified and assessed:
 
 | Deviation | Assessment |
 |---|---|
 | `hipGraphInstantiate` 5-arg `(&exec_, graph, nullptr, nullptr, 0)` vs CUDA 3-arg `(&exec_, graph, 0)` | **Correct.** Verified the ROCm 7.2.3 header signature: `hipGraphInstantiate(hipGraphExec_t*, hipGraph_t, hipGraphNode_t*, char*, size_t)`. Passing `nullptr, nullptr, 0` is the correct no-error-node, no-log-buffer instantiation. |
-| `Check()` on `hipGraphExecDestroy`/`hipGraphDestroy` where CUDA ignores returns | **Design choice**, consistent with `Free`/`FreePinned` in the same file. However — see finding LOW-1: the stated justification is factually wrong. |
+| `Check()` on `hipGraphExecDestroy`/`hipGraphDestroy` where CUDA ignores returns | **Design choice**, consistent with `Free`/`FreePinned` in the same file. The code comment's stated justification is misattributed — see LOW-1. |
 | `VT_BENCH_PROFILE_CONTROL` omitted from `ReplayGraph` | **Deliberate**, spec §2, documented in code comment. |
 
 **Claim verification:**
@@ -89,31 +96,62 @@ correct flags; the gate results are valid.
 
 ---
 
-**LOW-1 — False `[[nodiscard]]` claim in code comment and commit message**
+**LOW-1 — Code comment misattributes the `[[nodiscard]]` mechanism; evidence
+corrected after author feedback**
 
 `src/vt/rocm/rocm_backend.hip`, comment above `DestroyGraph`:
 
-> `hipGraphExecDestroy is [[nodiscard]] where cudaGraphExecDestroy is not, so the CUDA leg's bare call would not compile here.`
+> `hipGraphExecDestroy is [[nodiscard]] where cudaGraphExecDestroy is not, so
+> the CUDA leg's bare call would not compile here.`
 
-Same claim repeated in the commit message:
+Same claim in the commit message.
 
-> `hipGraphExecDestroy and hipGraphDestroy are [[nodiscard]] where their cudaGraph* counterparts are not, so the mirrored bare calls do not compile.`
+**Corrected evidence.** The original review stated the bare call "compiled
+with 0 warnings" — that was wrong. A bare `hipGraphExecDestroy` call produces
+a `-Wunused-value` warning:
 
-**Evidence:** I compiled a bare
-`hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph))` call (no `Check`,
-no `(void)` cast) under the same `-Werror` HIP build. It compiled with **0
-warnings**. The ROCm 7.2.3 header declares `hipError_t hipGraphExecDestroy(hipGraphExec_t graphExec)`
-with no `[[nodiscard]]` attribute. Same for `hipGraphDestroy`.
+```
+rocm_backend.hip:293:7: warning: ignoring return value of type 'hipError_t'
+declared with 'nodiscard' attribute [-Wunused-value]
+```
 
-**Violated rule:** Code comments and commit messages must state accurate
-technical facts. The `Check()` is a valid design choice (consistency with
-`Free`/`FreePinned`), but the stated justification is false — a future
-maintainer would be misled into thinking the check is mandatory.
+The `[[nodiscard]]` is correct and real, but the mechanism is misattributed:
+the attribute is on the **return type** `hipError_t`, not on the function
+`hipGraphExecDestroy` itself. ROCm 7.2.3 (`hip_runtime_api.h:305`):
 
-**Required remediation:** Rewrite the comment to justify `Check()` on its
-actual merits — "Checked, matching Free/FreePinned in the same file: a failing
-destroy is a leak this backend would rather report than swallow" — without the
-false `[[nodiscard]]` claim.
+```c
+#if __cplusplus >= 201703L
+#define __HIP_NODISCARD [[nodiscard]]
+...
+typedef enum __HIP_NODISCARD hipError_t {
+```
+
+Every HIP API returning `hipError_t` inherits `[[nodiscard]]` at C++17+, so
+the function-level declaration (`hip_runtime_api.h:8321`) is bare.
+CUDA's `cudaError_t` carries no such attribute, which is exactly why the
+mirrored bare calls compile silently on the CUDA side.
+
+**One nuance the author should be aware of:** under the project's actual CMake
+flags, the warning is **not** promoted to an error. `vllm_cpp_set_warnings`
+(`cmake/CompilerWarnings.cmake`) applies `-Wall -Wextra -Werror` only to
+`COMPILE_LANGUAGE:CXX`, `OBJCXX`, and `CUDA` — there is no `HIP` generator
+expression. The actual compile command for `rocm_backend.hip` (verified via
+`cmake --build -v`) contains no `-Werror`, so a bare call would compile with
+a warning but not fail the build. With explicit `-Werror` (as in the author's
+standalone `hipcc` test) it is indeed a hard error.
+
+**Violated rule:** Code comments must state accurate technical facts. The
+comment's *conclusion* — that a CUDA-shaped bare call produces a diagnostic
+here and not on CUDA — is correct. The *attribution* is wrong (function, not
+type), and the claim "would not compile" is overstated under the project's
+actual flags (compiles with a warning).
+
+**Required remediation:** Correct the attribution from function to return
+type — e.g., "`hipError_t` is `[[nodiscard]]` at C++17+ (via
+`__HIP_NODISCARD` on the enum, `hip_runtime_api.h:305`), so every HIP API
+returning it diagnoses an ignored result; `cudaError_t` carries no such
+attribute, which is why the CUDA leg's bare calls compile silently." Keep the
+compile-failure rationale — it is true and load-bearing.
 
 ---
 
@@ -157,6 +195,6 @@ hipGraph, with correct API adaptations (`hipGraphInstantiate` 5-arg form). Every
 guarantee the tests claim to pin — re-execution over persistent buffers (the
 load-bearing one), recorded-not-executed, handle API path — is caught by
 mutation testing. The declared gates (1, 2, 7) pass cleanly with only
-confirmed-known-unrelated failures. The one substantive finding (LOW-1: false
-`[[nodiscard]]` comment) is a documentation inaccuracy that does not affect
-correctness.
+confirmed-known-unrelated failures. The one substantive finding (LOW-1:
+misattributed `[[nodiscard]]` in the comment) is a documentation inaccuracy
+that does not affect correctness.
