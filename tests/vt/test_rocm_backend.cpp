@@ -342,26 +342,33 @@ TEST_CASE("ROCm backend: graph capture/replay re-executes captured ops") {
   CHECK(back.back() == 0x22);
 
   // Handle variant — the path decode graphs actually take, since they keep one
-  // exec per padded batch size rather than a single stored graph.
+  // exec per padded batch size rather than a single stored graph. Captures
+  // into a DIFFERENT destination (dst2) than the stored-graph path above
+  // (dst), not the same op replayed twice: a mutation that returns the stale
+  // member exec_ (still the stored-graph path's Copy(dst, src)) instead of the
+  // freshly captured local exec must be distinguishable from the correct
+  // behaviour, and only fails here because the two graphs write different
+  // buffers.
+  void* dst2 = rocm.Alloc(kBytes);
   rocm.Copy(q, src, pattern_a.data(), kBytes);
-  rocm.Memset(q, dst, 0, kBytes);
+  rocm.Memset(q, dst2, 0, kBytes);
   rocm.Synchronize(q);
 
   rocm.BeginCapture(q);
-  rocm.Copy(q, dst, src, kBytes);
+  rocm.Copy(q, dst2, src, kBytes);
   void* graph = rocm.EndCaptureGraph(q);
   REQUIRE(graph != nullptr);
 
   rocm.ReplayGraph(q, graph);
   rocm.Synchronize(q);
-  rocm.Copy(q, back.data(), dst, kBytes);
+  rocm.Copy(q, back.data(), dst2, kBytes);
   rocm.Synchronize(q);
   CHECK(back.front() == 0x11);
 
   rocm.Copy(q, src, pattern_b.data(), kBytes);
   rocm.ReplayGraph(q, graph);
   rocm.Synchronize(q);
-  rocm.Copy(q, back.data(), dst, kBytes);
+  rocm.Copy(q, back.data(), dst2, kBytes);
   rocm.Synchronize(q);
   CHECK(back.front() == 0x22);
   CHECK(back.back() == 0x22);
@@ -369,6 +376,7 @@ TEST_CASE("ROCm backend: graph capture/replay re-executes captured ops") {
   rocm.DestroyGraph(graph);
   rocm.Free(src);
   rocm.Free(dst);
+  rocm.Free(dst2);
   rocm.DestroyQueue(q);
 }
 
