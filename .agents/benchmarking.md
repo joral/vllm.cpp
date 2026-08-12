@@ -56,6 +56,59 @@ were host-side waste, not slow math.
 Before accepting a gap as "GPU-bound", trace both implementations with the same
 tool on the same workload and compare what actually ran.
 
+### Same-tool tracing when the oracle only runs in a container (ROCm)
+
+The rule above is hard to obey on ROCm: vLLM runs in a container, our binary is
+built outside it, and a profiler installed on each side is two tools, not one.
+The answer is to run OUR binary INSIDE the oracle's container, so one
+`rocprofv3` and one ROCm runtime observe both. Both AMD images already ship
+`rocprof`, `rocprofv2` and `rocprofv3` at `/opt/rocm/bin` — nothing to install.
+
+On NixOS this needs four things, and each was found by hitting it:
+
+1. **Bind-mount the store**: `-v /nix:/nix:ro`. Our ELF interpreter and RPATH
+   are `/nix/store` paths; with the store visible they resolve inside the
+   container unchanged.
+2. **Scope `LD_LIBRARY_PATH` to the CHILD, not the container.** Setting it via
+   `docker run -e` puts our glibc in front of the container's own tools and
+   breaks them — `rocprofv3` is a script, and `/usr/bin/env` dies with
+   `undefined symbol: __tunable_is_initialized`. Wrap the target instead:
+   `rocprofv3 … -- bash -c 'export LD_LIBRARY_PATH=…; exec <our-binary> …'`, so
+   the profiler starts clean and only the traced process is affected.
+3. **Give the child BOTH library sets.** Ours (build dir, the hipBLAS overlay,
+   and the `ldd`-derived nix dirs) AND the container's
+   (`/opt/rocm/lib:/usr/lib/x86_64-linux-gnu`) — `rocprofv3` injects a library
+   into the target that needs container deps such as `libsqlite3.so.0`. Derive
+   the nix set from the binary itself:
+
+   ```sh
+   ldd <binary> | grep -oE '=> /nix/store/[^ ]+' \
+     | sed 's|^=> ||' | xargs -n1 dirname | sort -u
+   ```
+
+   Take `dirname` of the resolved path. A regex ending in `/lib` silently
+   mismatches — greedy `[^ ]+` matches inside `…/libfoo.so` — producing
+   `/lib/lib` paths that resolve to nothing and fail confusingly later.
+4. **Mount the model and an output dir**, and `chmod 777` the output dir — the
+   container writes the `.db` as root.
+
+Sanity-check the plumbing by running the binary WITHOUT the profiler first. It
+should produce the same tokens it produces natively; if it does not, the
+environment substitution changed behaviour and nothing measured afterwards is
+comparable.
+
+Note this runs our binary against the CONTAINER's ROCm, not the host's. Same
+version and soname is what makes it sound (verify both), and it is arguably
+more correct for a comparison — but if a profile shows something surprising,
+that substitution is the first thing to suspect.
+
+Results land in a rocpd SQLite `*_results.db`. The `top_kernels` view gives
+`name, total_calls, total_duration, average, percentage`; the `kernels` view has
+per-dispatch `start`/`end`, which is what the decode-only windowing above needs.
+The oracle's trace in particular is dominated by model load and graph-capture
+warmup — bucket dispatch counts over time to find the phase boundary, then take
+the final burst. Skipping that step compares our decode against their startup.
+
 ## Recording it
 
 Record the exact build and run recipe, revisions, model hashes, environment,
