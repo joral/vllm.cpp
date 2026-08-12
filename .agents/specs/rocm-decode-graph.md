@@ -66,13 +66,15 @@ and less elsewhere. The scaling curve below is real and reproduced; the causal
 attribution to launch overhead is refuted. Kept unedited because a
 pre-registered prediction that is quietly rewritten after the result is worthless.
 
-**It also bounds the win.** Fitting `ratio = alpha + beta / (hidden x inter)`
-across the three points gives **alpha ~= 1.36x** (size-independent: kernel
-quality, inductor fusion, the Triton attention path) and **beta ~= 1.65** in
-units where 0.6B's `hidden x inter` = 1 — an overhead contribution of ~1.65x at
-0.6B, ~0.41x at 1.7B, ~0.21x at 4B. So roughly half the 0.6B gap is fixed
-overhead, and the expected outcome is all three sizes converging on **~1.36x**:
-a real win, and **not parity**. A ~1.4x residual would remain.
+**It also bounded the win — WRONGLY; this paragraph is the falsified
+prediction, preserved verbatim.** Fitting `ratio = alpha + beta / (hidden x
+inter)` across the three points gave **alpha ~= 1.36x** (size-independent:
+kernel quality, inductor fusion, the Triton attention path) and **beta ~= 1.65**
+in units where 0.6B's `hidden x inter` = 1 — an overhead contribution of ~1.65x
+at 0.6B, ~0.41x at 1.7B, ~0.21x at 4B. The reasoning WAS that roughly half the
+0.6B gap is fixed overhead, so the expected outcome WAS all three sizes
+converging on **~1.36x**. **That did not happen** — measured convergence was
+0-2%, i.e. none. See gate 5.
 
 Treat the fit as provisional. An earlier two-point version gave `alpha ~= 1.54x`;
 Qwen3-4B then measured 1.46x, below that asymptote, which a curve cannot do, so
@@ -346,9 +348,19 @@ mutations that must turn it red, in a scratch copy, restored byte-for-byte:
 
    | Model | capture ON | capture OFF | delta | predicted |
    |---|---|---|---|---|
-   | Qwen3-0.6B | 193.67 tok/s | 187.62 tok/s | **+3.2%** | ~2.2x |
+   | Qwen3-0.6B | 193.67 tok/s | 187.62 tok/s | +3.2% (see below) | ~2.2x |
    | Qwen3-1.7B | 148.72 tok/s | 147.80 tok/s | **+0.6%** | ~1.4x |
    | Qwen3-4B | 100.22 tok/s | 101.27 tok/s | **-1.0%** | ~1.07x |
+
+   **The 0.6B +3.2% is the top of the noise band, not a signal.** An independent
+   reviewer re-ran the same A/B and measured **+0.7%** (ON 190.91, OFF 189.58,
+   3 reps). The discrepancy is one low sample in this spec's OFF arm — the three
+   OFF reps were 191.88 / **179.29** / 191.70, and dropping that outlier moves
+   this spec's own delta to **+1.0%**. Pooling both sets of reps gives
+   **ON 192.29 / OFF 188.60, +2.0%**. Treat the honest figure as **0-2%,
+   indistinguishable from zero**; the conclusion and the §10 stop condition are
+   unchanged either way, but +3.2% should not be quoted as if it were a
+   measured win.
 
    Against §1's oracle figures the ratios are 2.85x / 1.93x / 1.43x, versus
    2.99x / 1.90x / 1.46x before this change — i.e. **unmoved**. §10 requires
@@ -520,8 +532,10 @@ an in-flight replay is exactly the case this asymmetry would surface as a thrown
   `platforms/rocm.cpp`, mirroring `rocm.py:1001-1002` (unconditional `True`,
   same shape as `cuda.py:662`, against `interface.py:1191`'s `False` default).
   One line of product code and one assertion; no model-level edit was needed,
-  which is the seam claim in §2 holding up. Gates 3 and 4 met above, on
-  Qwen3-0.6B AND Qwen3.5-0.8B. *Gate: 3, 4.*
+  which is the seam claim in §2 holding up. Gates 3 and 4 met above, on FOUR
+  models — Qwen3-0.6B/1.7B/4B dense and Qwen3.5-0.8B GDN hybrid. (An earlier
+  revision of this line said two; gate 3's table is and was the authoritative
+  list. Caught in review.) *Gate: 3, 4.*
 - **W3 — STOPPED at the §10 threshold, result recorded.** Gate 5 ran on all
   three sizes, same-binary A/B, 2-3 reps. Capture moves throughput by
   +3.2% / +0.6% / -1.0%; the predicted ~1.36x convergence did not happen and
