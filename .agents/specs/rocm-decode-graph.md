@@ -236,9 +236,83 @@ mutations that must turn it red, in a scratch copy, restored byte-for-byte:
    again. **Required outcome is an honest report, not a specific token** — re-run
    the same real-oracle comparison that resolved it before and state what it
    does. A flip the oracle also produces is not a regression; a silent one is.
+   **MET in W2, on four models rather than the one required.** Capture changed
+   nothing on any of them, byte-for-byte:
+
+   | Model | Path | capture OFF (`VLLM_CPP_CUDAGRAPH=0`) | capture ON |
+   |---|---|---|---|
+   | Qwen3-0.6B | dense | `' 1000000'` | identical |
+   | Qwen3-1.7B | dense | `' Paris. 1. What is the capital of France? 2. What'` | identical, 16/16 |
+   | Qwen3-4B | dense | `' in which country? The capital of France is in France. But wait, that'` | identical, 16/16 |
+   | Qwen3.5-0.8B | GDN hybrid | `':\nA. Paris\nB. London\nC. London\nD.'` | identical, 16/16 |
+
+   The OFF runs are a real negative control, not an assumption:
+   `VLLM_CPP_CUDAGRAPH=0` reports `0 total replays across 0 captured size(s)`
+   while the ON runs report a capture and a non-zero count, so the two arms
+   genuinely differ in execution path.
+
+   Qwen3-0.6B's value is unchanged from the pre-W1 figure this spec's sibling
+   record already had, so there is no flip to explain, silent or otherwise.
+   Qwen3.5-0.8B is the stronger signal and was not in the original plan: it runs
+   the GDN stack, so capture wraps a far larger kernel surface than the dense
+   path, and it is still exact. Gemma-3-1B is NOT a check here — it has no
+   decode-graph class (`grep -rln DecodeGraph src/vllm/model_executor/models/`),
+   so capture cannot reach it.
+
+   **Against the oracle:** in the production configuration AGENTS.md mandates as
+   the honest denominator, our ROCm agrees with the pinned oracle EXACTLY on
+   this prompt — `' 1000000'`, ids `[220, 16, 15, 15, 15, 15, 15, 15]`. That
+   agreement is real but must not be oversold; see the 2x2 below, which shows
+   the oracles do not have one answer to agree with.
+
+   **The full 2x2 was then measured, and it refutes the obvious explanation.**
+   [rocm-gfx1200-m2-correctness.md](rocm-gfx1200-m2-correctness.md) concludes
+   "the real reference implementation does not agree with itself across its own
+   versions", without recording the graph configuration of its oracle runs
+   (`grep -i 'eager\|cudagraph\|graph'` over that file returns nothing). The
+   tempting reading — that its VERSION disagreement is really CAPTURE CONFIG —
+   was written down as a hypothesis with its outcomes pre-registered, then
+   tested by pulling the tier-1 image
+   (`rocm/vllm:rocm7.13.0_gfx120X-all_ubuntu24.04_py3.13_pytorch_2.10.0_vllm_0.19.1`,
+   `vllm 0.19.1+rocm7.13.0rc2`) and running both builds both ways. **The
+   hypothesis is WRONG.** Same board, same prompt, same greedy settings:
+
+   | Build | `enforce_eager=True` | `enforce_eager=False` (production) |
+   |---|---|---|
+   | vLLM 0.19.1 | `' 1000000'` | `' Paris, and the capital of the United'` |
+   | vLLM `555967922` (pin) | `' Paris. The capital of the United States'` | `' 1000000'` |
+
+   Perfectly ANTI-SYMMETRIC. Both builds flip on capture config, in OPPOSITE
+   directions, so version and capture config are independent contributors and
+   neither reduces to the other. The sibling record's version framing therefore
+   STANDS — and is in fact understated, because the same build also disagrees
+   with itself. Reproduced: 3/3 on the 0.19.1 graphs-on cell, and the pin's
+   graphs-on cell repeats.
+
+   The load-bearing consequence for us: **our ROCm output is capture-INVARIANT
+   where both real vLLM builds are not.** Ours is `' 1000000'` in all
+   configurations; each oracle changes answer when its graph mode changes. On
+   this prompt our implementation is the more stable of the three, which is a
+   fact about a 0.07-logit near-tie rather than a quality claim — but it does
+   mean gate 3 cannot be framed as "we match the oracle": there is no single
+   oracle answer to match.
+
 4. **`VT_DECODE_GRAPH_STATS=1`** must show a non-zero replay count, proving
    capture engaged rather than falling through to eager — otherwise gate 5's
    numbers are meaningless.
+
+   **MET in W2.** Qwen3-0.6B, 4 prompts / 32 output tokens each:
+
+   ```text
+   [Qwen3DenseDecodeGraph] captured dense decode graph for padded size S=1 (real B=1)
+   [Qwen3DenseDecodeGraph] dense decode graph: 123 total replays across 1 captured size(s)
+   ```
+
+   Qwen3.5-0.8B likewise captures and replays
+   (`[DenseDecodeGraph] Qwen3.5 dense decode graph: 6 total replays`). D1's
+   pre-warm mitigation therefore holds against a REAL model, not just the W1
+   micro-test: the captured region contains every projection GEMM and none of
+   them hit `hipMalloc`/`hipFree`/`hipblasCreate` mid-capture.
 5. **Performance, measured against a pre-registered prediction.** Re-run §1 on
    all three sizes, same-binary A/B (capture ON vs `VLLM_CPP_CUDAGRAPH=0`), idle
    box, reproduced 2-3x per AGENTS.md. Written down before the work so it cannot
@@ -350,8 +424,12 @@ an in-flight replay is exactly the case this asymmetry would surface as a thrown
   carried in the intake table and this header; this spec committed. No code.
 - **W1 — backend seam + micro-test.** §5 port map, §6 test, RED-first. Verify D1
   with a capture around a GEMM. *Gate: 1, 2, 7.*
-- **W2 — flip `support_static_graph_mode()`, run a real model.** Qwen3-0.6B end
-  to end with capture engaged. *Gate: 3, 4. Nothing proceeds past a red.*
+- **W2 — DONE.** `support_static_graph_mode()` overridden true in
+  `platforms/rocm.cpp`, mirroring `rocm.py:1001-1002` (unconditional `True`,
+  same shape as `cuda.py:662`, against `interface.py:1191`'s `False` default).
+  One line of product code and one assertion; no model-level edit was needed,
+  which is the seam claim in §2 holding up. Gates 3 and 4 met above, on
+  Qwen3-0.6B AND Qwen3.5-0.8B. *Gate: 3, 4.*
 - **W3 — measure against the prediction.** Gate 5 + 6, all three sizes,
   same-binary A/B, idle box, 2-3x reproduced. Convergence is the result, not any
   single ratio. Record a miss as readily as a hit.

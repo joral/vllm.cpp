@@ -57,6 +57,25 @@ class RocmPlatform final : public Platform {
   // whether it may treat host and device memory as one.
   bool is_integrated_gpu() const override { return backend().UnifiedMemory(); }
 
+  // rocm.py:1001-1002 support_static_graph_mode -> True, unconditional, exactly
+  // as cuda.py:662 does and against interface.py:1191's False default. Mirrored
+  // unconditionally rather than probed: upstream does not gate it on arch, and
+  // hipGraph is a core HIP runtime facility, not a gfx-specific extension.
+  //
+  // This is the SECOND of the two flags a decode-graph class needs; the other is
+  // Backend::SupportsGraphCapture(), true for kROCM since W1. Neither the models
+  // nor this file tests is_cuda() anywhere, so flipping this alone is what makes
+  // Qwen3 dense/MoE, DeepSeek-V2/V4, Voxtral and Laguna capture on ROCm.
+  //
+  // The capture contract the decode-graph classes must honour on HIP is stricter
+  // than on CUDA in two measured ways, both recorded in
+  // .agents/specs/rocm-decode-graph.md: the pre-warm has to cover hipBLASLt
+  // HANDLE creation as well as workspace growth (D1 — hipblasCreate initialises
+  // lazily in the GEMM path and is illegal mid-capture), and teardown must
+  // synchronise before destroying an exec, because this backend Check()s
+  // hipGraphExecDestroy where the CUDA leg ignores its return (D6).
+  bool support_static_graph_mode() const override { return true; }
+
   // --- W0 placeholders. Each is the BASE class answer, stated explicitly here
   // --- with what would change it, so nobody has to guess whether the omission
   // --- was considered.
@@ -64,9 +83,6 @@ class RocmPlatform final : public Platform {
   // supports_fp8() stays false: gfx942/gfx950 have hardware fp8 and rocm.py lists
   //   "fp8" in supported_quantization (rocm.py:457-467), but we have no ROCm fp8
   //   kernel, and this predicate gates a fused path that would then not exist.
-  // support_static_graph_mode() stays false: hipGraph is the mapping and is not
-  //   implemented. Capture that bakes a wrong address is a silent correctness
-  //   bug, so this flips only alongside a real capture implementation.
   // needs_weight_staging() stays false: this is the memory-model POLICY that
   //   selects the device-resident forward over the host-resident reference path.
   //   HIP's programming model does stage (hipMalloc hands back a distinct

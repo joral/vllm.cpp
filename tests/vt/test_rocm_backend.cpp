@@ -283,6 +283,13 @@ TEST_CASE("the ROCm platform self-registers and is selected over CPU") {
   // absent. When M3 lands ROCM_ATTN/TRITON_ATTN this flips, and this assertion
   // is the reminder to update it deliberately.
   CHECK(rocm.get_attn_backend_priority({}).empty());
+
+  // W2: mirrors upstream rocm.py:1001-1002, which returns True unconditionally
+  // — the same shape as cuda.py:662 and against interface.py:1191's False
+  // default. Paired with Backend::SupportsGraphCapture() (W1), this is what
+  // lets a decode-graph class engage; both must be true, and neither model nor
+  // platform code tests is_cuda() anywhere.
+  CHECK(rocm.support_static_graph_mode());
 }
 
 // Mirrors "CUDA backend: graph capture/replay re-executes captured ops" in
