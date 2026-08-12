@@ -59,6 +59,13 @@ like a confound but are not — launches and compute both scale with layers, so
 the layer count cancels and `L/C` depends only on per-layer width
 (`1 / (hidden x intermediate)`). All three sit on one curve.
 
+**SUPERSEDED BY MEASUREMENT — read gate 5 before trusting anything below.** The
+fit in the next two paragraphs predicted that capture would recover roughly half
+the 0.6B gap. W3 measured the opposite: capture moves throughput by ~3% at 0.6B
+and less elsewhere. The scaling curve below is real and reproduced; the causal
+attribution to launch overhead is refuted. Kept unedited because a
+pre-registered prediction that is quietly rewritten after the result is worthless.
+
 **It also bounds the win.** Fitting `ratio = alpha + beta / (hidden x inter)`
 across the three points gives **alpha ~= 1.36x** (size-independent: kernel
 quality, inductor fusion, the Triton attention path) and **beta ~= 1.65** in
@@ -332,6 +339,91 @@ mutations that must turn it red, in a scratch copy, restored byte-for-byte:
    fixed-overhead term is smaller than the fit implies, and redirect to D4.
    **Do not describe any outcome as parity**; ~1.36x is the predicted floor for
    this change alone.
+
+   **FAILED. The prediction is falsified and the §10 stop condition has
+   triggered.** Same-binary A/B on gfx1200, 128in/128out batch 8, capture ON vs
+   `VLLM_CPP_CUDAGRAPH=0`, 3 reps at 0.6B and 2 at the others:
+
+   | Model | capture ON | capture OFF | delta | predicted |
+   |---|---|---|---|---|
+   | Qwen3-0.6B | 193.67 tok/s | 187.62 tok/s | **+3.2%** | ~2.2x |
+   | Qwen3-1.7B | 148.72 tok/s | 147.80 tok/s | **+0.6%** | ~1.4x |
+   | Qwen3-4B | 100.22 tok/s | 101.27 tok/s | **-1.0%** | ~1.07x |
+
+   Against §1's oracle figures the ratios are 2.85x / 1.93x / 1.43x, versus
+   2.99x / 1.90x / 1.46x before this change — i.e. **unmoved**. §10 requires
+   Qwen3-0.6B to fall below ~2.2x; it sits at 2.85x. W3 stops here.
+
+   **This is not a measurement artifact.** Gate 4 holds at exactly this config —
+   `captured dense decode graph for padded size S=8 (real B=8)` with **126 total
+   replays** over the 128 decode steps, so nearly every step of the measured run
+   replayed a graph. Capture is engaged and is simply not where the time goes.
+
+   **Nor is it a batch-size artifact.** Per-step launch cost is fixed per STEP,
+   so at batch 8 it is amortised over 8 tokens and capture's benefit is at its
+   most diluted. The best case for the hypothesis is single-stream, where the
+   spec's own §1 figures show the worst gap (our TPOT 13.55 ms vs oracle
+   5.21 ms). Measured there too, Qwen3-0.6B at concurrency 1:
+
+   | | tok/s | TPOT |
+   |---|---|---|
+   | capture ON | 47.29, 50.53 | 14.98, 13.82 ms |
+   | capture OFF | 49.94, 49.71 | 13.99, 13.99 ms |
+
+   No gain in the configuration most favourable to it. TPOT reproduces §1's
+   13.55 ms. A ~14 ms decode step for a 0.6B model that does not move when
+   essentially all per-step launch work is removed points at the GPU work
+   itself, not at the host.
+
+   **The prerequisite this row skipped, now taken.** `cuda_backend.cu`'s capture
+   comment cites "the measured 88%-of-wall host-API overhead" — a CUDA
+   measurement. No equivalent was ever taken on ROCm. §1 INFERRED
+   launch-boundness from a scaling curve rather than measuring it. Measured
+   directly (Qwen3-0.6B, 4 prompts, 128/128, concurrency 1, `bash time`):
+
+   | | wall | user | sys | total CPU |
+   |---|---|---|---|---|
+   | capture ON | 11.31 s | 13.81 s | 14.09 s | 27.9 s (247%) |
+   | capture OFF | 11.36 s | 13.78 s | 13.54 s | 27.3 s (240%) |
+
+   **Capture removes no host CPU work.** Collapsing hundreds of per-step
+   launches into one call should cut system time visibly; instead `sys` is
+   marginally HIGHER with capture on. The host is not spending its time issuing
+   launches, which is why replaying a graph changes nothing.
+
+   The same numbers name the next hypothesis. ~2.5 cores are burned to produce
+   ~50 tok/s, with `sys` exceeding wall — the signature of spin-wait/polling on
+   synchronisation, not of work issuance. So the D4 profiling spec has two
+   ordered questions, neither of which is "is launch overhead the problem"
+   (answered: no): (1) where does the ~14 ms decode step go on the DEVICE, via a
+   same-tool `rocprof` trace of both sides; (2) what is burning ~2.5 cores of
+   host CPU, and whether that contends with the GPU work.
+
+   **What it refutes.** §1 argued from a monotonic 2.99 -> 1.90 -> 1.46 fall
+   across a 7.9x compute span that roughly half the 0.6B gap is fixed per-step
+   launch overhead, recoverable by capture. The direct intervention says
+   otherwise: removing essentially all per-step launch work changes throughput
+   by ~3% at the size where the fit predicted the most headroom. The scaling
+   curve is real, but launch overhead is not what produces it. D4's caution —
+   "evidenced, not profiled", say "consistent with", not "because of" — was
+   correct, and this is the case it was written for.
+
+   **Not a ceiling** (AGENTS.md: never declare one). The gap is unexplained, not
+   irreducible. The next traceable hypothesis is the one D4 already names and
+   this result now makes mandatory rather than optional: a same-tool `rocprof`
+   trace of both sides on the identical workload, to find where decode time
+   actually goes. Candidates worth ordering by that trace rather than by
+   argument: per-kernel efficiency on RDNA4, hipBLASLt algorithm selection for
+   these shapes, attention-path cost, and memory-system behaviour. Nothing here
+   licenses a claim that gfx1200 cannot close the gap.
+
+   **Caveat on the denominator.** §1's oracle figures come from
+   `vllm bench throughput`. An ad-hoc re-measure of the pinned oracle during
+   this gate (a `llm.generate` loop with a warm pass, NOT methodologically
+   matched) read 1029 tok/s at 0.6B, which would make the ratio worse, not
+   better. The A/B above is unaffected — it is one binary, one box, one flag —
+   but a matched oracle re-measure is owed before any ratio here is cited as
+   accepted.
 6. **`GetReferenceTierHits()` == 0** in any perf measurement — structurally
    impossible on a discrete board, assert anyway.
 7. **Records green:** `agent-preflight.sh --staged`, `check-agent-record.py`,
@@ -430,9 +522,12 @@ an in-flight replay is exactly the case this asymmetry would surface as a thrown
   One line of product code and one assertion; no model-level edit was needed,
   which is the seam claim in §2 holding up. Gates 3 and 4 met above, on
   Qwen3-0.6B AND Qwen3.5-0.8B. *Gate: 3, 4.*
-- **W3 — measure against the prediction.** Gate 5 + 6, all three sizes,
-  same-binary A/B, idle box, 2-3x reproduced. Convergence is the result, not any
-  single ratio. Record a miss as readily as a hit.
+- **W3 — STOPPED at the §10 threshold, result recorded.** Gate 5 ran on all
+  three sizes, same-binary A/B, 2-3 reps. Capture moves throughput by
+  +3.2% / +0.6% / -1.0%; the predicted ~1.36x convergence did not happen and
+  Qwen3-0.6B stayed at 2.85x against §1's oracle figure, above the ~2.2x stop
+  threshold. The miss is recorded in gate 5 above, not buried. **W3 does not
+  iterate here**; §10 redirects to D4 profiling as the next spec.
 - **W4 — records.** This spec's `## Outcome`, `backend-matrix.md`,
   `docs/ROCM.md` §5 M3, `docs/BENCHMARKS.md` if gate 5 yields an accepted
   measurement, `NOW.md` if the row's lifecycle state moves.
