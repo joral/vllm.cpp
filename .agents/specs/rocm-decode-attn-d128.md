@@ -40,8 +40,9 @@ decode-opt kernel on elements-per-lane and add an `EPL=4` instantiation.
 So the ROCm change is a **mirror of merged work**, not new design. It adopts
 the merged arm's flag, default, and stated reason verbatim
 (`cuda_paged_attn.cu`, `DecodeD128Enabled`). Where the two backends' facts
-differ — and they do, sharply, in §5 — the difference is recorded rather than
-averaged away.
+differ — and they do, sharply in §5's measurement and materially in §7's dtype
+coverage, where this arm is **narrower** than the CUDA one — the difference is
+recorded rather than averaged away.
 
 ## 2. Why `PagedAttnOnline` was what ran
 
@@ -215,6 +216,28 @@ cross-device test and its two flag-on ctest registrations, and this spec.
 - **rocWMMA for `d=128`.** A second, independently-flagged kernel for the same
   shape — its own spec (`rocm-decode-attn-d128-wmma.md`, landing separately),
   its own claim, its own issue.
+- **Every dtype combination except all-`bf16` — and here the ROCm arm is
+  narrower than the CUDA arm it mirrors.** `bf16_decode_opt` requires `query`,
+  `k_cache`, `v_cache` and `out` to *all* be `kBF16`, and the vectorized helpers
+  are bf16 by construction (`LoadRowEplBf16`/`StoreRowEplBf16`). The fallback
+  dispatch supports **five** combinations — `bf16/bf16/bf16`, `f32/f32/f32`,
+  `bf16/bf16/f32`, `bf16/f32/bf16`, `f32/bf16/f32` — so **four of the five still
+  fall to `PagedAttnOnline` at `d=128`**, which is the exact fallback this arm
+  exists to get off.
+
+  The CUDA arm does not have this limitation. It added `LoadRowN<4, float>`
+  *beside* `LoadRowN<4, __nv_bfloat16>`, and its `d == 32 * 4` launch branch
+  carries no dtype gate at all, so f32 reaches the decode-opt kernel there
+  (`cuda_paged_attn.cu:2796` dispatches `LaunchDecode<TQ, TKV, float>` for
+  `out.dtype == kF32`). §1 calls this change a mirror of merged work; **on dtype
+  coverage it is not one**, and that is recorded here rather than left to be
+  discovered.
+
+  The limitation is pre-existing, not introduced: ROCm's decode-opt has been
+  bf16-only at *every* head_dim, so this is a gap the `d=128` arm inherits
+  rather than creates. It is owed, not intended, and it is not waived — an f32
+  `d=128` decode on ROCm is silently slow rather than refused, which is the
+  weaker of the two failure modes AGENTS.md allows.
 - **`qg=4`/`qg=8` GQA fusion at any `d`.** `PagedAttnDecodeGqaBf16`'s fused
   condition only ever covered `qg==2` and `qg==8 && d==512`; `qg=4` (Qwen3-4B)
   was never fused at 256/512 either. Real, but head-dim-independent — its own
