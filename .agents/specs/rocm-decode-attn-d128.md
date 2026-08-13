@@ -16,7 +16,8 @@ open because the flip to default-ON is still owed and only CUDA was covered.
 — the ROCm per-call decode-attention gap (`PagedAttnOnline` 41.1us vs vLLM's
 5.10us fallback kernel, 8.1x) on gfx1200. #488 asserts no cause; this spec
 supplies one of them and does not close it.
-**Base:** `origin/main` `bbc482a2`, fresh branch (not stacked — this touches
+**Base:** `origin/main` `fafa16f0` after rebase (the claim file records the
+same), fresh branch (not stacked — this touches
 `rocm_paged_attn.hip`/its cross-device test, disjoint from #506's
 `rocm_skinny_gemm.hip`/`rocm_matmul_hipblaslt.hip`).
 **Board:** AMD Radeon RX 9060 XT (`gfx1200`, Navi 44, RDNA4, discrete, 32
@@ -65,7 +66,7 @@ head_dim 128") independently names `d=128` as the real-model shape.
 
 Cross-checked against the pinned oracle (`csrc/rocm/attention.cu` @
 `555967922`): its `CALL_CUSTOM_LAUNCHER_BLK_HEAD` dispatch switches on
-`head_size` with cases **64 and 128** (`attention.cu:3607-3618`), including on
+`head_size` with cases **64 and 128** (`attention.cu:3609-3620`), including on
 RDNA4 via the `is_navi_gpu()` (`arch.find("gfx11")==0 || arch.find("gfx12")==0`)
 launcher variant. Upstream's fast kernel covers `d=128`; ours didn't.
 
@@ -88,7 +89,7 @@ __device__ inline void LoadRowEplBf16(...) {
 one — the same pattern, one size down. No new algorithm, tiling, or
 synchronization. This is the same observation #382 made about the CUDA file.
 
-## 4. What changed
+## 4. What will change
 
 `src/vt/rocm/rocm_paged_attn.hip`:
 
@@ -101,7 +102,10 @@ synchronization. This is the same observation #382 made about the CUDA file.
    || decode_wmma)) || d == 256 || d == 512`. The `decode_wmma` disjunct is
    deliberate: the rocWMMA arm (separate spec) is a second, independently
    opt-in kernel for the same head size, and without it a bare
-   `VT_ATTN_DECODE_WMMA=1` would be a silent no-op.
+   `VT_ATTN_DECODE_WMMA=1` would be a silent no-op. **Forward reference:**
+   neither `VT_ATTN_DECODE_WMMA` nor `rocm-decode-attn-d128-wmma.md` exists yet
+   — in the tree or in this PR — so an implementer working from this section
+   must land the flag with the rocWMMA arm, not cite it from here.
 4. `decode_gqa` fused-head condition extended to `qg == 2 && (d == 128 || d ==
    256 || d == 512)` (Qwen3-0.6B/1.7B are `qg=2`; Qwen3-4B is `qg=4`, not fused
    at any `d` today — falls to per-head `PagedAttnDecodeOptBf16T`, still off
@@ -246,7 +250,34 @@ cross-device test and its two flag-on ctest registrations, and this spec.
 - **Explaining why GQA=2 wins more than GQA=4** via kernel tracing. Named, not
   run.
 
-## 8. Reproduction
+## 8. Risks and decisions
+
+| Risk | Assessment |
+|---|---|
+| The reduction-order change moves a greedy anchor at a bf16 tie | This is why the arm ships **default OFF**, adopting the merged CUDA arm's flag, default and stated reason verbatim rather than inventing new ones. A default-ON flip is a separate, per-backend argument and is explicitly out of scope here. |
+| The 3.53x is a single-board, single-run figure | Measured on one gfx1200 that may also drive a display. It is indicative, not the idle-box reproduced standard AGENTS.md requires for a binding number, and §5 says so. It justifies building the arm; it does not license a BENCHMARKS entry or a default flip. |
+| The same arm measured 1.6x SLOWER on sm_110 (#382) | Recorded, deliberately not reconciled. It is the reason the default stays OFF and the reason the flip must be argued per backend rather than once. Treating the ROCm number as settling the question for all boards is the error this row is guarding against. |
+| The spec lands before its code | Intended, and required — AGENTS.md puts the spec before implementation. The consequence is that §4 and the result section describe an unmerged branch, which the banner above the result section states outright so no reader mistakes it for landed work. |
+| `VT_ATTN_DECODE_WMMA` is cited but does not exist | A forward reference to a sibling arm whose spec and issue are not yet filed (§4). An implementer must land the flag alongside the rocWMMA arm; taking §4 literally today produces a reference to an undefined symbol. |
+| The residual #488 gap is unquantified | No post-change per-call oracle re-measure was run, so how much of #488 this closes is unknown. Named here rather than left implicit; it is owed before #488 can be judged. |
+
+## 9. Stop conditions
+
+- **Stop if the token-exact gate moves with the flag OFF.** The arm is opt-in;
+  flag-off behaviour must be byte-identical to today. Any drift means the gate
+  predicate is wrong, not that the golden needs refreshing.
+- **Stop if the flag-ON arm cannot be shown to reach the new kernel.** A green
+  gate that never entered `PagedAttnDecodeOptBf16T` proves nothing — the ctest
+  registrations in §4 exist precisely so the opt-in arms are gated rather than
+  silently skipped. Confirm selection counts, not just tokens.
+- **Stop before flipping the default.** That needs its own row, and needs the
+  sm_110 reversal in §6 reconciled rather than out-voted by one board.
+- **Stop if the measured speedup on a second board contradicts the first.**
+  Two boards disagreeing is a finding about the kernel, not noise to average.
+- **Do not extend this row to the rocWMMA arm.** It is a separate, independently
+  flagged kernel with its own spec and its own issue, both still unfiled.
+
+## 10. Reproduction
 
 ```sh
 nix develop .#rocm-shell --command bash -c '
@@ -268,9 +299,16 @@ flock "$HOME/gpu.lock" -c '
 '
 ```
 
-## Outcome (2026-08-12)
+## Result on the implementation branch (2026-08-12)
 
-**Landed the ROCm `d=128` decode arm, default OFF, mirroring the merged CUDA
+> **Not landed.** This section records what was built and measured on the
+> unmerged implementation branch. No `VT_ATTN_DECODE_D128` exists in
+> `src/vt/rocm/` on `main` — `git log -S'VT_ATTN_DECODE_D128' -- src/vt/rocm/`
+> is empty, and `rocm_paged_attn.hip` still gates on `d == 256 || d == 512`.
+> This spec is committed BEFORE its implementation, per AGENTS.md; the section
+> becomes `## Outcome` when the code merges and the row reaches `DONE`.
+
+**Built the ROCm `d=128` decode arm, default OFF, mirroring the merged CUDA
 arm of the same issue.** Root cause for the ROCm decode-attention gap #488
 measured was neither architecture- nor WMMA-specific: no fast decode kernel
 existed for `head_dim=128`, the size every locally-tested model uses, on any
