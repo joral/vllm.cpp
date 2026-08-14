@@ -17,6 +17,10 @@ set_tests_properties(test_serve_low_tools PROPERTIES
 
 function(vllm_cpp_add_test name)
   add_executable(${name} ${ARGN})
+  # tests/ on the include path so every suite can reach the shared test helpers
+  # under tests/support/ as "support/<name>.h". No header name under tests/
+  # collides with one under include/ or src/, so nothing else resolves here.
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   if(TARGET vllm::sanitize_test_shared)
     target_link_libraries(${name} PRIVATE vllm::sanitize_test_shared vllm_test_main)
   else()
@@ -33,6 +37,17 @@ function(vllm_cpp_add_test name)
   # returns 77, which today is all but test_voxtral_e2e.
   set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
 endfunction()
+
+# The gate on the golden-comparison helper itself (issue #449): a NaN operand
+# must be a FAILURE, never the 0.0 that both historical spellings returned.
+vllm_cpp_add_test(test_max_abs_diff support/test_max_abs_diff.cpp)
+# ...and the wrapper must RAISE, not merely return +infinity, so the
+# "these must differ" callers cannot read a NaN as a difference. That case is
+# skipped in the normal run because a raised failure would count as one; here it
+# is forced on and REQUIRED to exit non-zero. Without the guard this entry fails.
+add_test(NAME test_max_abs_diff_nan_raises
+  COMMAND test_max_abs_diff --no-skip --test-case=*RAISES*)
+set_tests_properties(test_max_abs_diff_nan_raises PROPERTIES WILL_FAIL TRUE)
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
 set(_vllm_cpp_expected_build_version "${PROJECT_VERSION}")
@@ -55,6 +70,31 @@ vllm_cpp_add_test(test_nvfp4_dequant vllm/test_nvfp4_dequant.cpp)
 vllm_cpp_add_test(test_awq_gptq_dequant vllm/test_awq_gptq_dequant.cpp)
 vllm_cpp_add_test(test_mxfp4_dequant vllm/test_mxfp4_dequant.cpp)
 vllm_cpp_add_test(test_ct_nvfp4_emulation vllm/test_ct_nvfp4_emulation.cpp)
+# MODEL-TEXT-nemotron-h W1 (#517): the ModelOpt MIXED_PRECISION per-module
+# quant-algo resolver. Two arms, deliberately two BINARIES: the curated fixture
+# arm is always-on, and the exhaustive real-config arm exits 77 (Skipped) when
+# the 30B checkpoint is not staged. Folding them into one target would let the
+# skip swallow the always-on gate as well.
+#
+# The resolver header is INTERNAL (src/, not include/) until a loader consumes
+# it, so both targets take ${CMAKE_SOURCE_DIR}/src on the include path — the
+# same arrangement test_linear_method and test_model_registry already use.
+vllm_cpp_add_test(test_modelopt_mixed_precision
+  vllm/model_executor/layers/quantization/test_modelopt_mixed_precision.cpp)
+target_include_directories(test_modelopt_mixed_precision PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_modelopt_mixed_precision PRIVATE
+  MODELOPT_MIXED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/modelopt_mixed_precision")
+vllm_cpp_add_test(test_modelopt_mixed_precision_checkpoint
+  vllm/model_executor/layers/quantization/test_modelopt_mixed_precision_checkpoint.cpp)
+# tests/parity as well as src/: the exhaustive arm resolves its checkpoint
+# through the SINGLE pinned parity::Nemotron35LightningSnapshot() rather than
+# joining $CHECKPOINT_ROOT by hand, so that one resolver owns the revision pin
+# for both env spellings (#517 LOW-3) -- the same arrangement test_qwen36_weights
+# uses for the 35B pin.
+target_include_directories(test_modelopt_mixed_precision_checkpoint PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 vllm_cpp_add_test(test_gguf_dequant vllm/test_gguf_dequant.cpp)
 vllm_cpp_add_test(test_gguf_nvfp4 vllm/test_gguf_nvfp4.cpp)
 # gguf_nvfp4_goldens.inc lives next to the test source.
@@ -69,6 +109,13 @@ vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
+vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
+vllm_cpp_add_test(test_speech_engine vllm/multimodal/test_speech_engine.cpp)
+vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
+vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
+target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
+target_include_directories(test_gpt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
@@ -76,6 +123,45 @@ vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 vllm_cpp_add_test(test_minimax_h3_video_fold vllm/models/test_minimax_h3_video_fold.cpp)
 target_compile_definitions(test_minimax_h3_video_fold PRIVATE
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# LTX-2.5 L1: the GENERALIZED VideoEngine seam + its family registry, held to
+# the SAME pre-fold goldens through the abstract path (and to the never-guess
+# refusals). Needs the fold fixture builder, which lives beside the H3 test.
+vllm_cpp_add_test(test_video_engine vllm/multimodal/test_video_engine.cpp)
+target_include_directories(test_video_engine PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_compile_definitions(test_video_engine PRIVATE
+  MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
+# over a reduced-dimension checkpoint set written in the SHIPPED file format.
+vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
+# LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
+# live next to the test source, like every other generated .inc.
+vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
+# LTX-2.5 L8: the DEVICE-RESIDENT forward, held to the SAME ltx2_goldens.inc the
+# L2 CPU gate above is held to. Its own target so test_ltx2's recorded 29/1615
+# baseline stays exactly where it is; it runs on the CPU backend everywhere and
+# adds the CUDA cases when a CUDA backend is registered.
+vllm_cpp_add_test(test_ltx2_device vllm/models/test_ltx2_device.cpp)
+# LTX-2.5 L4: the VAE bricks, gated against upstream ltx_core executed at reduced
+# dimensions. ltx2_vae_goldens.inc lives next to the test source.
+vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
+target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX-2.5 L3: the text conditioning path, gated against upstream ltx_core executed
+# at reduced dimensions. ltx2_text_goldens.inc lives next to the test source.
+vllm_cpp_add_test(test_ltx2_text_encoder vllm/models/test_ltx2_text_encoder.cpp)
+target_include_directories(test_ltx2_text_encoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX-2.5 L5: the pipeline layer — sigma schedule, noiser, diffusion steps,
+# guidance, patchifiers, the recipe table, the latent spatial upsampler, the
+# duration head and the embeddings connector. ltx2_pipeline_goldens.inc lives
+# next to the test source.
+vllm_cpp_add_test(test_ltx2_pipeline vllm/models/test_ltx2_pipeline.cpp)
+target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX-2.5 L6: the quantized loaders, gated three ways — the SHIPPED checkpoints'
+# own manifests, a few hundred of their own bytes against torch, and synthetic
+# files for whole-model materialization. All three .inc files live beside the
+# test source.
+vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
+target_include_directories(test_ltx2_loader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
@@ -92,6 +178,34 @@ vllm_cpp_add_test(test_qwen3_5_gguf_mtp vllm/models/test_qwen3_5_gguf_mtp.cpp)
 vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
+# MODEL-GDN-OUTPUT-GATE-TYPE (#489): `GlueFuseEnabled()` defaults ON and is read
+# ONCE per process into a function-local static, so one run of these two suites
+# can only ever execute the glue-FUSED gated-RMSNorm tail. The UNFUSED tail
+# carries its own `vt::RmsNormGatedArgs{eps, sigmoid_gate}` construction in each
+# of the three GDN blocks, and inverting only that construction left the entire
+# declared focused gate GREEN (test_hf_config 210|210, test_qwen27_dense_forward
+# 583|583, test_qwen3_5_gdn_spec_routing 52|52) — live code, but ungated.
+# Re-run the SAME binaries with the lever forced to 0 so the `VT_GLUE_FUSE=0`
+# fallback is gated too, mirroring the precedent the fusion row itself set
+# (parity-ledger.md:112 — "fused ON default AND `VT_GLUE_FUSE=0` fallback 16/16")
+# and the per-lever re-run below.
+foreach(_glue_fuse_test test_qwen27_dense_forward test_qwen3_5_gdn_spec_routing)
+  add_test(NAME ${_glue_fuse_test}_glue_fuse_off COMMAND ${_glue_fuse_test})
+  set_tests_properties(${_glue_fuse_test}_glue_fuse_off PROPERTIES
+    ENVIRONMENT "VT_GLUE_FUSE=0" SKIP_RETURN_CODE 77)
+endforeach()
+# MODEL-GDN-OUTPUT-GATE-TYPE (#489), the FP8 half. Each GDN tail carries TWO fp8
+# gate-carrying constructions: the `vt::kRmsNormGatedQuantFp8` FusedRecipe copy
+# (taken at the `VT_FUSED_CHAIN_ADOPT` default) and the direct
+# `vt::RmsNormGatedQuantFp8` hand-call (taken only at =0). `FusedChainAdoptEnabled()`
+# is another read-once static, so a single run reaches exactly one of the two and
+# the other is live-but-ungated — the same defect the `_glue_fuse_off` entries
+# above were added for. Re-run the SAME binary with the lever forced to 0.
+# CUDA-only in effect: the fp8 tail needs `Platform::supports_fp8()`.
+add_test(NAME test_qwen3_5_gdn_spec_routing_fused_chain_off
+  COMMAND test_qwen3_5_gdn_spec_routing)
+set_tests_properties(test_qwen3_5_gdn_spec_routing_fused_chain_off PROPERTIES
+  ENVIRONMENT "VT_FUSED_CHAIN_ADOPT=0" SKIP_RETURN_CODE 77)
 # PERF-27B-DENSE-MARLIN-GATEUP (#365): the pre-kernel DECISIONS that route the
 # 27B's dense W4A16 MLP through the fused Marlin gate_up pair. CPU-only by
 # construction — the fused GEMM itself is CUDA + VT_MARLIN_NVFP4.
@@ -111,6 +225,13 @@ foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
     PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
 endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+# POOL-DEVICE-KEY (#516, .agents/specs/pool-device-key.md): the shared scratch
+# pool's free list must be keyed by DEVICE as well as size class, or a block
+# allocated through one backend is handed to a DBuf running on another —
+# host-side SIGSEGV in one direction, silent all-NaN output in the other.
+# Hardware-free: two fake backends stand in for two devices, so this runs
+# everywhere and in ~milliseconds rather than only where a GPU is present.
+vllm_cpp_add_test(test_device_pool vllm/models/test_device_pool.cpp)
 vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
@@ -326,6 +447,28 @@ target_include_directories(test_muse_glimmer_gguf PRIVATE
 # or mis-shaped tensor). CPU-only; the forward REFUSES-by-name (W3-W6).
 # .agents/specs/kimi-linear.md.
 vllm_cpp_add_test(test_kimi_linear_scaffold vllm/models/test_kimi_linear_scaffold.cpp)
+
+# Nemotron-H (NemotronHForCausalLM) W3 STRUCTURAL gate (#517,
+# .agents/specs/nemotron-h-model.md §4 W3): registry-resolve + config descent off
+# the REAL released config.json (52-entry layers_block_type schedule, the legacy
+# hybrid_override_pattern/mamba_* aliases, the refuse cases) + the on-disk name map
+# accounted BOTH WAYS against all 18487 tensors of the released index + the
+# heterogeneous KV topology (6-layer full-attention group + 23-layer Mamba2 group,
+# shapes from mamba2_state_shape). The structural half runs off a COMMITTED
+# headers-only fixture so CI never needs the 20.1 GiB NAS asset; a final case
+# re-verifies that fixture against the LIVE checkpoint when VT_NEMOTRON35_SNAPSHOT
+# names it, and SKIPs loudly otherwise. CPU-only, no forward (W4), no speed claim.
+vllm_cpp_add_test(test_nemotron_h_scaffold vllm/models/test_nemotron_h_scaffold.cpp)
+target_compile_definitions(test_nemotron_h_scaffold PRIVATE
+  NEMOTRON_H_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/nemotron_h_35_lightning")
+# GATE-PIN-UNPINNED-SNAPSHOTS (#471): the live re-verification resolves the
+# checkpoint through the pinned parity::HfSnapshot, so it needs tests/parity on
+# the include path.
+# nemotron_h.h is a MODEL-PRIVATE header under src/, not include/vllm/: W3 ships
+# nothing on the public ABI and include/vllm/ is a USER_USAGE_PREFIXES surface
+# (#515). Same call as the W1 resolver header.
+target_include_directories(test_nemotron_h_scaffold PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
@@ -744,6 +887,8 @@ vllm_cpp_add_test(test_reasoning_olmo3
   vllm/entrypoints/openai/reasoning_parsers/test_olmo3.cpp)
 vllm_cpp_add_test(test_reasoning_deepseek_v3
   vllm/entrypoints/openai/reasoning_parsers/test_deepseek_v3.cpp)
+vllm_cpp_add_test(test_reasoning_qwen3
+  vllm/entrypoints/openai/reasoning_parsers/test_qwen3.cpp)
 vllm_cpp_add_test(test_tool_parser_xlam
   vllm/entrypoints/openai/tool_parsers/test_xlam_tool_parser.cpp)
 vllm_cpp_add_test(test_tool_parser_phi4mini
@@ -823,6 +968,13 @@ if(VLLM_CPP_SERVER)
   # cause the starvation.)
   set_tests_properties(test_openai_api_server test_openai_conformance
     PROPERTIES RUN_SERIAL ON)
+  # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
+  # drives the REAL VllmServerMain (owned by the library behind the same
+  # VLLM_CPP_SERVER gate) by re-execing this binary, so it needs src/ on the
+  # include path for server_main.h, exactly as test_openai_api_server does.
+  vllm_cpp_add_test(test_serve_recipe_args
+    vllm/entrypoints/openai/test_serve_recipe_args.cpp)
+  target_include_directories(test_serve_recipe_args PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 
@@ -1137,6 +1289,7 @@ vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)
+vllm_cpp_add_test(test_ops_moe_nongated_relu2 vt/test_ops_moe_nongated_relu2.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
 vllm_cpp_add_test(test_ops_layernorm vt/test_ops_layernorm.cpp)
@@ -1175,6 +1328,13 @@ vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
 # byte-exact scalar kernel, full-key-range coverage, fall-through totality, and the
 # VT_FA2_DENSE A/B knob. CUDA-only content; skips cleanly on a CPU box.
 vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.cpp)
+# vt::AttentionCross, DIRECTLY, on every backend that registers it. Its own
+# target rather than more cases in test_ops_attention or test_ltx2_device, both
+# of which carry recorded baselines. It exists because the CUDA kernel's whole
+# flash-tiling machinery (cross-tile rescale, multi-block launch, npl>1 head
+# split, GQA broadcast, ChooseTileCols' halving) is unreachable from every
+# LTX-2.5 call geometry, which is tiles=1/npl=1/nblk=1/Hq==Hkv throughout.
+vllm_cpp_add_test(test_ops_attention_cross vt/test_ops_attention_cross.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)

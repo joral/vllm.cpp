@@ -251,14 +251,87 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(windows), 1)
         self.assertEqual(windows[0].path.name, "engine-matrix.md")
 
+    def test_serve_recipe_args_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #606 row and its 152 -> 153 ratchet bump are one semantic change.
+
+        Same shape as the #117 assertion above, and it exists for the same
+        reason: the bump and the row have to arrive together, or a number was
+        moved to silence a failure. This one also pins WHICH matrix owns the
+        row, because SERVE-* IDs are reachable from more than one, and a row
+        that drifted into another matrix would leave the engine count short
+        while the pin still read 153.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+        recipe = [row for row in rows if row.item_id == "SERVE-RECIPE-ARGS"]
+        self.assertEqual(len(recipe), 1)
+        self.assertEqual(recipe[0].path.name, "engine-matrix.md")
+
+    def test_omni_pin_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #633 row and its 153 -> 154 ratchet bump are one semantic change.
+
+        Same shape as the #117 and #606 assertions above, and it carries one
+        extra hazard worth pinning. This bump COLLIDED: `main` took the constant
+        152 -> 153 for `SERVE-RECIPE-ARGS` while the omni-pin branch took the
+        same 152 -> 153 for its own row, so both sides read 153 and the merge
+        looked clean. Resolving it by keeping either 153 would have dropped a
+        real row while leaving the matrix internally consistent, which is
+        exactly the state no other assertion here can see. Naming BOTH rows is
+        what makes 154 checkable rather than plausible.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        for item_id in ("ENG-UPSTREAM-OMNI-PIN", "SERVE-RECIPE-ARGS"):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "engine-matrix.md", item_id)
+
+    def test_music3_and_indextts_rows_both_survive_their_collision(self) -> None:
+        """373 needs BOTH rows named, because the merge that produced it collided.
+
+        The same hazard the omni-pin assertion above records, on the MODEL pin
+        and on the same day. `main` took the constant 370 -> 372 for IndexTTS-2.5
+        (two architectures) while the Music3 branch took 370 -> 371 for its own
+        row. Neither side was wrong about its own change, and neither number was
+        373 -- so whichever side an auto-merge kept, the tree would have been
+        internally consistent while silently short a real architecture.
+
+        A count assertion alone cannot see that: it only knows the pin matches
+        the rows it can find. Naming the three rows is what makes 373 checkable
+        rather than plausible.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        collided = (
+            "MODEL-MUSIC-minimax-music3-mini-max-music3-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-s2-mel-decoder",
+        )
+        for item_id in collided:
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+
     def test_model_row_ratchet_is_load_bearing(self) -> None:
         """The MODEL row pin must catch a row appearing or vanishing.
 
         Mirrors the ENGINE ratchet above, for the same reason and with more
         force: the MODEL count is the one that actually moves, because every new
-        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362. Without
-        this, bumping the number to silence a failure is indistinguishable from
-        bumping it because a row really landed.
+        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362
+        (`c8fc24a50`); the seven recipe architectures that had no row at all took
+        it 362 -> 369 (#609, #610, `eba6ab7c7`); LTX-2.5 took it 369 -> 370
+        (#435, `cefacd2d0`); IndexTTS-2.5 took it 370 -> 372, being two
+        architectures (#634); MiniMax-Music3 took it to 373 (#672). Without this,
+        bumping the number to silence a failure is indistinguishable from bumping
+        it because a row really landed.
         """
         clean: list[str] = []
         agent_record.check_matrices(clean)
@@ -280,6 +353,130 @@ class AgentRecordMutationTests(unittest.TestCase):
         ):
             agent_record.check_matrices(errors)
         require(errors, r"\d+ MODEL rows; expected \d+")
+
+    def test_indextts_rows_are_inside_the_model_ratchet(self) -> None:
+        """The #634 rows and the 370 -> 372 bump are one semantic change.
+
+        IndexTTS-2.5 is registered by vLLM-Omni as TWO architectures, a talker
+        and an S2Mel decoder, so it moves the pin by two rather than one. That
+        is the hazard worth pinning: a port described in prose as "a model" is
+        the shape that lands one row and a bump of two, and the count alone
+        cannot tell that from two rows landing. Both are named here, and both
+        are asserted `INVENTORIED` rather than `SPIKE` — they are unclaimed and
+        blocked on #633, and `SPIKE` would owe a `CLAIM-*` owner they do not
+        have.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        for item_id in (
+            "MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-s2-mel-decoder",
+        ):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+            self.assertEqual(
+                found[0].field("state").strip().strip("`"), "INVENTORIED", item_id
+            )
+
+    def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
+        """The #609/#610 rows and the 362 -> 369 bump are one semantic change.
+
+        Mirrors `test_windows_release_row_is_inside_the_engine_ratchet`: name
+        the rows the bump was taken FOR, so a count raised to silence a broken
+        parse cannot look identical to a count raised because rows landed. Two
+        of the seven are pinned, one per issue; seven near-identical assertions
+        would add repetition, not force.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        for item_id in (
+            "MODEL-TEXT-bailing-moe-v3-bailing-moe-v3-for-causal-lm",
+            "MODEL-MM-moss-tts-moss-tts-delay-talker-for-generation",
+        ):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md")
+            self.assertEqual(
+                found[0].field("state").strip().strip("`"), "INVENTORIED", item_id
+            )
+
+    def test_beyond_pin_rows_stay_out_of_the_at_pin_model_inventory(self) -> None:
+        """A beyond-pin row must not inflate the AT-THE-PIN model inventory.
+
+        `check_model_invariants` pins what vLLM's OWN registry holds at
+        `555967922`: 324 category/target rows, 373 memberships, 356
+        architectures, 310 targets, 261 modules. It counts a row only when the
+        Upstream cell carries a backticked `module`-colon-colon-`class` token.
+        So a row for an architecture that is NOT at the pin -- MuseGlimmer,
+        KimiK3, MiniMaxH3DiT, and the seven recipe architectures rowed for
+        #609/#610 -- deliberately spells its module and class as separate
+        fields instead, and contributes nothing.
+
+        That is a convention, and an unenforced convention drifts. The moment
+        someone "helpfully" anchors one of those rows the pinned inventory
+        silently gains a target vLLM does not register at the pin, and the next
+        person to re-pin the counts bakes the error in. This proves the
+        omission is load-bearing rather than an oversight.
+        """
+        clean: list[str] = []
+        agent_record.check_model_invariants(clean)
+        self.assertEqual(clean, [])
+
+        beyond_pin = (
+            "MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation",
+            "MODEL-MM-kimi-k3-kimi-k3-for-conditional-generation",
+            "MODEL-DIFFUSION-minimax-h3-mini-max-h3-dit",
+            "MODEL-TEXT-bailing-moe-v3-bailing-moe-v3-for-causal-lm",
+            "MODEL-MM-moss-tts-moss-tts-delay-talker-for-generation",
+            "MODEL-MM-moss-tts-moss-tts-realtime-talker-for-generation",
+            "MODEL-MM-qwen3-tts-qwen3-tts-talker-for-conditional-generation",
+            "MODEL-MM-higgs-audio-v3-higgs-audio-v3-talker-for-conditional-generation",
+            "MODEL-MM-voxtral-realtime-voxtral-realtime-for-conditional-generation",
+            "MODEL-MM-bailing-mm-native-bailing-mm-native-for-conditional-generation",
+        )
+        matrix = agent_record.AGENTS / "model-matrix.md"
+        lines = matrix.read_text(encoding="utf-8").splitlines(keepends=True)
+        for item_id in beyond_pin:
+            rows = [line for line in lines if line.startswith(f"| `{item_id}` |")]
+            self.assertEqual(len(rows), 1, item_id)
+            upstream = agent_record.split_cells(rows[0])[2]
+            self.assertEqual(
+                [v for v in re.findall(r"`([^`]+)`", upstream) if "::" in v],
+                [],
+                item_id,
+            )
+
+        # Anchoring exactly ONE of them the at-the-pin way must move the
+        # inventory off its pin, in the file rather than in a stub.
+        victim = "MODEL-DIFFUSION-minimax-h3-mini-max-h3-dit"
+        mutated: list[str] = []
+        for line in lines:
+            if line.startswith(f"| `{victim}` |"):
+                cells = line.split("|")
+                cells[3] += " `vllm/model_executor/models/minimax_h3.py::MiniMaxH3DiTModel` "
+                line = "|".join(cells)
+            mutated.append(line)
+        self.assertNotEqual(mutated, lines)
+
+        errors: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = Path(tmp)
+            (agents / "model-matrix.md").write_text("".join(mutated), encoding="utf-8")
+            # ROOT moves with AGENTS: the checker reports the path relative to
+            # it, so leaving ROOT pointing at the real tree raises instead of
+            # producing the error we are asserting on.
+            with (
+                mock.patch.object(agent_record, "AGENTS", agents),
+                mock.patch.object(agent_record, "ROOT", agents),
+            ):
+                agent_record.check_model_invariants(errors)
+
+        require(errors, r"model inventory .*expected")
 
     def test_engine_summary_rejects_stale_area_rollup(self) -> None:
         source = agent_record.ENGINE_MATRIX.read_text(encoding="utf-8")

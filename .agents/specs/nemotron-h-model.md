@@ -3,6 +3,13 @@
 **Claim:** `CLAIM-MODEL-NEMOTRON-H`. **Model row:**
 `MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm` (existing, stays `INVENTORIED`
 at this spec commit). **Issue:** [#517](https://github.com/mudler/vllm.cpp/issues/517).
+**Gate-infrastructure issues this row depends on:**
+[#569](https://github.com/mudler/vllm.cpp/issues/569) (checkpoint pinned by
+CONTENT — **closed**, `751325460`; W6 must run with `VT_NEMOTRON35_SNAPSHOT`
+UNSET and record the resolved directory, because that override is deliberately
+never revision-checked),
+[#547](https://github.com/mudler/vllm.cpp/issues/547) (GB10 reference-tier runs
+the CPU kernel over device pointers).
 
 **Hard blocker:** `KERNEL-SSM-MAMBA` [#496](https://github.com/mudler/vllm.cpp/issues/496)
 ([spec](mamba2-ssd.md)). W1 (CPU host references) is in fresh review on
@@ -88,15 +95,51 @@ memory format against the oracle explicitly.
 | MoE | `nemotron_h.py:126-256` (`NemotronHMoE`), decoder layer `:317` |
 | non-gated activation | `activation_without_mul(config.mlp_hidden_act)` -> `ReLUSquaredActivation` (`layers/activation.py`) |
 | expert ckpt naming | `ckpt_names=("up_proj", "down_proj", "")` (`nemotron_h.py:220`) |
-| routed scale applied to OUTPUT | `apply_routed_scale_to_output=True` (`nemotron_h.py:246`) |
+| routed scale applied to OUTPUT | `apply_routed_scale_to_output=True` (`nemotron_h.py:234`), factor `:233` |
 | router dtype | `GateLinear(..., out_dtype=torch.float32, force_fp32_compute=True)` (`nemotron_h.py:150-156`) |
 | state shape / dtype | `mamba_utils.py:174-199`, `:73-81` |
 | MTP | `models/nemotron_h_mtp.py::NemotronHMTP` (`registry.py:638`) |
 | MIXED_PRECISION resolution | `layers/quantization/modelopt.py:2280-2450`, per-layer lookup `:2416-2445` |
 
-The `quantized_layers` lookup is **direct name first, then shard prefix**
-(`modelopt.py:2426`, `:2437`). Mirror both, in that order; a merged/sharded
-local name that resolves only by prefix is the case that will bite.
+**Correction (W1, 2026-08-12).** This section previously said the
+`quantized_layers` lookup is "direct name first, then shard prefix
+(`modelopt.py:2426`, `:2437`)". That understated upstream and was a defect in
+this spec, not in upstream. `_resolve_quant_algo` (`modelopt.py:2412-2487`) has
+**five** strategies and tries them in this order:
+
+1. **Direct lookup** (`:2424-2427`) over `_quantized_layer_prefix_candidates`.
+2. **Packed/fused lookup** (`:2429-2447`): unfuse via the model's
+   `packed_modules_mapping`, collect each shard's algo **across all base
+   candidates**, and **raise `ValueError`** if the shards of one fused layer
+   disagree.
+3. **Prefix lookup** (`:2449-2453`): any `quantized_layers` key starting with
+   `prefix + "."`, returning the first in map order.
+4. **The `.experts` special case** (`:2455-2461`): a `FusedMoE` layer's prefix
+   is `...moe.experts` while ModelOpt lists `...moe.up_proj` / `...moe.down_proj`,
+   so the container falls back to its parent.
+5. **`fused_projection_shards` fallback** (`:2463-2486`): `qkv_proj ->
+   (q_proj, k_proj, v_proj)` and `gate_up_proj -> (gate_proj, up_proj)` for
+   configs that list shard names with no `packed_modules_mapping` registered.
+   The algo set is rebuilt **per candidate** here, unlike strategy 2, and it
+   raises on disagreement too.
+
+`_quantized_layer_prefix_candidates` (`:2489-2505`) itself yields the prefix, a
+bare `lm_head` when the prefix ends in `.lm_head` (the real checkpoint stores a
+BARE `lm_head` key), and the `language_model.model.` <-> `model.language_model.`
+swap, de-duplicated in order.
+
+Exclusion is separate and is checked **first**, in `get_quant_method`
+(`:2515-2522`): `is_layer_excluded` (`:145-181`) runs `is_layer_skipped`
+(`quant_utils.py:510-572`, which raises on a partially-excluded fused layer),
+then a legacy substring rule kept for pre-0.39 exports, then `fnmatch`
+wildcards — which is how the real `ignore` entry `mtp*` covers the whole MTP
+head.
+
+**Measured on the real config** (all 5981 `quantized_layers` entries and all 72
+`ignore` entries): the histogram is exactly `{W4A16_NVFP4: 5935, FP8: 46}`,
+every entry resolves by strategy **1** alone, and no entry collides with the
+`ignore` list. Strategies 2-5 are therefore not reachable from this checkpoint
+and are covered by synthetic fixture entries instead — see W1 below.
 
 Config note: `nemotron_h.py` reads `config.hybrid_override_pattern`, which
 newer transformers exposes as a property derived from `layers_block_type`
@@ -136,12 +179,259 @@ cannot.
 | W | Content | Gate | Depends on |
 |---|---|---|---|
 | **W1** | ModelOpt `MIXED_PRECISION` resolver: parse `quantization_config`, resolve per-module `quant_algo` (direct then shard-prefix), expose it to weight loading. Refuse an unknown algo by name | unit tests on the REAL `config.json` (committed as a fixture, weights not needed): every one of the 5981 entries resolves, the `ignore` list resolves to unquantized, an unknown algo refuses | — |
-| **W2** | Non-gated `relu²` grouped MoE through `MlpGateUpMethodBase` / `vt::MergedGemmGroup`; bf16 arm then NVFP4 W4A16 g16 | byte/tolerance tests vs a host reference; `relu²` mutation caught; routed scale applied to the OUTPUT, not the logits | — |
+| **W2** | Non-gated `relu²` grouped MoE; bf16 arm then NVFP4 W4A16 g16. **As built it is NOT a merged pair** — the planned `MlpGateUpMethodBase` / `vt::MergedGemmGroup` routing was refuted during implementation and the arm is the EXISTING grouped GEMM plus a new `vt::MoeRelu2`; §6a is the authority on the seam | byte/tolerance tests vs a host reference; `relu²` mutation caught; routed scale applied to the OUTPUT, not the logits | — |
 | **W3** | `nemotron_h_weights.cpp` + `_registry.cpp`: `layers_block_type` dispatch, `backbone.` prefix, het-KV group construction (1 Mamba group + 1 full-attn group over 6 layers), enumeration gate vs the released index | enumeration: every tensor in `model.safetensors.index.json` is claimed or explicitly refused; KV spec shapes match `mamba2_state_shape` | #496 W1 |
 | **W4** | `nemotron_h.cpp` forward: hybrid layer loop, Mamba2 mixer wiring, 6 attention layers, MoE layers | CPU forward runs; per-layer activations vs a dumped oracle reference | #496 W1, W2, W3 |
 | **W5** | MTP head (`mtp.layers.0`, `eh_proj`/`enorm`/`hnorm`) on the existing spec-decode seam | draft acceptance non-zero; spec-off and spec-on token-identical | W4 |
 | **W6** | **GB10 e2e token gate vs the pinned oracle** | token-exact greedy, identical prompts/counts/batching/sampling; oracle identity asserted | #496 W2 (CUDA), W4, W5 |
 | **W7** | GGUF k-quant / i-quant arm through the shared GGUF loader (see §5b); refused by name until it lands | quant-matched load + token gate | W4 |
+
+### W1 progress — the resolver has LANDED (2026-08-12)
+
+`src/vllm/model_executor/layers/quantization/modelopt_mixed_precision.h`,
+header-only, mirroring `modelopt.py` at the pin. It sits under `src/` rather
+than beside its two `include/vllm/...` siblings on purpose:
+`check-doc-checkpoint` classifies the whole `include/vllm/` prefix as a
+user-facing surface and demands `docs/USAGE.md` move with it, and nothing this
+header does is user-facing yet — it is not on the `include/vllm.h` ABI and no
+loader calls it, so that edit would have documented nothing. **W3 promotes it to
+`include/` when it becomes part of the consumed surface**, and pays the public
+document obligation that genuinely applies then. Parses either config shape,
+resolves a module prefix through all five strategies plus the exclusion pass,
+and returns a TYPED `ModuleQuant` (algo, which strategy answered, group size)
+rather than a raw string.
+
+Two gate arms, deliberately two binaries so the opt-in one cannot mask the
+always-on one:
+
+- `test_modelopt_mixed_precision` — always-on, curated fixture at
+  `tests/fixtures/modelopt_mixed_precision/curated_config.json`, whose real
+  entries are copied verbatim from the checkpoint and whose synthetic entries
+  are each annotated with the strategy they exist to reach. **26 cases, 167
+  assertions** (22 / 137 as first landed; see the W1 repair note below).
+- `test_modelopt_mixed_precision_checkpoint` — exhaustive, reads the real
+  1.3 MB `config.json` from `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`,
+  asserts all 5981 + 72 entries and the exact histogram, plus the standalone
+  `hf_quant_config.json` the repair below added. **3 cases, 12181 assertions,
+  GREEN** (2 / 12145 as first landed; the checkpoint is staged on the NAS and
+  reachable from the CPU box, so this ran rather than skipping). Exits 77 —
+  CTest *Skipped*, with a loud banner naming the exact export — when the
+  checkpoint is absent.
+
+**One deliberate divergence from upstream**, recorded here because it is a
+policy choice and not a port: an algorithm that resolves to something this
+consumer does not implement is **refused by name**. Upstream's
+`get_quant_method` falls through to `UnquantizedLinearMethod()` for anything
+outside {FP8, NVFP4, W4A16_NVFP4, MXFP8} — including `FP8_PB_WO` and
+`FP8_PER_CHANNEL_PER_TOKEN`, which are entries of its own `QUANT_ALGOS`. Silent
+dequantization is numerically correct and therefore invisible to a token gate,
+which is precisely the stop condition §0 names. A prefix simply ABSENT from
+`quantized_layers` is not this case and stays unquantized, as upstream.
+
+**Still owed by later W's:** nothing consumes the resolver yet — no loader, no
+`get_quant_method` equivalent, no kernel selection. W3 wires it.
+
+### W1 repair — the fresh review returned FAIL (2026-08-12)
+
+Reviewed at `f5c901ce`; repaired on `row/MODEL-NEMOTRON-H-W1-FIX`. The review
+confirmed all five resolution strategies against a verbatim upstream
+transcription (63,787 + 6,493 prefixes, **0 diffs**) and found one real defect
+plus four guarantees the suite did not actually hold.
+
+**The defect: `Parse` refused the driver checkpoint's own `hf_quant_config.json`
+(HIGH).** `Parse` gated on `ExtractQuantAlgo`, which mirrors
+`_extract_modelopt_quant_algo` (`modelopt.py:245-263`) and requires a top-level
+`quant_method` starting with `"modelopt"`. That precondition belongs to the
+SELECTION hook — `override_quantization_method` uses it to tell a ModelOpt
+`quantization_config` apart from a compressed-tensors one in the same field of
+the same `config.json`. Upstream's PARSER, `from_config` (`:282-367`), never
+inspects `quant_method` at all: it dispatches on the SHAPE. The real file has
+top-level keys exactly `{producer, quantization}` and names no `quant_method`
+anywhere, so the header threw
+`std::invalid_argument: not a MIXED_PRECISION config (quant_algo="", quant_method="")`
+on the one config `get_config_filenames()` (`:265-267`) actually points at,
+while upstream parsed it and resolved all 5981 entries. Detection and parsing
+are now separate: `ShapeQuantAlgo` for `Parse`, `ExtractQuantAlgo` for
+`IsMixedPrecision`.
+
+**Four guarantees the tests did not hold.** Each survived the reviewer's
+mutation with the suite green; each now has a case that catches it, proven by
+re-applying that exact mutation:
+
+| Guarantee | Mutation that used to survive | Now caught by |
+|---|---|---|
+| Scans run in INSERTION order (`ordered_json`, header divergence 3) | load the fixture with plain `nlohmann::json` | `synthetic.layers.2.self_attn` resolves FP8, not W4A16_NVFP4 — sorted, `k_proj` comes first |
+| Strategies 3 and 4 return the FIRST matching child | return the LAST match | new `synthetic.layers.8.moe.{a,b}_proj`, the first parent whose first and last child DISAGREE |
+| Strategy 2's algo set spans ALL base candidates, unlike strategy 5 | rebuild the set per candidate | new `language_model.model...q_proj` / `model.language_model...k_proj` pair — the union raises, a per-candidate rebuild returns FP8 and never sees the second spelling |
+| `is_layer_skipped`'s `experts` branch (`quant_utils.py:559-565`) | invert `e.find(prefix)`, or delete the branch | an `ignore` naming ONE expert child must exclude the whole container |
+
+**`FnMatch` vs CPython, measured not assumed.** Two differential sweeps against
+`fnmatch.fnmatchcase`: 3,183,165 pairs (names ≤3, patterns ≤5) with **0**
+mismatches, and 6,291,453 pairs (names ≤2, patterns ≤6) with **108** across
+**27** patterns — all one class, all CPython-True/ours-False, all a bracket
+whose contents reduce to a bare `!` after `translate` drops a REVERSED range
+(`[?-.!]` → `(?s:.)\Z`). Recorded in the header and NOT fixed: matching it means
+reproducing `translate`'s rewriting, and ModelOpt emits no bracket expressions
+at all, so no reachable input touches it.
+
+**LOW-1, corrected 2026-08-13.** That count read **20** here and at
+`modelopt_mixed_precision.h:253` when the branch went to review. It was wrong,
+and wrong in a way the numbers refute on their own: every one of those patterns
+translates to `(?s:.)\Z`, which matches a length-1 name and nothing else, so a
+pattern can contribute at most the **4** one-character names in the sweep
+alphabet `{a,b,.,0}` and 20 patterns cap out at 80 — below the 108 the same
+sentence reports. Re-measured independently against CPython 3.12
+`fnmatch.fnmatchcase` on this branch: sweep 1 reproduces `3,183,165 pairs,
+0 mismatches`; sweep 2 reproduces `6,291,453 pairs, 108 mismatches` and yields
+`27 distinct patterns`, 27 x 4 = 108, direction `{(True, False): 108}`,
+`distinct translations: {'(?s:.)\Z': 108}`, `mismatching name lengths: {1: 108}`.
+All 27 have the shape `[X-Y!]` with X > Y. `FnMatch`'s behavior is unchanged —
+only the recorded number was.
+
+**Why a plain `ctest` skips the exhaustive arm.** `CHECKPOINT_ROOT` is a `.env`
+key and `.env` is not exported by anything; the repo's documented loader is
+`set -a; . ./.env; set +a` (`.env.example:8`). There is no CTest-side `.env`
+reader, so a shell that has not sourced it skips the arm. The skip banner names
+the exact export rather than pretending the arm ran. (This paragraph also
+credited `.agents/environment.md` with that loader line and claimed
+`hf_snapshot.h` does not apply here; both were wrong — see LOW-3 below.)
+
+Gate after repair: **26 cases / 167 assertions** curated (was 22 / 137),
+**3 cases / 12181 assertions** exhaustive (was 2 / 12145), clean Release
+`-Werror`, ASan and UBSan clean, full `ctest` 396/396.
+
+### W1 land-prep — round-2 review PASS, its LOWs, and the two open dispositions (2026-08-13)
+
+Round 2 reviewed `e734fe9e` and returned **PASS** with three LOW findings. All
+three are repaired on `row/MODEL-NEMOTRON-H-W1-LAND`; each was re-verified
+against the file or the measurement rather than taken on report.
+
+**LOW-1 — the `27` above.** Recorded as `20` in two places. See the correction
+paragraph in the block above for the arithmetic and the re-measurement.
+
+**LOW-2 — `CAPTURE` on a `const char*` prints `1`.** doctest 2.5.2 has no
+stringifier for a `const char*` lvalue, and two loops in
+`test_modelopt_mixed_precision_checkpoint.cpp` (`:172`, `:248`) each compared
+FIVE prefixes through one, so a failure named none of them. Demonstrated RED by
+inverting both CHECKs in a scratch copy — `logged: p := 1`, ten times — and
+GREEN under the identical inversions after switching both loops to
+`const std::string`, which is what `:149` and `:161` already used:
+`logged: p := backbone.embeddings`, `... := lm_head`, and so on for all nine
+distinct prefixes.
+
+**LOW-3 — two env vars gated one checkpoint, and neither carried the pin.**
+Two parts.
+
+*(a) A half-true citation.* The test claimed `.env.example` **and**
+`.agents/environment.md` document the loader as `set -a; . ./.env; set +a`.
+`.env.example:8` does, verbatim; `.agents/environment.md` does not contain the
+string at all (`grep -n 'set -a'` exits 1) and instead points at `.env.example`
+at `:16`. Corrected to cite `.env.example:8` alone.
+
+*(b) The pin had no teeth.* `CHECKPOINT_ROOT` (this test, joining the staging
+directory name by hand) and `VT_NEMOTRON35_SNAPSHOT`
+(`parity::Nemotron35LightningSnapshot()`, landed on main with §5a) resolved the
+same NAS `local_dir`, and `kNemotron35LightningNvfP4Revision` could refuse
+neither: the accessor's HF-cache spelling is unreachable for a `local_dir` tree,
+because there is no `snapshots/<rev>/` whose NAME carries the revision, and an
+env override is deliberately never revision-checked. A re-download of the same
+repo name lands a different revision under the identical path — exactly the
+substitution `kQwen27NvfP4Revision` exists because of.
+
+`hf download --local-dir` does record the revision, just not in the path.
+`Nemotron35LightningSnapshot()` is the SINGLE resolver for both spellings.
+
+**SUPERSEDED 2026-08-13 by #569 (`751325460`).** The manifest at
+`<dir>/.cache/huggingface/trees/<revision>.json` records *"this revision was
+downloaded here once"*, **not** *"these bytes are that revision"*, so gating on
+it was existence-only: a directory holding `LlamaForCausalLM` with every sidecar
+naming a different revision, an **empty** `touch`ed manifest and a decoy beside
+it, still RESOLVED. `huggingface_hub`'s `_tree_cache.py` never invalidates — its
+docstring says a tree listing "can be cached forever without any invalidation
+logic" — so manifests **accumulate** and an old revision's manifest vouches for
+new bytes.
+
+The resolver now sweeps the per-file `.cache/huggingface/download/<file>.metadata`
+sidecars, whose `commit_hash` tracks the bytes. Row B below **no longer
+reproduces**: adding the manifest changes nothing. Retained as the record of what
+was tried and why it was insufficient.
+
+| Run | Setup | Result (at the time; B is now superseded) |
+|---|---|---|
+| A | staged dir carries only `deadbeef….json` | `EXIT=77`, loud skip |
+| B | add `29f2d174….json`, nothing else changed | `EXIT=0`, 3 / 12181 — **no longer true; the sidecars decide** |
+| C | `VT_NEMOTRON35_SNAPSHOT` at the real NAS dir | `EXIT=0`, 3 / 12181 |
+| D | neither env var set | `EXIT=77`, banner names the export AND the manifest |
+| E | `VT_` set to a nonexistent dir, `CHECKPOINT_ROOT` valid | `EXIT=77` — refuses, never falls back |
+
+`VT_NEMOTRON35_SNAPSHOT` keeps `HfSnapshot`'s documented escape semantics
+unchanged and is checked first. That asymmetry is deliberate: naming ONE
+directory outright is the deliberate different-checkpoint run the override
+exists for, while naming a ROOT is not, so only the root path is revision-gated.
+
+**Two round-1 dispositions that existed nowhere.** Round 1 returned findings 1-8
+and 7 and 8 were answered verbally only.
+
+- **Finding 7 — the header lives under `src/`, not `include/`.**
+  **ACCEPTED, by operator decision.** `check-doc-checkpoint` classifies the
+  whole `include/vllm/` prefix as user-facing and demands `docs/USAGE.md` move
+  with it; nothing consumes the resolver yet and it is not on the
+  `include/vllm.h` ABI, so that edit would have documented nothing. The checker
+  behavior is tracked as **#515**. **W3 must promote the header to `include/`
+  when it becomes consumed surface** and pay the public-document obligation that
+  genuinely applies then. Recorded here so the debt outlives the conversation.
+- **Finding 8 — the exhaustive arm is opt-in because `CHECKPOINT_ROOT` is not
+  exported.** **ANSWERED.** The repo convention is `set -a; . ./.env; set +a`
+  (`.env.example:8`); no new mechanism was invented, and the skip banner now
+  names the exact export. LOW-3(b) supersedes the part of this that claimed
+  `hf_snapshot.h` did not apply — it does, and it is now the resolver.
+
+**Reported, outside this row's authority to fix.**
+`.agents/environment.md:29-30` states that `CHECKPOINT_ROOT` "states an INTENT
+and nothing more: no code in the tree reads `CHECKPOINT_ROOT`". The exhaustive
+arm reads it — before this branch directly, now through
+`parity::Nemotron35LightningSnapshot()` — so that sentence is false as written
+and belongs to whoever owns `.agents/environment.md`.
+
+**Land-prep gate, re-run on the re-merged tree.** Baselines are unchanged, which
+is the point: the merge moved the spec and nothing else this row owns.
+
+| Arm | Result |
+|---|---|
+| curated `test_modelopt_mixed_precision` | **26 cases / 167 assertions**, `Status: SUCCESS!` |
+| exhaustive `test_modelopt_mixed_precision_checkpoint` | **3 cases / 12181 assertions**, `Status: SUCCESS!` (`CHECKPOINT_ROOT=/mnt/nas_share/checkpoints`) |
+| clean Release, CUDA off, `-Werror` | 1209/1209 built, **0 warnings** |
+| full `ctest` (Release) | **402 tests, 401 passed**; `test_engine_core_proc` failed under `-j` and passed on a serial re-run (the known starvation set); `test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e` correctly *Skipped* with no `CHECKPOINT_ROOT` |
+| Debug + `VLLM_CPP_SANITIZE=address,undefined`, the four targets this change touches | **4/4 Passed**, including under CI's own `ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1`, `UBSAN_OPTIONS=print_stacktrace=1`, `VT_POOL_BYPASS=1` |
+| `scripts/agent-preflight.sh` | green |
+| `scripts/check-doc-checkpoint.py` | `OK: public documents match the claims this change makes.` |
+| `scripts/check-commit-trailers.py --range origin/main..HEAD` | `OK: commit trailer contract` |
+
+The whole-tree sanitizer run reports 39 LeakSanitizer failures across unrelated
+model/serving binaries. Those are the lane's known pre-existing state, not this
+change: `.github/workflows/ci.yml:775-793` marks `sanitize-cpu`
+`continue-on-error: true` precisely so "a pre-existing finding cannot block
+unrelated work" and cites a live run whose conclusion is `success` with both
+sanitizer lanes `failure`. This change cannot reach them either — the only `src/`
+file it touches is `modelopt_mixed_precision.h`, which `grep -rln` finds included
+by exactly two files, both of them its own tests, so every object in `libvllm.a`
+is byte-identical to one built from `origin/main`.
+
+**The six mutations, re-run against the re-merged tree.** All six RED on the
+curated arm; the baseline is `26 | 26 passed | 0 failed` before each.
+
+| Mutation | Curated result |
+|---|---|
+| `Parse` back on `ExtractQuantAlgo` | `FAILURE!` 25 passed / 1 failed — and REDs the exhaustive arm too, where the thrown case drops the assertion count to 12152 |
+| fixture loaded with plain `nlohmann::json` | `FAILURE!` 163 passed / 4 failed |
+| strategies 3+4 return the LAST match | `FAILURE!` 163 passed / 4 failed |
+| strategy 2 rebuilds the algo set per candidate | `FAILURE!` 164 passed / 3 failed |
+| `e.find(prefix)` → `prefix.find(e)` | `FAILURE!` 163 passed / 4 failed |
+| the `experts` branch deleted | `FAILURE!` 163 passed / 4 failed |
+
+Read `Status:`, not `assertions:` — mutation 1 prints `0 failed` on the
+exhaustive arm while failing, because the case THREW and its remaining
+assertions were never reached.
 
 ## 5. Gates
 
@@ -214,12 +504,359 @@ For this row that means:
 | Arm | State |
 |---|---|
 | ModelOpt NVFP4 W4A16 g16 + FP8 W8A8 (the shipped checkpoint) | W1-W6, the critical path |
-| Safetensors bf16 | reachable via the same loader; owed a fixture |
+| Safetensors bf16 | reachable via the same loader; owed a fixture. Its ENUMERATION is now correct (§5d finding 1): a producer with no `quantization_config` claims the bare weights and none of the 92 FP8/NVFP4 scale companions |
 | **GGUF k-quants / i-quants** through the shared GGUF loader | **OWED.** No NemotronH GGUF arm exists |
 
 Until the GGUF arm lands it is **refused by name** at load, naming the missing
 piece, never silently dequantized to a supported path — a silent fallback is
 exactly what a token gate cannot see. Tracked as W7.
+
+## 5c. W3 result — registered, parsed, enumerated, KV-shaped (2026-08-13)
+
+W3 landed on `row/MODEL-NEMOTRON-H-W3B` (base `fafa16f0`). It makes the
+architecture KNOWN; it runs nothing. The forward and GGUF arms REFUSE BY NAME.
+
+**Enumeration, the hard numbers.** `EnumerateNemotronHTensors` claims **18487 of
+18487** released tensors; **0 unaccounted, 0 invented, 0 refused** — every tensor
+has a named consumer, so no refusal was needed. Composition: 5 root (embeddings,
+`norm_f`, the NVFP4 `lm_head` triple), 23 mamba layers x 13, 6 attention x 7,
+23 MoE x 777 (2 router + 128x6 expert + 6 shared + 1 norm), and 270 MTP
+(`mtp.layers.0` 8, `mtp.layers.1` 262). Both directions are gated against a
+committed headers-only projection of the index, and a second case re-verifies
+that projection against the LIVE checkpoint when `VT_NEMOTRON35_SNAPSHOT` names
+it.
+
+**Four things the reconnaissance had wrong or unstated, settled against source
+and disk:**
+
+1. **`layers_block_type` really is the source of truth, but for a subtler
+   reason than "the config says so".** vLLM VENDORS its own `NemotronHConfig`
+   (`transformers_utils/configs/nemotron_h.py:277-287`) in which the polarity is
+   REVERSED — `hybrid_override_pattern` is the ctor argument and
+   `layers_block_type` the derived property. That class is imported by
+   `nemotron_h.py:83` for TYPE ANNOTATION only; the object that reaches the
+   model comes from transformers `AutoConfig`, where `num_hidden_layers` is a
+   property over `layers_block_type` whose setter discards the checkpoint's
+   value (`configuration_nemotron_h.py:225-238`). §5a's live oracle run is what
+   settles it on the real checkpoint. Both spellings are accepted here, the
+   modern one winning — **for the SCHEDULE pair only**; see §5d, which corrects
+   the generalization this sentence originally made.
+2. **`moe_latent_size`: absent and `null` are the SAME state.** Upstream's
+   predicate is `getattr(config, "moe_latent_size", None) is not None`
+   (`nemotron_h.py:143`), so a missing key and an explicit `null` both mean "no
+   latent MoE". A three-state representation would have been inventing a
+   distinction upstream does not make. `std::optional` covers both; a real value
+   REFUSES (§0).
+3. **The shared `detail::ResolveMambaSsmCacheDType` is the WRONG reader here,
+   and using it silently halves the recurrent state.** It reads
+   `HfConfig::mamba_ssm_dtype`, which `hf_config.cpp:439` parses from the key
+   **`mamba_ssm_dtype`** — Qwen3.5/3.6's spelling. NemotronH ships
+   **`mamba_ssm_cache_dtype`** (`configuration_nemotron_h.py:121`), so the
+   shared helper saw an empty string and returned the CONVOLUTION dtype. Caught
+   by the KV gate as `page_size_bytes() == 1085440` against an expected
+   `2134016` — the SSM state at bf16 instead of f32. This is not a Qwen bug;
+   the two families genuinely use different config keys. Resolved locally by
+   `NemotronHSsmCacheDType`, with the reason recorded at the call site.
+4. **The conv-state layout discrepancy is real and deliberate.** Upstream's
+   default is `"SD"` = `(state_len, dim)` (`mamba_utils.py:27-48`,
+   `VLLM_SSM_CONV_STATE_LAYOUT` unset); our local convention across
+   `qwen3_5_common.cpp:85` and `kimi_linear_registry.cpp:156` is
+   `(dim, state_len)`. Same bytes, same page size; the local convention is kept
+   so the shared runner sees one orientation, and the divergence is commented
+   rather than left for W4.
+
+**KV topology.** Two groups carrying their REAL per-layer names — 6
+`backbone.layers.{5,12,19,26,33,42}.mixer` on a `FullAttentionSpec(2 kv heads,
+head_size 128)`, and 23 mamba layers on a `MambaSpec` with shapes
+`{{6144, 3}, {64, 64, 128}}` and dtypes `{bf16, f32}`. `conv_dim == 6144` is
+falsified straight off disk by `mixer.conv1d.weight` BF16 `[6144, 1, 4]`, and
+`in_proj` `[10304, 2688]` confirms `z + xBC + dt`. The names are load-bearing:
+`kv_cache_utils.cpp:979` multiplies a mamba group's page by
+`layer_names.size()`, and `kv_cache_interface.cpp:151-158` does the same for an
+attention group, so a one-element tag would under-count both by 23x and 6x.
+
+**Scope boundary held.** No per-module quant algorithm is resolved — that is W1,
+which is not on `main`. W3 reads four coarse, individually falsifiable keys
+(`quant_method`, `quant_algo`, `kv_cache_scheme`, and the `mtp*` entry in
+`ignore`) and derives the scale companions STRUCTURALLY; the enumeration gate is
+what proves that derivation against all 18487 tensors. A non-ModelOpt producer
+refuses by name. One piece of honest debt is recorded in the code: the quantized
+companion layout of a dense `mlp` block is DERIVED from the shared linear
+layout, because no in-scope released NemotronH checkpoint ships one.
+
+**Fixture.** `tests/vllm/models/fixtures/nemotron_h_35_lightning/` holds the
+released `config.json` minus exactly `quantization_config.{config_groups,
+quantized_layers}` (865 KB of 1.34 MB, the 5981-entry maps W1 owns) and a
+707-family projection of the index. `ignore` is KEPT, unlike the original plan:
+at 2.4 KB it is small, and its `mtp*` wildcard is what makes the MTP tower
+unquantized — eliding it would have forced a guess about 270 tensors.
+
+**Mutation proof (IMP-MUTATE).** Each defect applied alone to the restored tree,
+rebuilt, the gate run, then `git checkout` and `git status --porcelain` verified
+empty. All five turn it RED:
+
+| Mutation | Result |
+|---|---|
+| `layers_block_type` `"moe"` mapped to `kAttention` | 4 cases / 9 assertions FAILURE |
+| `LayerIndices` shifts the FIRST attention index by +1 | 2 cases / 2 assertions FAILURE |
+| `conv_dim` drops the `2*n_groups*state_size` term | 4 cases / 8 assertions FAILURE |
+| SSM cache dtype collapsed to the conv/activation dtype | 1 case / 2 assertions FAILURE |
+| mamba `dt_bias` left UNCLAIMED (23 tensors) | 1 case / 2 assertions FAILURE |
+
+**Gate evidence.** Release `-Werror` CPU: `test_nemotron_h_scaffold` 10/10 cases,
+38245/38245 assertions, `Status: SUCCESS!`; with `VT_NEMOTRON35_SNAPSHOT` set,
+10/10 and 39113/39113. Debug arm (asserts unmasked): identical. Full `ctest`:
+`100% tests passed, 0 tests failed out of 401` (`test_voxtral_e2e` skipped, no
+asset). `test_model_registry` 24/24 and `test_model_loader_gguf` 3/3 after their
+pinned 37-architecture ledgers were reconciled to 38.
+
+One defect was found this way rather than by inspection: the live re-verification
+first died with `[json.exception.type_error.304] cannot use at() with null` from
+inside a loop nowhere near its cause. `nlohmann::json::parse(x).items()` binds a
+range to a TEMPORARY that is destroyed before the body runs. It reads as a clean
+one-liner and it is undefined behaviour; the materialized form is what the
+muse-glimmer precedent already used.
+
+**Not done here:** the forward (W4), the MTP head (W5), the e2e token gate (W6),
+the GGUF arm (W7). The row stays `INVENTORIED`.
+
+## 5d. W3 repair — the review's four findings, and two residuals (2026-08-13)
+
+The fresh review of `row/MODEL-NEMOTRON-H-W3C` @ `3295d0c1a` (PR #565) returned
+**PASS** with four MINOR/NIT findings and two report-only items. Repaired on
+`row/MODEL-NEMOTRON-H-W3-FIX` (base `3295d0c1a` + `origin/main` re-merged, W1's
+`MIXED_PRECISION` resolver having landed as `1bc5ef82c`).
+
+**1. `ClaimMamba` ignored `quantized` — FIXED.** Every other claimer
+(`ClaimNvfp4`, `ClaimMoe`, `ClaimMlp`, and `ClaimAttention`'s `fp8_kv`) gates on
+`quantized`; `ClaimFp8` did not. The released config MINUS `quantization_config`
+parsed without refusal and enumerated **92 tensors an unquantized checkpoint
+does not ship** — `backbone.layers.{mamba}.mixer.{in,out}_proj.{weight_scale,
+input_scale}`, 23x4, first `backbone.layers.0.mixer.in_proj.weight_scale`. That
+is exactly the shape §5b's owed **safetensors bf16 arm** will present. Nothing
+consumes the map yet, so no gated claim was wrong — but an unimplemented arm is
+refused BY NAME, never silently mis-enumerated. `quantized` now threads through
+`ClaimFp8`/`ClaimMamba` and both call sites (backbone `quantized`, MTP
+`mtp_quantized`). The 18487-tensor gate is unchanged: the released checkpoint is
+quantized, and its MTP schedule is `{attention, moe}` with no mamba block.
+
+**2. Legacy-alias precedence was INVERTED — FIXED, and the RECORD corrected.**
+`Get{Int,Double,Bool}Aliased` preferred the MODERN key. Upstream does the
+opposite for the `mamba_*` SCALARS: `configuration_nemotron_h.py:145-155` is
+`self.n_groups = kwargs.pop("mamba_n_groups") if "mamba_n_groups" in kwargs else
+self.n_groups`, which OVERWRITES an already-populated dataclass field, so
+**legacy wins**. Re-derived by RUNNING transformers @ `7d06b1a5` (the pin this
+port names), not by reading it:
+
+```
+NemotronHConfig(n_groups=8, mamba_n_groups=4, conv_kernel=4, mamba_d_conv=7)
+  -> n_groups=4, conv_kernel=7
+NemotronHConfig(chunk_size=128, mamba_chunk_size=77, expand=2, mamba_expand=9,
+                use_conv_bias=True, mamba_conv_bias=False,
+                time_step_min=1e-3, mamba_dt_min=0.5)
+  -> chunk=77 expand=9 conv_bias=False dt_min=0.5
+NemotronHConfig(layer_types=['mamba','mamba'], hybrid_override_pattern='*-')
+  -> ['mamba', 'mamba']
+NemotronHConfig(mtp_layers_block_type=['mamba'], mtp_hybrid_override_pattern='*E')
+  -> ['mamba']
+```
+
+So the two families **genuinely disagree** and each is mirrored on its own
+terms: legacy-wins for the `mamba_*` scalars (`:145-155`), modern-wins for both
+SCHEDULE pairs (`:158-165`, `:176-184`, where the legacy pattern is consulted
+only when the modern list is `None`). Worse than the behavior was the record:
+the code comment and §5c above asserted "the modern one wins" as if it were
+upstream's rule, which is what would mislead the next porter. Both polarities
+are now stated where they are implemented, each with its own upstream anchor and
+an explicit "do not unify these" note. **No released checkpoint ships both
+spellings of one field**, so this was a mirroring defect and a record defect,
+never a live one — which is precisely why it needed a test.
+
+**3. The forward refusal was claimed but never exercised — FIXED.** The case
+titled "the unported ARMS refuse by name" had one SUBCASE (GGUF).
+`ForwardNemotronHForCausalLM` is an unconditional `VT_CHECK`, which throws
+`std::runtime_error` (`vt/dtype.h:11-17`), so it is directly callable with a stub
+`LoadedModel`. Now asserted, including that the message NAMES the missing piece
+(W4 and this spec).
+
+**4. `NemotronHBlockName` had zero call sites — FIXED by using it.**
+`BlockFromName` now maps both directions through it and builds its refusal's
+expected-list from the enum, so a fifth block kind cannot arrive alongside a
+message that still lists four. A round-trip assertion pins every spelling the
+refusal offers to one that actually parses.
+
+**5. RESIDUAL, pre-existing, NOT fixed here — `docs/FEATURES.md:171` is off by
+two.** It says "27 of the 32 registered text-generation architectures" while
+`:173` implies 38 − 3 Parakeet − 1 `LlamaModel` = **34**, and
+`tests/vllm/models/test_model_registry.cpp:47` now says "34 text archs". W3's
+`+1` increment was correct; the BASE number was already stale before this row
+touched it, and no checker validates it. Left for the operator to file — the
+repair branch has no `docs/` authority, and fixing a pre-existing doc drift
+inside a scoped repair would hide it.
+
+**6. RESIDUAL, accepted by design — fixture DTYPE drift is invisible offline.**
+The committed index projection pins tensor NAMES and SHAPES offline; DTYPES are
+only re-verified by the live case
+(`test_nemotron_h_scaffold.cpp`, `VT_NEMOTRON35_SNAPSHOT`). CI has no
+checkpoint, so a re-quantization that changed dtypes while preserving names and
+shapes — which has happened before to an `unsloth` repo under an unchanged name
+— would pass CI and fail only where the checkpoint is staged. That is the
+declared design (the alternative is committing dtype metadata that nothing
+offline can falsify), and it is named here so W4/W6 do not rediscover it.
+
+**Mutation proof, re-run in full on the repaired tree.** Each defect applied
+alone to the restored tree, rebuilt, the gate run, then the file restored and
+its SHA-256 re-verified byte-for-byte (`git status --porcelain` empty
+afterwards). All fourteen turn it RED — the ten from the W3 review plus four
+this pass adds:
+
+| Mutation | Result |
+|---|---|
+| `layers_block_type` `"moe"` mapped to `kAttention` (at `BlockFromName`) | 7 cases / 12 assertions FAILURE |
+| `kMoe` claims attention tensors (at the enumeration switch) | 2 cases / 4 assertions FAILURE |
+| `LayerIndices` shifts every index by +1 | 2 cases / 2 assertions FAILURE |
+| `conv_dim` drops the `2*n_groups*state_size` term | 4 cases / 8 assertions FAILURE |
+| SSM cache dtype collapsed to the conv/activation dtype | 1 case / 2 assertions FAILURE |
+| mamba `dt_bias` left UNCLAIMED (23 tensors) | 2 cases / 3 assertions FAILURE |
+| MTP `final_layernorm` dropped | 2 cases / 3 assertions FAILURE |
+| attention KV group collapsed to ONE layer tag | 1 case / 1 assertion FAILURE |
+| the `mtp*` `ignore` entry not honored | 3 cases / 4 assertions FAILURE (assertions 38284 -> **39320**) |
+| mamba KV group collapsed to ONE layer tag | 1 case / 1 assertion FAILURE |
+| MTP `enorm` dropped | 2 cases / 3 assertions FAILURE |
+| **NEW** the forward returns `{}` instead of refusing (finding 3) | 1 case / 2 assertions FAILURE |
+| **NEW** `NemotronHBlockName` mislabels `kMoe` (finding 4) | 8 cases / **0 assertions** FAILURE |
+| **NEW** `ClaimFp8` ignores `quantized` again (finding 1) | 1 case / 1 assertion FAILURE |
+| **NEW** the aliased getters prefer MODERN again (finding 2) | 1 case / 4 assertions FAILURE |
+
+Two of those rows are worth keeping in view. The `mtp*` mutation makes the
+assertion COUNT go **up** by 1036 while the gate goes red — a changed count is
+itself the signal. And the `NemotronHBlockName` mutation reports
+**`assertions: 28 | 28 passed | 0 failed`** next to `8 failed` test cases: the
+cases THREW, so `grep 'assertions:'` alone would have read that mutation as
+clean. Read `Status:`.
+
+**Gate evidence (this repair).** Local CPU-only host (`VLLM_CPP_CUDA=OFF`), disk
+**68G free / 85% used** at every measurement below.
+
+| Arm | Result |
+|---|---|
+| Release `-Werror`, full build | 0 warnings, 0 errors |
+| Release `test_nemotron_h_scaffold`, offline | **12/12 cases, 38284/38284 assertions, `Status: SUCCESS!`** |
+| Release `test_nemotron_h_scaffold`, `VT_NEMOTRON35_SNAPSHOT` live | **12/12, 39152/39152, `Status: SUCCESS!`** |
+| Debug (`-g0`, asserts unmasked), offline | 12/12, 38284/38284, `Status: SUCCESS!` |
+| Debug (`-g0`), live | 12/12, 39152/39152, `Status: SUCCESS!` |
+| Full `ctest -j4` | **100% tests passed, 0 tests failed out of 403** (skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e` — neither has its asset here) |
+
+The W3 baselines were 10/38245 offline and 10/39113 live; the deltas (+2 cases,
++39 offline / +39 live assertions) are this pass's three new cases and the
+`NemotronHBlockName` round-trip. RED-before on the pre-fix tree was
+12 cases / 9 failed assertions, reporting `92` companions with first
+`backbone.layers.0.mixer.in_proj.weight_scale`, and `8 == 4` / `4 == 7` /
+`2 == 9` / `128 == 77` / `0.001 == 0.5` / `0.1 == 0.6` / `0.0001 == 0.7` for the
+alias precedence.
+
+## 5e. W3 landing — the `doc-checkpoint range` gate, and how it was cleared (2026-08-13)
+
+`row/MODEL-NEMOTRON-H-W3-FIX` @ `cb37239d4` (PR #572) was green on every gate
+except one, and could not clear it itself:
+
+```
+Committed range vs origin/main:
+  FAIL doc-checkpoint range
+     ERROR: commit 3981de6a4: changed feature_surface but did not update
+     docs/FEATURES.md.
+```
+
+The rule is unconditional and PER-COMMIT: `check-doc-checkpoint.py:79`
+classifies any path under `src/vllm/model_executor/models/` as
+`feature_surface`, `:311-316` requires `docs/FEATURES.md` in the SAME commit,
+and `commits_in_range` (`:369-375`) walks
+`rev-list --reverse --no-merges origin/main..HEAD` — so W3C's own
+`docs/FEATURES.md` edit in `3295d0c1a` does not cover a later commit. `ci.yml:343`
+runs the identical invocation, so CI was red for the same reason. The checker
+has no exemption mechanism, deliberately, and weakening it was never on the
+table.
+
+`main` is never force-pushed, so `3981de6a4` could not be amended in place.
+The history was instead rebuilt on `row/MODEL-NEMOTRON-H-W3-LAND` as ONE
+squashed commit off current `origin/main`, carrying the whole W3 + W3-FIX
+content with the `docs/FEATURES.md` clause included — which is what the
+squash-merge would have produced anyway, and which satisfies the per-commit rule
+trivially. This mirrors the precedent set on this row when `W3B` was superseded
+by `W3C`.
+
+**Tree equivalence, proven not asserted.** `git diff cb37239d4` against the
+squashed tree lists exactly five files: the four that `72e661ae4` (the one
+`origin/main` commit the fix branch lacked, #442 DSPARK) touches, plus the one
+`docs/FEATURES.md` line. Every `src/`, `tests/`, `CMakeLists.txt`,
+`docs/USAGE.md` and spec-body path is byte-identical.
+
+**The `docs/FEATURES.md` wording, and why it is not the one proposed here.** The
+draft above read "claims the bare weights and none of the **92** FP8/NVFP4 scale
+companions". 92 is the count of the companions `ClaimMamba` was leaking
+(23 mamba blocks × 2 projections × 2), not the number of scale companions in the
+model — the released checkpoint carries thousands, across `ClaimNvfp4`,
+`ClaimMoe`, `ClaimMlp` and the fp8-KV pair. Naming 92 would have implied the
+architecture has 92 companions in total. What the gate actually asserts is
+stronger and simpler: an unquantized producer claims a strict SUBSET of the
+quantized arm's names with ZERO companions of any kind
+(`.weight_scale`, `.weight_scale_2`, `.input_scale`, `.k_scale`, `.v_scale`).
+The landed clause is:
+
+> 18487/18487 tensors claimed; **a bf16 config claims that set minus its scale
+> companions.** Nothing runs yet (spec #517, blocked on #496)
+
+`check-public-doc-tables.py` caps a table CELL at 220 chars and the row was
+already at 211, so the clause was paid for out of this row's own budget, as
+that checker's `MAX_ROW_CHARS` comment directs ("shorten THIS row and move its
+forensics"). What moved out is `het-KV shapes match \`mamba2_state_shape\`` — a
+forensic anchor already carried by §5c above and by "KV-shape gated", which
+stays in the cell. `0 unaccounted` and `released` went too, both implied by
+"18487/18487". Finding 5's `:171`/`:173` count drift was NOT touched; it stays
+open for its own issue.
+
+**Every gate re-run on the squashed tree**, because a squash is a new tree and
+inherited numbers are void. Local CPU-only host (`VLLM_CPP_CUDA=OFF`, GNU 13.3,
+Ninja), disk **68-69G free / 85% used** at every measurement:
+
+| Arm | Result |
+|---|---|
+| Release `-Werror`, clean full build | 1213/1213 targets, **0 `warning:` lines in the captured log**, 0 errors |
+| Release `test_nemotron_h_scaffold`, offline | **12/12 cases, 38284/38284 assertions, `Status: SUCCESS!`** |
+| Release, `VT_NEMOTRON35_SNAPSHOT` live | **12/12, 39152/39152, `Status: SUCCESS!`** |
+| Debug (`-g0`, asserts unmasked), offline | 12/12, 38284/38284, `Status: SUCCESS!` |
+| Debug (`-g0`), live | 12/12, 39152/39152, `Status: SUCCESS!` |
+| Full `ctest -j4` | **100% tests passed, 0 failed out of 403** (skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e` — neither has its asset here) |
+| `doc-checkpoint` over `origin/main..HEAD` | **ok** (was the one FAIL) |
+
+**The fifteen mutations, re-applied to the squashed tree.** Each alone, rebuilt,
+run, restored, SHA-256 re-verified and the working-tree-vs-index diff proven
+empty. All fifteen RED:
+
+| Mutation | Result on the squashed tree |
+|---|---|
+| `layers_block_type` `"moe"` → `kAttention` at `BlockFromName` | 7 cases / 12 assertions FAILURE |
+| `kMoe` claims attention tensors (enumeration switch) | 2 cases / 4 assertions FAILURE |
+| `LayerIndices` shifts every index by +1 | 2 cases / 2 assertions FAILURE |
+| `conv_dim` drops the `2*n_groups*state_size` term | 4 cases / 8 assertions FAILURE |
+| SSM cache dtype collapsed to the conv dtype | 1 case / 2 assertions FAILURE |
+| mamba `dt_bias` left UNCLAIMED | 2 cases / 3 assertions FAILURE (38284 → 38238) |
+| MTP `final_layernorm` dropped | 2 cases / 3 assertions FAILURE |
+| attention KV group collapsed to ONE layer tag | 1 case / 3 assertions FAILURE |
+| the `mtp*` `ignore` entry not honored | 3 cases / 4 assertions FAILURE (38284 → **39320**) |
+| mamba KV group collapsed to ONE layer tag | 1 case / 2 assertions FAILURE |
+| MTP `enorm` dropped | 2 cases / 3 assertions FAILURE |
+| the forward returns `{}` instead of refusing | 1 case / 2 assertions FAILURE |
+| `NemotronHBlockName` mislabels `kMoe` | 8 cases / **0 assertions** FAILURE |
+| `ClaimFp8` ignores `quantized` again | 1 case / 1 assertion FAILURE |
+| the aliased getters prefer MODERN again | 1 case / 8 assertions FAILURE |
+
+The two instructive rows survive the re-run unchanged. The `mtp*` mutation moves
+the assertion COUNT **up** by 1036 while the gate goes red — a changed count is
+itself the signal. And `NemotronHBlockName` prints
+**`assertions: 28 | 28 passed | 0 failed`** beside `8 failed` test cases,
+because the cases THREW: `grep 'assertions:'` reads that red gate as clean.
+Read `Status:`.
 
 ## 6. Risks / decisions
 
@@ -242,15 +879,214 @@ exactly what a token gate cannot see. Tracked as W7.
   non-attention layers and may not move tokens on short prompts. Gate with a
   long-prompt arm, not only a 6-token one.
 
+## 6a. W2 note — the non-gated `relu²` expert, as built
+
+**Seam verdict: the non-gated expert is NOT a merged pair, and does not get a
+`MergedGemmGroup` descriptor.** `MergedGemmGroup` describes N GEMMs *sharing
+operand A* collapsed into one launch (`merged_gemm.h:1-22`). NemotronH's expert
+has exactly one projection — `ckpt_names=("up_proj", "down_proj", "")`
+(`nemotron_h.py:220`, the empty third entry being the absent gate) — so with
+N == 1 there is nothing to merge and no launch to save; an arity-1 descriptor
+would name a fusion that does not exist. `MlpGateUpMethodBase`
+(`linear.h:82-86`) is likewise a *merged `[2I,H]` gate_up* seam and has no pair
+to hold either.
+
+The arm is therefore the **existing** grouped projection plus the activation we
+did not have — exactly the shape the gated bf16 archs had before their pair was
+folded (`kMoeGroupedGemmBf16` + `kMoeSiluMul`):
+
+```
+up   : kMoeGroupedGemmBf16   (bf16)  |  kMoeGroupedGemmNvfp4Marlin (W4A16 g16)
+act  : kMoeRelu2                          <- NEW, the only new kernel
+down : kMoeGroupedGemmBf16   (bf16)  |  kMoeGroupedGemmNvfp4Marlin (W4A16 g16)
+comb : kMoeCombine(..., routed_scale)     <- routed scale on the OUTPUT
+```
+
+No parallel MoE path was added. The reasoning is recorded next to the seam it
+excludes (`merged_gemm.h`, the note after the bf16-sibling block).
+
+**`vt::MoeRelu2` (`OpId::kMoeRelu2`, CPU + CUDA).** Mirrors
+`ReLUSquaredActivation` (`layers/activation.py:609-628`) as the fused-MoE path
+reaches it: `activation_without_mul("relu2")` → `MoEActivation.RELU2_NO_MUL`
+(`layers/fused_moe/activation.py:34`; `activation_without_mul` is `:98`, the
+enumerator at `:33` is `GELU_TANH_NO_MUL`) → `apply_moe_activation`'s (`:184`)
+`F.relu(input, inplace=True); torch.square(input, out=output)`. The **dtype
+order is the mirrored part**: upstream's kernel
+(`csrc/libtorch_stable/activation_kernels.cu:673-678`) widens to f32, clamps at
+zero in f32, squares in f32 and rounds ONCE on the store. No new f32 buffer is
+introduced — the op reads and writes the caller's dtype and only its arithmetic
+is f32, which is what `LoadF32`/`StoreF32` already are elsewhere in `vt`.
+
+**`routed_scaling_factor` is applied to the OUTPUT**
+(`apply_routed_scale_to_output=True`, `nemotron_h.py:234`). `vt::MoeCombine`
+gained a trailing `routed_scale` (default `1.0f`, so every landed caller is
+byte-identical) which multiplies the routed sum *before* the shared term is
+added — literally `moe_runner.py:390-407` (`:402-406` `fused_output *= routed_scaling_factor`,
+`shared_output` untouched) followed by `:722-725` (`shared_output + fused_output`).
+Upstream forces the ROUTER's factor to `1.0` in exactly this case
+(`layer.py:291-300`), so `MoeRouterTopKArgs::routed_scaling_factor` stays 1.0 on
+this path. Note this is the *opposite* polarity from Laguna, which folds the same
+factor into the router weights by linearity (`laguna_ops.h:48`); NemotronH takes
+the literal upstream form.
+
+**`group_size=16` NVFP4 — SUPPORTED, risk closed by source.** `MoeMarlinArgs`
+already defaults to `group_size = 16` with `mxfp4 = false` (`ops.h`), and
+`cuda_moe_marlin.cu:7,115-129` documents and consumes exactly that
+(`group_blocks=1`, `s_type = kFE4M3fn`, `num_groups = size_k / group_size`); 32
+is reachable only via the MXFP4 branch. It is the configuration the landed
+NVFP4 MoE archs (Laguna, Qwen3.5) already run. A unit test pins the default so a
+later widening cannot silently re-point these experts.
+
+**CUDA arms — what was actually run, and by whom.** The implementer did NOT
+compile them: their worktree had no `nvcc`, so at `e2d68404` the CUDA arms were
+*written and reviewed*, never built, and the earlier wording here
+("compiled-and-reviewed") overstated it. They have since been compiled and
+GPU-verified **by the fresh reviewer**, on `dgx.casa` (GB10, nvcc 13.0.88), from
+a `git archive` of `e2d68404`:
+
+- Release `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON` exited 0 with
+  **671/671 targets and zero warnings**; `cuda_moe.cu.o` compiled under
+  `-Werror=all-warnings`.
+- A reviewer-authored GPU parity test proved `MoeRelu2` CUDA == CPU
+  **bit-for-bit** over 4097 elements in all four dtype arms; that CUDA
+  `routed_scale` scales the routed sum only; and that the `1.0f` default is
+  byte-identical to the landed 4-arg call across all 8 dtype combinations.
+- Branch tests on the GPU box: `test_ops_moe_nongated_relu2` 10/10,
+  `test_ops_moe` 9/9 with 33451 assertions.
+
+**That GPU build is NOT a proof about this head, and the merge messages that
+implied otherwise were wrong (corrected 2026-08-13).** Four of this branch's
+land-prep merge commits carry a sentence of the form "`src/vt/cuda/cuda_moe.cu`
+and `vt/ops.h` are untouched by this merge, so the CUDA arm the fresh reviewer
+compiled and GPU-verified on GB10 at `e2d68404` is unchanged." Each half is
+individually true — `git diff --shortstat <merge>^1 <merge> -- include/vt/ops.h`
+is empty for `57e4301489`, `40908db153`, `6ac8eed85e`, `721f44d38d` and
+`f6a7f87090` — but the CONCLUSION does not follow, because the compile inputs
+moved in commits those merges do not cover. Measured on this branch:
+
+| Since `e2d68404` (the GPU-verified tree) | Delta |
+|---|---|
+| `include/vt/ops.h` | **+180 / −1** (`git diff --numstat e2d68404 HEAD`) |
+| `src/vt/cuda/cuda_moe.cu` | **+7 / −1** |
+
+The header movement is `d3cd442e6`, the merge that brought Mamba2 SSD W1
+(`fe81bd3b5`, #496) — a merge that DID touch `include/vt/ops.h`, by +179 lines
+against its first parent (`git show --stat d3cd442e6`) — and the `.cu` movement
+is this row's own `dd7a6477d` repair. So `cuda_moe.cu` has been compiled at
+`e2d68404` and nowhere since, and no local GPU host is reachable to redo it
+(`dgx.casa` is down). The standing evidence for the CUDA arm at THIS head is
+therefore the PR's `cuda-fat-build` CI job, which compiles `cuda_moe.cu`
+against the merged `include/vt/ops.h` for 10 architectures under
+`-Werror=all-warnings`; the GB10 run remains the evidence for the arm's
+RUNTIME behaviour at `e2d68404`, which the eight-line `.cu` delta since is a
+comment change plus the `routed_scale` parameter the reviewer's own GPU parity
+test exercised.
+
+**Scope of the "bit-for-bit" claim.** The reviewer's GPU parity result is a
+MEASUREMENT on GB10, not a guarantee the build flags provide: `-ffp-contract=off`
+is pinned for CXX, HIP and OBJCXX (`CMakeLists.txt:55`, `:393`, `:467`) but
+nothing passes nvcc `--fmad=false`, and `CMakeLists.txt:41-56` carves CUDA out
+deliberately ("GPU parity tests compare GPU-vs-GPU"). `MoeRelu2` is safe by
+construction — a compare-select and one multiply, with no multiply-add to
+contract — and the `routed_scale` step is one standalone multiply on the
+finished accumulator, which is why §6a's evidence is stated for exactly those
+two. `MoeCombine`'s `acc += w * Load(...)` reduction is the contractable one
+and is NOT covered; the comment in `cuda_moe.cu` claiming it was has been
+narrowed to what holds. The flag gap itself is repo-wide and tracked as **#591**
+(found independently in `cuda_mamba2_ssd.cuh`); it is not repaired here.
+
+**Still OWED** (no GPU in the implementer/repair worktrees, and not covered by
+the above): `kMoeGroupedGemmNvfp4Marlin` exercised on the real NemotronH g16
+tensors, and the end-to-end NemotronH MoE block on GB10. Both remain owed to W6
+or an earlier GPU-host spot check. The `group_size` unit test pins the default
+only — it is not a run of the Marlin arm.
+
+**Evidence.** `tests/vt/test_ops_moe_nongated_relu2.cpp` (**12 cases / 81
+assertions**): the activation against hand-computed exact values, the
+`relu`/`silu` mis-ports, a bf16-in/f32-out arm that catches narrowing the square,
+a bf16-out raw-bit arm, the shape/dtype/**device** contract refusals, the routed
+scale on the routed sum only, the routed scale on the **assembled sum rather than
+each router weight** (bitwise), the f16-out refusal that makes upstream's fp16
+arm unreachable, the 1.0 default being byte-identical to the landed call, and the
+whole expert `up → relu² → down → scaled combine` against an
+independently-written scalar reference.
+
+Mutations executed and caught (Release, `-ffp-contract=off`; every one restored
+and md5-verified afterwards):
+
+| # | Mutation | Target | Result |
+|---|---|---|---|
+| M1 | `relu` (square dropped) | `test_ops_moe_nongated_relu2` | RED 5 cases / 27 assertions |
+| M2 | `silu` (the gated family's activation) | same | RED 5 / 35 |
+| M3 | square narrowed through bf16 | same | RED 2 / 20 |
+| M4 | `routed_scale` dropped | same | RED 3 / 32 |
+| M5 | `routed_scale` applied to routed **+ shared** | same | RED 2 / 29 |
+| M6 | `routed_scale` **folded into each router weight** | same | RED 1 / 4 |
+| M7 | routed scale folded into the router **logits** | `test_ops_moe_router_grouped` | RED 3 / **525** (was recorded 498 — see below) |
+| M8 | NVFP4 `group_size` default 16 → 32 | `test_ops_moe_nongated_relu2` | RED 1 / 1 |
+| M9 | `MoeRelu2` device `VT_CHECK` dropped | same | RED 1 / 2 |
+| M10 | `IsOutFloat` widened to admit `kF16` | same | RED 1 / 2 |
+
+M6 is the one this repair added. At `e2d68404` it **survived green** (10/10
+cases, 71/71 assertions): the landed cases all compared with a tolerance, and the
+fold is exact-arithmetic-equal, so nothing could see it. It is also the most
+likely W4 mistake, because Laguna performs exactly that fold
+(`laguna_ops.h:48`) — legally, since Laguna passes no `shared`. The new case
+pins it bitwise on decimal-grid data whose f32 products carry full mantissas
+(rows separate by 10 and 4 ULP), with a `REQUIRE` that the data separates the two
+forms so the green cannot be vacuous. M7 does NOT red the NemotronH file by
+design — this path forces the router factor to 1.0 (`layer.py:291-300`), so the
+router's own suite is where that defect is visible.
+
+**M7's assertion count was recorded wrong (repaired 2026-08-13).** The table and
+the `dd7a6477d` commit message both said `RED 3 / 498`. Three independent
+re-measurements — the fresh review's, the operator's, and this repair's — all
+read **3 cases / 525 assertions** failing, out of the unchanged 14 / 941
+baseline. The CASE count was right; only the assertion count was wrong, and 498
+is reproducible by nobody. `tests/vt/test_ops_moe_router_grouped.cpp` and the
+grouped-router kernel it exercises have not moved since `e2d68404`
+(`git log --oneline e2d68404..HEAD -- tests/vt/test_ops_moe_router_grouped.cpp`
+is empty), so the count is stable and the original entry was a transcription
+slip, not drift. Re-measured here by folding
+`args.routed_scaling_factor` into the logits fed to sigmoid/softmax in
+`MoeRouterGroupedTopKKernel` (`cpu_ops.cpp:2325-2339`) and disabling the
+post-renormalize weight scale (`:2430-2434`); Release, `-ffp-contract=off`;
+tree restored and md5-verified (`cd409b9465c00834be373cf3ecfb4c1d`), rebuilt,
+back to 14/941 SUCCESS.
+
 ## 7. Now
 
-**State at this commit:** spec committed, implementation **not started**. The
-row stays `INVENTORIED`; this commit changes no lifecycle state. The checkpoint
-is staged on the NAS and the oracle smoke run is queued behind the GPU lock.
+**State at this commit:** **W1 and W3 have LANDED on `main`; W2 is in
+re-review.** The `MIXED_PRECISION` resolver landed at `1bc5ef82c` (#561) and the
+W3 scaffold at `c6b240edd` (#576); both are merged into this branch, and their
+spec sections (§4's three W1 subsections, §5c/§5d/§5e) are main's, carried here
+byte for byte. The Mamba2 SSD kernel work W1 landed earlier at `47960a009`
+(#496), so `include/vt/ops.h` carries main's
+`kMamba2ChunkScan`/`kMamba2StateUpdate`/`kRmsNormGatedGroup` first and appends
+`kMoeRelu2` after them; no existing op id shifted. W2 (the non-gated `relu²`
+expert, §6a) was reviewed PASS at `e2d68404`, repaired for that review's six
+findings at `dd7a6477d`, and this branch is its land-prep: re-merged onto
+`origin/main` and fully re-gated. A second fresh review (PR #586 @ `f6a7f8709`)
+returned **PASS** — it established that the repair delta changes zero executable
+lines — with four RECORD findings, all repaired on
+`row/MODEL-NEMOTRON-H-W2-RECORDS`: two stale `activation.py:33` anchors
+(`include/vt/ops.h`, this spec), M7's assertion count (§6a), §4's W2 seam text
+contradicting §6a, and an overstated bit-identity comment in `cuda_moe.cu`
+(#591). That repair touches comments and this spec only; no executable line
+moved. `tests/vt/test_ops_moe_nongated_relu2.cpp:12` already carried the
+corrected anchors and needed no change.
 
-**Next action:** dispatch fresh implementers for **W1** and **W2** (both
-independent of #496) as soon as `row/KERNEL-SSM-MAMBA-SSD-W1` clears review,
-so the ops-header churn does not collide.
+The row stays `INVENTORIED`; this commit changes no lifecycle state, so it owes
+no `STATUS`/`BENCHMARKS` write. **Oracle gateability is CLOSED** — §5a records
+the pinned oracle loading and running the checkpoint on GB10 with three greedy
+goldens committed, so W6 has a denominator whenever it is reached.
+
+**Next action:** land W2 after a fresh scoped re-review, then dispatch **W4**
+(W3 having landed). Three things are carried forward, not resolved here: the two
+OWED GPU items in §6a (`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and
+the end-to-end NemotronH MoE block on GB10), and the OWED GGUF k-quant arm
+tracked as W7 (§5b).
 
 ## 8. Stop conditions
 
