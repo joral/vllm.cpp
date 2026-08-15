@@ -99,7 +99,9 @@ synchronization. This is the same observation #382 made about the CUDA file.
    `decode_opt`/`decode_gqa` flags — the same env var, default and rationale as
    the merged CUDA arm.
 3. `bf16_decode_opt` gate: `d == 256 || d == 512` → `(d == 128 && (decode_d128
-   || decode_wmma)) || d == 256 || d == 512`. The `decode_wmma` disjunct is
+   || decode_wmma)) || d == 256 || d == 512`. **As landed the gate omits the
+   `decode_wmma` disjunct**, because that flag does not exist — see the forward
+   reference below. The `decode_wmma` disjunct is
    deliberate: the rocWMMA arm (separate spec) is a second, independently
    opt-in kernel for the same head size, and without it a bare
    `VT_ATTN_DECODE_WMMA=1` would be a silent no-op. **Forward reference:**
@@ -142,10 +144,19 @@ bf16 correctness coverage in this suite.
 
 `tests/CMakeLists.txt`: because the arm ships OFF **and** its flag is read into
 a `static const bool` — once per process — the default registration only ever
-gates the `PagedAttnOnline` fallback. Two extra ctest registrations re-run the
-same binary filtered to this case with `VT_ATTN_DECODE_D128=1` and
-`VT_ATTN_DECODE_WMMA=1`, so the arms that actually run the new kernels are
-gated. Same shape as the existing `test_dense_gateup_fused_marlin_off_*` pair.
+gates the `PagedAttnOnline` fallback. **As landed there is ONE extra ctest
+registration**, `VT_ATTN_DECODE_D128=1`; the planned second,
+`VT_ATTN_DECODE_WMMA=1`, does not exist because that flag does not. Same shape
+as the existing `test_dense_gateup_fused_marlin_off_*` pair.
+
+That registration does NOT by itself prove the new kernel ran. It re-runs the
+same case with the env set, and the case's only backend assertion is
+`declines == 0`, which `OpProviderStats` reports at PROVIDER granularity —
+identical with the flag set and unset. On any non-ROCm machine the case runs
+1 test case and **0 assertions** and exits 0, so the registration is green on
+nothing everywhere this project has hardware. Closing §9's stop condition 2
+needs a kernel-selection counter in `rocm_paged_attn.hip` asserted to DIFFER
+between the two registrations.
 Verified non-vacuous (the trap `SKIP_RETURN_CODE 77` exists for, issue #463):
 the filter resolves to `test cases: 1 | 1 passed`, `assertions: 6 | 6 passed`,
 not zero.
@@ -191,8 +202,10 @@ Any future flip to default-ON must be argued per backend with per-backend
 measurement; the fact that the ROCm arm is a large win is not evidence for the
 CUDA arm, and #382's sm_110 regression is not evidence against this one.
 
-**Correctness**, gfx1200, real hardware: `ctest -R 'rocm|cross_device'` **6/6
-pass**, including both new flag-on registrations. Full `ctest` 393 tests,
+**Correctness**, gfx1200, real hardware: `ctest -R 'rocm|cross_device'` **5/5
+pass** as landed, including the one new flag-on registration. (An earlier draft
+of this section said 6/6 "including both new flag-on registrations", from the
+two-registration plan above that did not land.) Full `ctest` 393 tests,
 385 passed / 8 failed; all 8 reproduce identically (same tests, same root cause
 `vt: no kernel for op 63 on device type 5`, an unrelated pre-existing ROCm
 op-registration gap) on an isolated build of this branch **without** this
@@ -301,12 +314,22 @@ flock "$HOME/gpu.lock" -c '
 
 ## Result on the implementation branch (2026-08-12)
 
-> **Not landed.** This section records what was built and measured on the
-> unmerged implementation branch. No `VT_ATTN_DECODE_D128` exists in
-> `src/vt/rocm/` on `main` — `git log -S'VT_ATTN_DECODE_D128' -- src/vt/rocm/`
-> is empty, and `rocm_paged_attn.hip` still gates on `d == 256 || d == 512`.
-> This spec is committed BEFORE its implementation, per AGENTS.md; the section
-> becomes `## Outcome` when the code merges and the row reaches `DONE`.
+> **Landed by PR #767**, which carries this correction. The banner this
+> paragraph replaced said "Not landed" and offered
+> `git log -S'VT_ATTN_DECODE_D128' -- src/vt/rocm/` as proof — a command that
+> returns the opposite once the code is in, which is how a record starts
+> disagreeing with the tree.
+>
+> The section stays `## Result` rather than becoming `## Outcome`: `BACKEND-ROCM`
+> remains `ACTIVE`, and `## Outcome` is scoped to a row reaching `DONE`. The
+> arm ships **default OFF**, so nothing here is a shipped-behaviour claim.
+>
+> **Still owed, and NOT discharged by this landing:** the flag-ON arm has no
+> proof it REACHES the new kernel. `OpProviderStats` counts at provider
+> granularity, so `declines == 0` is identical with the flag set and unset, and
+> the ctest registration runs 0 assertions on every non-ROCm machine. §9's stop
+> condition 2 — "stop if the flag-ON arm cannot be shown to reach the new
+> kernel; confirm selection counts, not just tokens" — is therefore still open.
 
 **Built the ROCm `d=128` decode arm, default OFF, mirroring the merged CUDA
 arm of the same issue.** Root cause for the ROCm decode-attention gap #488
