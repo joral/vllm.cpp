@@ -327,7 +327,8 @@ __device__ inline void StoreRow8Bf16(__hip_bfloat16* p, int64_t base, int lane, 
   StoreRowEplBf16<8>(p, base, lane, r);
 }
 
-// BF16 Q/K/V/Out; EPL=8 → d=256, EPL=16 → d=512. No per-key block sync (decode+prefill).
+// BF16 Q/K/V/Out; EPL=4 → d=128, EPL=8 → d=256, EPL=16 → d=512. No per-key block sync
+// (decode+prefill). The d=128 case is opt-in behind VT_ATTN_DECODE_D128 (default OFF).
 template <int EPL>
 __global__ void PagedAttnDecodeOptBf16T(__hip_bfloat16* out, const __hip_bfloat16* query,
                                         const __hip_bfloat16* k_cache, const __hip_bfloat16* v_cache,
@@ -452,7 +453,8 @@ __global__ void PagedAttnDecodeOptBf16T(__hip_bfloat16* out, const __hip_bfloat1
 }
 
 // GQA-fused decode: one CTA per KV head; load K/V once, attend QG q-heads.
-// Gemma-4: hq=16, kv=8 → QG=2. EPL=8→d=256, EPL=16→d=512. grid=(total_q, num_kv_heads).
+// Gemma-4: hq=16, kv=8 → QG=2. EPL=4→d=128, EPL=8→d=256, EPL=16→d=512.
+// grid=(total_q, num_kv_heads). The d=128 case is opt-in behind VT_ATTN_DECODE_D128 (default OFF).
 template <int QG, int EPL = 8, int NWARPS = kDecWarps>
 __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16* query,
                                        const __hip_bfloat16* k_cache, const __hip_bfloat16* v_cache,
