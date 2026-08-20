@@ -320,7 +320,16 @@ MATRICES = {
     # because the rows EXIST, never to make a state transition pass; both are
     # `ACTIVE` rather than `DONE` because neither CUDA arm has ever compiled
     # (spec `## Owed` O10, no `nvcc` on the authoring host).
-    "KERNEL": (AGENTS / "kernel-matrix.md", 56),
+    # 57 since 2026-08-20 (#1506): +`KERNEL-QUANT-CIQ-GEMM-ROCM`, the `kROCM`
+    # provider for `kMatmulBTQuant`/`kMatmulBTQuantGrouped`. A SEPARATE row from
+    # `KERNEL-QUANT-CIQ-GEMM-CUDA` rather than a device column on it, for the
+    # reason that row is separate from the CPU one: the block decode is shared
+    # but the GEMM is not, and the two have different gates (the CUDA row gates
+    # on GB10, this one on gfx1200) and different type coverage (this row ships
+    # four k-quants, not eight, because a 43-GGUF census on the gate box reaches
+    # no others). Bumped because the row EXISTS, never to make a state
+    # transition pass; it is `SPIKE` and no kernel is written.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 57),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
