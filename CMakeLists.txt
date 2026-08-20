@@ -1561,6 +1561,10 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gemma4_expert_geglu.hip
     src/vt/rocm/rocm_fp8_channel_gemv.hip
     src/vt/rocm/rocm_moe_router.hip
+    # KERNEL-QUANT-CIQ-GEMM-ROCM (#1506): registering this TU flips
+    # GgufQuantComputeAvailable TRUE on kROCM, so the GGUF loader stops
+    # expanding every quantized weight to bf16 at load.
+    src/vt/rocm/rocm_quant_dot.hip
     src/vt/rocm/rocm_sample.hip
     src/vt/rocm/rocm_gdn_state.hip
     src/vt/rocm/rocm_gdn_conv.hip

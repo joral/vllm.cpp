@@ -13,8 +13,10 @@ the dangerous part rather than the goal.
 
 ## Now
 
-`SPIKE`. Spec committed; no kernel written. Next action: the red-first per-type
-unit gate over a poisoned output buffer (§Tests, step 1), on gfx1200.
+`ACTIVE`. The kernel is written and gated on gfx1200: `test_rocm_quant_dot`
+**3/3 - 53157/53157**, red-first captured, mutation-proven, and the model-level
+arm measured. Next action: the MoE-model arm (§Tests step 6) and a decode-only
+speed measurement, because §Outcome retracts this row's own wall-time figure.
 
 ## The gap, measured
 
@@ -40,13 +42,18 @@ Measured 2026-08-20, gfx1200 (RDNA4), ROCm 7.2.3, `Qwen3.5-4B-Q4_K_M.gguf`
 | build | device | `keep_quant` | peak RSS | wall |
 |---|---|---|---|---|
 | CPU | `cpu` | on (auto) | 7038 MiB | 8.2 s |
-| HIP | `auto` | off (auto) | 12159 MiB | 37.1 s |
+| HIP | `auto` | off (auto) | 12159 MiB | 37.1 s (COLD, see below) |
 | HIP | `auto` + `VT_GGUF_KEEP_QUANT=1` | forced on | — | `no kernel for op MatmulBTQuant (id 75) on device rocm (type 5)` (`op_provider.cpp:518`) |
 
-Identical tokens in the first two rows. **1.73x peak RSS, 4.5x wall.** The cost
-is a load-time cliff at scale, not a slowdown: a ~16 GB k-quant expands to
-roughly 55-60 GB and does not fit on a 64 GB host that runs the same file on
-CPU. Today the HIP build is strictly worse than the CPU build for GGUF.
+Identical tokens in the first two rows. The memory figure is **1.73x peak RSS**
+and it holds. **The 37.1 s does NOT**: it was the first read of that file on this
+host, so it measured page-cache misses rather than dequantization, and the warm
+A/B in `## Outcome` reverses its direction. Retracted here rather than deleted,
+because the number reached issue #1506 before it was checked.
+
+The load-time cliff is what makes this row worth doing and it is untouched by
+that retraction: a ~16 GB k-quant expands to roughly 55-60 GB and does not fit on
+a 64 GB host that runs the same file on CPU.
 
 ## Scope
 
@@ -64,7 +71,23 @@ refuses.
 Out of scope, listed under `## Owed`: CUDA-parity type coverage, wave64/CDNA,
 a native grouped kernel, and the Q8_0-activation legacy types.
 
-## Upstream anchors
+## Our baseline
+
+What this tree does on ROCm before the kernel, measured rather than read
+(gfx1200 / ROCm 7.2.3, `Qwen3.5-4B-Q4_K_M.gguf`, `examples/vllm-cli`):
+
+- `kMatmulBTQuant` registered on `kCPU` (`cpu_quant_gemm.cpp:303`) and `kCUDA`
+  (`cuda_quant_dot.cu:1991`) only; `src/vt/rocm/` has 18 `.hip` files and no
+  keep-quant GEMM.
+- `keep_quant` therefore defaults OFF on `kROCM`, and every quantized weight is
+  expanded to bf16 at load: **12159 MiB peak RSS**, against the CPU build's
+  7038 MiB with keep-quant on. Tokens identical.
+- Forcing `VT_GGUF_KEEP_QUANT=1` past the probe: `no kernel for op
+  MatmulBTQuant (id 78) on device rocm (type 5)` (`op_provider.cpp:518`).
+- The Q8_K ACTIVATION quantizer already exists on ROCm and has been tuned
+  (`6251de146`), so only the weight side is missing.
+
+## Upstream chain
 
 vLLM has no GGUF k-quant GEMM, so per `AGENTS.md` §"When vLLM has no
 implementation" the secondary oracle is **llama.cpp** (registry id `llama-cpp`,
@@ -147,7 +170,48 @@ byte-exact is the loader: with `VT_GGUF_KEEP_QUANT=0` the ROCm path must remain
 byte-identical to today's expanded-bf16 behaviour, which is the same-binary A/B
 that makes the flip reviewable.
 
-## Tests
+## Port map
+
+| Source | Destination | Note |
+|---|---|---|
+| `cuda_quant_dot.cu:578` `DotQ4K` | `rocm_quant_dot.hip` `DotQ4K` | line-for-line; `__dp4a` -> `DDp4a` |
+| `:620` `DotQ5K`, `:530` `DotQ3K`, `:662` `DotQ6K` | same names | line-for-line |
+| `:176` `QuantizeQ8KKernel` | same name | unchanged; one thread per super-block |
+| `:774` `QuantDotGemmKernel` | same name | `__shfl_down_sync` -> `__shfl_down`, wave32 |
+| `:814` `QuantDotGemmGroupedKernel` | same name | same substitution |
+| `:1588` `IsCudaKeepQuantSupported` | `IsRocmKeepQuantSupported` | four types, not eight |
+| `:1835`/`:1928` CPU fallback | `FallbackToCpu`/`FallbackToCpuGrouped` | REWRITTEN: stages through host memory (see §Design) |
+| `:1991` `Registrar` | `Registrar` | `kCUDA` -> `kROCM`, both ops |
+| `cpu_quant_blocks.h` block structs | included as-is | the encoding is shared, not re-declared |
+
+No new codebook tables: the four k-quants carry their scales in-block, so unlike
+the IQ family there is nothing to vendor.
+
+## Dependencies
+
+- `vt::cpu::BlockQ{3,4,5,6}_K` / `BlockQ8_K` (`src/vt/cpu/cpu_quant_blocks.h`) —
+  shared block layouts, included rather than re-declared.
+- The CPU `kMatmulBTQuant` / `kMatmulBTQuantGrouped` providers — both the
+  correctness oracle and the delegation target for unserved dtypes.
+- `RegisterOp` / `GetOp` (`vt::OpProvider`) — the seam the flip rides.
+- ROCm >= 6.1 with `__builtin_amdgcn_sudot4` (RDNA3/4) or `sdot4`
+  (CDNA/RDNA2/gfx906). Verified on ROCm 7.2.3 / hipClang 22.
+- NOT a dependency: `hipBLASLt`. This kernel does its own integer dot.
+
+## Work breakdown
+
+| # | Slice | State |
+|---|---|---|
+| W1 | Red-first gate: three cases, poisoned buffers, over the CPU oracle | DONE — RED captured, then 3/3 - 53157 |
+| W2 | `rocm_quant_dot.hip`: four dots, Q8_K quant, dense + grouped GEMM, wave32 guard | DONE |
+| W3 | `IsRocmKeepQuantSupported` + host-staged CPU delegation + throwing `default:` | DONE |
+| W4 | CMake registration; the flip of `GgufQuantComputeAvailable` on `kROCM` | DONE |
+| W5 | Model-level arm: tokens + peak RSS on gfx1200, and the `VT_GGUF_KEEP_QUANT=0` byte-identity control | DONE |
+| W6 | `ctest -R 'rocm\|cross_device'` no-regression | DONE — 5/6; the 1 failure is pre-existing #1513, control-proven |
+| W7 | MoE-model arm (the grouped op in a real GGUF) | OWED |
+| W8 | Decode-only speed measurement, to attribute §Outcome's 1.8x | OWED |
+
+## Tests to port
 
 Red-first, in this order. Each step states the mutation that must turn it red.
 
@@ -197,9 +261,13 @@ quietly annex them. Record the numbers, claim nothing.
 
 - **The flip is global.** Every ROCm GGUF load changes at once. G2 is the
   control that makes it reviewable; without it there is no same-binary A/B.
-- **`__dp4a` may not lower to the instruction on gfx1200.** Then the kernel is
-  scalar and the memory win lands while the speed win does not. Measured, not
-  assumed — see §Design. Does not block G1-G5.
+- **~~`__dp4a` may not lower to the instruction on gfx1200.~~ RESOLVED, and the
+  premise was wrong twice.** HIP does not declare `__dp4a` at all (ROCm 7.2.3 /
+  hipClang 22: "use of undeclared identifier"), and the AMD builtin SPLITS by
+  architecture — RDNA3/RDNA4 take `__builtin_amdgcn_sudot4`, CDNA/RDNA2/gfx906
+  take `__builtin_amdgcn_sdot4`. With the right one the device assembly carries
+  **576 `v_dot4_i32_iu8`**, so it is the real instruction and the speed axis is
+  addressable.
 - **Wave64.** The reduction is wave32; a CDNA board would silently compute a
   wrong result if the guard is missing. Refuse by name.
 - **Q8_K activation contention.** #1294 already puts the quantizer at 35% of
@@ -249,3 +317,89 @@ Named here so they are visible debt rather than silence, per `AGENTS.md`
 - **Async scheduling on ROCm.** The HIP build reports
   `max_concurrent_batches=1` where CPU reports `2`. Noticed while measuring,
   uninvestigated, recorded in #1506. Not this row's work.
+
+## Outcome
+
+Recorded at implementation, per `AGENTS.md` §"Spec before code" (an `## Outcome`
+records what was measured, what was rejected, and why each default has its
+value).
+
+### What was measured
+
+`test_rocm_quant_dot` on gfx1200 / ROCm 7.2.3: **3/3 cases, 53157/53157
+assertions**. RED first — before `rocm_quant_dot.hip` existed all three cases
+threw `no kernel for op MatmulBTQuant (id 78) on device rocm (type 5)`.
+
+Mutation-proven rather than merely green: dropping the per-sub-block scale in
+`DotQ4K` (`isum += scale * sub` -> `isum += sub`) fails **25 assertions** across
+the dense and grouped Q4_K arms at NMSE 1.09 against the 1e-6 band, and the tree
+was restored byte-for-byte (sha256 `4ffc3a34d034ef75...`) with 53157/53157
+green after.
+
+Model level, `Qwen3.5-4B-Q4_K_M.gguf`, warm, three runs per arm, same binary:
+
+| arm | peak RSS | wall |
+|---|---|---|
+| `keep_quant` ON (this kernel) | **6066-6074 MiB** | 3.169 / 3.182 / 3.279 s |
+| `keep_quant` OFF (expand bf16) | 12152 MiB | 1.769 / 1.770 / 1.830 s |
+
+Tokens identical in both arms and identical to the CPU build (" Paris.\nA").
+
+- **G1** unit correctness: PASS, mutation-proven.
+- **G2** loader byte-identity: PASS — `VT_GGUF_KEEP_QUANT=0` reproduces 12152
+  MiB and the same tokens, so the flip is the only difference.
+- **G3** model tokens: PASS.
+- **G4** memory: **PASS with margin** — 12159 -> 6066 MiB is 2.0x, and below the
+  CPU build's 7038 MiB, which the gate only required matching.
+- **G5** no regression: **PASS.** `ctest -R 'rocm|cross_device'` on gfx1200 is
+  5/6. The one failure is `test_backend_cross_device:2063`, the bf16 arm of
+  `kMoeSiluMul`, and it is PRE-EXISTING with an empirical control: removing
+  `rocm_quant_dot.hip` from the build entirely reproduces the identical
+  failure, same line, same 359/360. Filed as
+  [#1513](https://github.com/mudler/vllm.cpp/issues/1513) against `BACKEND-ROCM`
+  rather than carried silently.
+- **G6** speed: report-only, and the report is UNFAVOURABLE — see next.
+
+### The row retracts its own headline number
+
+The issue and the first draft of this spec claimed the expanded path costs
+`4.5x wall`. **That was cold page-cache**, measured on the first-ever read of
+that file on this host. The warm A/B above puts keep-quant at about **1.8x MORE
+wall time**, not less. Corrected in issue #1506 (comment), and left visible here
+rather than quietly edited.
+
+The direction is not yet attributed and this row does not attribute it. The
+wall figure is dominated by load plus a 5-token prompt and isolates no decode;
+the expanded arm hands its GEMMs to a tuned hipBLASLt while this kernel is a
+wave-per-output MMVQ shaped for M=1. `AGENTS.md` §Gates forbids trading
+correctness for throughput and this row's G6 was made report-only precisely so a
+speed result could not be annexed from #487/#1294 — that clause is what caught
+this.
+
+**The case for the row is unchanged, because it was never speed.** Halving
+resident weights is what makes a ~16 GB k-quant loadable on a 64 GB host at all,
+and G4 delivers that with margin.
+
+### Why the defaults have their values
+
+- **Four types, not eight.** A 43-GGUF census on the gate box reaches Q4_K,
+  Q6_K, Q5_K and Q3_K and no others. Everything else delegates and stays
+  correct.
+- **`__builtin_amdgcn_sudot4`, not `__dp4a`.** HIP does not declare `__dp4a`;
+  the AMD builtin splits RDNA3/4 (`sudot4`) from CDNA/RDNA2/gfx906 (`sdot4`).
+  576 `v_dot4_i32_iu8` in the gfx1200 device assembly confirms the instruction.
+- **The CPU fallback stages through host memory.** The CUDA provider passes
+  device pointers straight to the CPU op because GB10 is unified. A discrete AMD
+  card is not, and since `VT-REFTIER-HOST-ADDRESSABLE` the reference tier says
+  so by name instead of segfaulting. Found by running the red-first test, not by
+  reading.
+- **Wave32 is checked, not assumed.** `RequireWave32` refuses a wave64 device by
+  name rather than reducing over the wrong lane set.
+
+## Owed (added at implementation)
+
+- **§Tests step 6, the MoE-model arm.** The grouped op is unit-gated but has not
+  run inside a real MoE GGUF, which is where hazard (a) would actually bite.
+- **A decode-only speed measurement**, one tool, isolating decode from load, to
+  attribute the 1.8x above. Until it exists this row asserts nothing about
+  throughput.

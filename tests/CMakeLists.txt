@@ -2173,6 +2173,14 @@ vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 vllm_cpp_add_test(test_ops_paged_attn_dtype vt/test_ops_paged_attn_dtype.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)
 vllm_cpp_add_test(test_gemma4_rocm_fp8_seams vt/test_gemma4_rocm_fp8_seams.cpp)
+# KERNEL-QUANT-CIQ-GEMM-ROCM (#1506): the ROCm keep-quant GEMM (kROCM provider
+# for kMatmulBTQuant + kMatmulBTQuantGrouped). Gates the AMD dequant-in-kernel
+# dot against the landed CPU keep-quant oracle + an f64 dequant reference on the
+# four k-quants this row serves, every output buffer POISONED so a dispatch that
+# launches nothing cannot pass (the #1029 failure). Skips coherently with no
+# ROCm device. Reaches src/ for the vt/cpu block/quant headers.
+vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
+target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_getblas_dualslot vt/test_ops_getblas_dualslot.cpp)
 target_compile_definitions(test_ops_getblas_dualslot PRIVATE
   VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

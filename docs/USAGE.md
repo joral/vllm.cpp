@@ -109,6 +109,24 @@ must use the C ABI in `include/vllm.h`.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
 
+## Run a quantized GGUF on an AMD GPU
+
+A HIP build keeps GGUF k-quant weights compressed from file to matmul for
+Q4_K, Q6_K, Q3_K and Q5_K, so resident weights match what the CPU build uses.
+Any other block dtype in the same checkpoint still loads and still produces
+correct output, by running that matmul on the CPU.
+
+Before this landed (issue #1506) a HIP build expanded every quantized weight to
+BF16 at load, which roughly doubled resident memory and could put a large
+k-quant out of reach on a machine that ran the identical file on CPU. Measured
+on gfx1200 with a 4B Q4_K checkpoint: peak resident memory falls from 12159 MiB
+to 6066 MiB.
+
+Set `VT_GGUF_KEEP_QUANT=0` to restore the expanding behavior in the same
+binary, for an A/B or if a device path misbehaves. See
+[ENVIRONMENT.md](ENVIRONMENT.md) for that variable and
+[FEATURES.md](FEATURES.md) for the per-backend format table.
+
 ## Find a focused guide
 
 [Task guides](guides/README.md) cover workflows that apply to more than one
