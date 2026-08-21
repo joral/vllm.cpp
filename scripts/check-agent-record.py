@@ -283,7 +283,57 @@ MATRICES = {
     # of rank-1 factors) rather than how one step is tiled, and it adds three cache
     # tensors to the MambaSpec. vLLM ships the algorithm for Mamba2 only and cannot
     # reach GDN (four walls, spec §Upstream chain); SGLang ships the GDN arm.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 52),
+    # 53 since 2026-08-19 (#1314): +`KERNEL-DFLASH2-GROUPED-CONV`, the DFlash2
+    # draft's grouped DYNAMIC depthwise convolution. A genuinely new family and
+    # not a variant of `KERNEL-DEPTHWISE-CONV1D`, on all three axes that decide
+    # a kernel's shape: the weights are DYNAMIC (a per-position delta projected
+    # from the sublayer input, added to a static per-channel base) rather than
+    # static, they are GROUPED (one delta per group of channels against one base
+    # per channel) rather than per-channel, and the tap mask is over the QUERY
+    # BLOCK (`i mod (1+k)`) rather than causal over the sequence. It also carries
+    # a SIDE axis no other convolution here has: one projection of the sublayer
+    # input produces both the prepare-side and the finish-side coefficients.
+    # Bumped because the row EXISTS, never to make a state transition pass; the
+    # row is `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
+    # (spec `## Owed` O6, no `nvcc` on the authoring host).
+    # 54 since 2026-08-20 (#1007): +`KERNEL-CONV3D`, the general 3-D convolution
+    # `vt` had on NO device. It is not a variant of `KERNEL-CPU-CONV2D-SUBSAMPLE`:
+    # the ACCUMULATION ORDER differs and is part of the contract (one f32 partial
+    # per input channel with the bias seeded first, against kConv2d's single flat
+    # accumulator with the bias last), which is the same sibling relationship
+    # kConv1d has with kDepthwiseConv1d. It is also the only conv family with a
+    # CUDA arm and a CPU arm landing together, and the reason the LTX-2.5 video
+    # VAE decode had no device path at all. Spec specs/ltx25-device-residency.md.
+    # 56 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-SELECTOR-EDGES` and
+    # +`KERNEL-TOPK-PAIRS`, the DFlash2 candidate selector's two kernels. TWO
+    # rows and not one because they are two kernels with different shapes and
+    # different gates: the first is a small dense contraction over two
+    # per-token codebooks, whose difficulty is the PREDECESSOR indexing (step 0
+    # is the verified anchor, every later step is the previous step's candidate)
+    # and the bf16 ROUNDING PLACEMENT; the second is a sort-free selection over a
+    # 248320 vocabulary, whose difficulty is the TIE-BREAK, because the
+    # pivot-bracket search converges to an exact array VALUE and therefore keeps
+    # whole tie groups. `KERNEL-TOPK-PAIRS` is also a distinct family from the
+    # shipped sampling threshold search rather than a variant of it: that kernel
+    # masks below the k-th largest IN PLACE and returns no indices, this one
+    # compacts the survivors, orders them and emits (id, value) pairs. Bumped
+    # because the rows EXIST, never to make a state transition pass; both are
+    # `ACTIVE` rather than `DONE` because neither CUDA arm has ever compiled
+    # (spec `## Owed` O10, no `nvcc` on the authoring host).
+    # 57 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-PATH-WALK`, the DFlash2
+    # candidate selector's PATH WALK. A separate family from
+    # `KERNEL-DFLASH2-SELECTOR-EDGES` rather than a second entry point into it,
+    # on the axis that decides kernel families here: the lattice op is a dense
+    # CONTRACTION whose difficulty is a reduction (and which is therefore gated
+    # within an f32 envelope), while the walk performs no arithmetic at all --
+    # only comparisons and one gather -- and is specified BIT-EXACT across
+    # backends. Their grids follow from that: one block per (request, step,
+    # predecessor slot) against one block per REQUEST with the step loop INSIDE
+    # it, which is spec `## Risks/decisions` D3's requirement and upstream's own
+    # `(num_reqs,)` / `num_warps=1` shape. Bumped because the row EXISTS, never
+    # to make a state transition pass; it is `ACTIVE` rather than `DONE` because
+    # its CUDA arm has never compiled on the authoring host (spec `## Owed` O11).
+    "KERNEL": (AGENTS / "kernel-matrix.md", 57),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -631,8 +681,20 @@ ENGINE_PREFIXES = (
 # average, and `## Gates` owes the idle-host re-measure. The exponent, not the
 # constant, is what makes this a row.
 # `READY`, spec `specs/bpe-quadratic-merge.md`, issue #1365.
+# 169 since 2026-08-21: +`SPEC-DRAFTER-CHAIN` (a preference-ordered chain of
+# speculators: try the first, and if it yields no draft for a sequence, try the
+# next). Genuinely new and not expressible by the per-method rows beside it: each
+# of `SPEC-MTP`, `SPEC-DFLASH`, `SPEC-DSPARK` and `SPEC-NGRAM` owns ONE
+# speculator's mechanism, and every one of them assumes it is the only speculator
+# resolved for a step. This row owns the composition -- a new optional field on
+# `--speculative-config` that is inert when absent, per-sequence resolution, and
+# the per-drafter attribution none of those rows has any reason to carry. vLLM
+# implements no composition at all (`SpeculativeMethod` is a single `Literal` at
+# the pin AND at `origin/main` `c20572610`), so this is a DIVERGENCE with
+# llama.cpp as a secondary oracle for semantics only, not a port. `READY`, spec
+# `specs/drafter-chain.md`, issue #1522.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 168
+ENGINE_ROWS = 169
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

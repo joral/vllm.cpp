@@ -35,7 +35,8 @@
 #include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) the graph-eligibility predicate
 #include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"  // SPEC-MTP I5d MtpProposePrefill
-#include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 DflashProposeBlock
+#include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 SampleDflashBlockDrafts
+#include "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.h"  // SPEC-DFLASH2 W3/W4: Dflash2SelectCandidates, Dflash2WalkPath
 #include "vllm/v1/worker/gpu/spec_decode/dspark/speculator.h"  // SPEC-DSPARK W5 SampleDsparkBlockDrafts
 #include "vllm/v1/spec_decode/ngram_proposer.h"  // SPEC-NGRAM D3 NgramPropose
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
@@ -2450,9 +2451,19 @@ void GPUModelRunner::propose_drafts_dflash(
   propose_drafts_block(
       num_rejected_in, *dflash_weights_, *dflash_config_,
       /*num_query_per_req=*/1 + k,
-      [k, draft_vocab](const std::vector<float>& block_logits, int P,
-                       const std::vector<int32_t>& anchors) {
+      [k, draft_vocab, weights = dflash_weights_](
+          const std::vector<float>& block_logits, int P,
+          const std::vector<int32_t>& anchors) {
         (void)anchors;  // DFlash's anchor is a bonus token, never a prediction.
+        // SPEC-DFLASH2 W4 (#1314): the guard lives HERE, inside the DFlash1
+        // sampler's own closure, rather than beside the walk it protects. A
+        // guard adjacent to the call site it defends is deleted in the same edit
+        // that deletes that call site; one function away, losing the walk still
+        // costs a named throw. `propose_drafts_block` enters this callback only
+        // when the DFlash2 branch produced nothing, and a DFlash2 block that
+        // reaches the per-slot argmax proposes worse tokens with NO visible
+        // symptom -- the verify is lossless, so only acceptance falls.
+        vllm::v1::RefuseDflash1ArgmaxOnDflash2Block(*weights);
         return SampleDflashBlockDrafts(block_logits, P, k, draft_vocab);
       });
 }
@@ -2751,11 +2762,46 @@ void GPUModelRunner::propose_drafts_block(
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
     const auto t_fwd0 = std::chrono::steady_clock::now();
+    // SPEC-DFLASH2 W3 (#1314): a DFlash2 draft ALSO captures `final_out` off
+    // this forward -- the post-final-norm hidden the candidate selector's
+    // `hidden_projection` reads. Upstream's `_generate_draft` takes both from
+    // one forward, and it must: the selector projects the SAME hidden states
+    // these logits came from. A DFlash1 draft passes nullptr and this call is
+    // byte-for-byte what it was.
+    //
+    // COST, named rather than discovered: asking for `final_out` takes this
+    // forward off the single-request PAGED fast path, which is guarded on
+    // `final_out == nullptr` (ForwardBlockLogitsWithDeviceKV). That costs a
+    // DFlash2 draft the CUDA-graph draft step until W4 computes the candidates
+    // inside the forward instead of after it. It costs a DFlash1 draft nothing,
+    // and this row claims no throughput number.
+    std::vector<float> block_hidden;
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
-            stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_);
+            stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_,
+            nullptr, backbone.IsDflash2() ? &block_hidden : nullptr);
     const auto t_fwd1 = std::chrono::steady_clock::now();
-    const std::vector<std::vector<int32_t>> drafts = sample(block_logits, P, anchors);
+    // SPEC-DFLASH2 W4 (#1314): the PRODUCTION draft of a DFlash2 block, end to
+    // end. The block forward above ran the draft's grouped dynamic convolution
+    // (W2); `Dflash2SelectCandidates` runs the target head's top-K, the codebook
+    // lattice and the edge scores (W3); `Dflash2WalkPath` walks that lattice
+    // from the verified anchor and IS what produces this draft's tokens (W4).
+    // Both are the SAME functions `DflashProposeBlock` calls, so this path and
+    // the one a gate can drive are one implementation rather than two.
+    //
+    // `sample` -- the DFlash1 per-slot argmax -- must NOT run for a DFlash2
+    // block. It would succeed and propose worse tokens with no visible symptom,
+    // because the verify is lossless and the emitted tokens stay the target's;
+    // only acceptance falls. The fallback below is therefore entered on
+    // EMPTINESS, and guarded, so that deleting this branch is loud.
+    std::vector<std::vector<int32_t>> drafts;
+    if (backbone.IsDflash2()) {
+      const vllm::v1::Dflash2ProposeState selected = vllm::v1::Dflash2SelectCandidates(
+          block_logits, block_hidden, anchors, P, num_query_per_req - 1, backbone,
+          config, queue_);
+      drafts = vllm::v1::Dflash2WalkPath(selected, queue_).draft_token_ids;
+    }
+    if (drafts.empty()) drafts = sample(block_logits, P, anchors);
     const auto t_smp1 = std::chrono::steady_clock::now();
     if (propose_trace) {
       // Splits the draft step into the parallel backbone forward and the

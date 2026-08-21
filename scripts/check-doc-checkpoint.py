@@ -53,11 +53,38 @@ ROW_TABLES = (
 # An accepted or retracted measurement is a claim too, even without a state move.
 MEASUREMENT_RECORDS = (".agents/benchmark-record.md",)
 
+# WHAT COUNTS AS A LIFECYCLE STATE. This tuple is the whole definition, and a
+# state missing from it is not mislabelled -- row_states DROPS the row, and both
+# lifecycle_moves and moved_rows iterate the AFTER map, so leaving the matched
+# set is silent by construction.
+#
+# 2026-08-21 (GATE-DOC-CHECKPOINT-STATES, #1434): +PARTIAL. It was absent while
+# being the second most used state in the matrices -- 118 backticked cells at
+# 947e5f648 against 77 for DONE -- so READY -> PARTIAL and PARTIAL -> READY both
+# returned rc 0, and PARTIAL -> ACTIVE red for the wrong reason, calling a row
+# that had existed for months `added as ACTIVE`. Admitting it takes the resolved
+# population over ROW_TABLES from 153 rows to 226.
+#
+# ANCHOR-BACKFILL is DELIBERATELY NOT HERE, although .agents/feature-matrix.md
+# names the two together. This tuple triggers REQUIRED["lifecycle"], which is
+# (STATUS, BENCHMARKS) and carries all of them or none, so the question is what
+# docs/STATUS.md projects. `Partial` is a term on that page (docs/STATUS.md:39).
+# ANCHOR-BACKFILL is a property of the RECORD -- "a legacy implemented row
+# without exact code, test and real-spec anchors" -- the capability is already
+# implemented, the page carries no matching term, and a DONE <-> ANCHOR-BACKFILL
+# move would demand a public-document edit with nothing true to write. That is
+# the shape this file's header records as the reason for the rewrite. The
+# `## Now` half it genuinely owes needs a spec-only class in REQUIRED and is
+# filed under `## Owed` in .agents/specs/doc-checkpoint-lifecycle-states.md.
+#
+# INVENTORIED and SPIKE stay out for the older reason: they are pre-claim, which
+# is the same polarity as the {ACTIVE, GATING, DONE} new-row set below.
 STATES = (
     "TODO",
     "READY",
     "ACTIVE",
     "GATING",
+    "PARTIAL",
     "BLOCKED",
     "DONE",
     "DROPPED",
@@ -106,6 +133,18 @@ USER_USAGE_PREFIXES = (
 # README permission and obligation come only from underlying landing sources.
 # Co-edited public projections can NEVER justify README churn -- that rule is
 # deliberate and directly tested.
+#
+# docs/QUICKSTART.md joined the set on 2026-08-20 (#1520). Every other member is
+# something the README QUOTES: the mission, the build entry point, the demo
+# numbers, the two example mains. The quickstart page is the same relation with
+# the direction made explicit -- the README `## Quickstart` block stopped
+# carrying the commands and now points at that page, so the claim "this is where
+# a reader starts" changed BECAUSE the page exists. It is a source, not a
+# projection: nothing else records what it says, and the README defers to it.
+#
+# This admits exactly one document and no class. docs/BUILD.md, docs/STATUS.md
+# and every other page under docs/ still cannot license a README claim change,
+# which tests/scripts/test_doc_checkpoint.py pins directly.
 LANDING_SOURCE_FILES = frozenset(
     {
         ".agents/mission.md",
@@ -113,6 +152,7 @@ LANDING_SOURCE_FILES = frozenset(
         "benchmarks/demo/footprint_gb10.json",
         "benchmarks/demo/qwen36_27b_c1_c32.json",
         "benchmarks/demo/vulkan_27b_llamacpp.json",
+        "docs/QUICKSTART.md",
         "examples/cli/main.cpp",
         "examples/server/main.cpp",
     }
