@@ -66,6 +66,27 @@ option(VLLM_CPP_SERVER "Build the OpenAI HTTP server (needs third_party/httplib/
 option(VLLM_CPP_LITERAL_STATIC
   "Link the CPU-only server as a literal static executable (experimental musl release lane only)"
   OFF)
+# ENG-HF-MODEL-DOWNLOAD W5 (#1280): fetching a HuggingFace repository named by
+# `--model` needs transport layer security, because `huggingface.co` speaks
+# nothing else. The shape mirrors llama.cpp at stock tag `b10451`
+# (`vendor/cpp-httplib/CMakeLists.txt:38-154`), which retired libcurl and now
+# transports over the same cpp-httplib this tree already vendors: one option for
+# the feature, one for OpenSSL, one for a statically fetched BoringSSL. It also
+# follows the VLLM_CPP_SERVER idiom directly above -- a missing dependency
+# DOWNGRADES the feature with a WARNING rather than failing the configure, so a
+# host with no OpenSSL development files still builds a working engine.
+option(VLLM_CPP_HF_DOWNLOAD
+  "Fetch a HuggingFace repository named by --model (resolves OFF with no TLS)" ON)
+option(VLLM_CPP_OPENSSL
+  "Use the system OpenSSL for HTTPS in the HuggingFace client" ON)
+option(VLLM_CPP_BUILD_BORINGSSL
+  "Fetch and statically link BoringSSL for HTTPS (for the literal-static lane)" OFF)
+# The value the USER asked for, captured before any resolution can downgrade it.
+# `tests/CMakeLists.txt` arms its transport-layer-security expectation from this
+# one, so a build where the feature silently resolved OFF fails a test instead
+# of quietly running the no-TLS arm of every case and reporting SUCCESS.
+set(VLLM_CPP_HF_DOWNLOAD_REQUESTED ${VLLM_CPP_HF_DOWNLOAD})
+
 if(VLLM_CPP_SERVER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib/httplib.h")
   message(WARNING "VLLM_CPP_SERVER=ON but third_party/httplib/httplib.h is missing; "
     "disabling the server target. Vendor cpp-httplib to enable it.")
@@ -753,6 +774,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
   src/vllm/model_executor/models/qwen3_dflash.cpp
+  src/vllm/model_executor/models/qwen3_dflash2.cpp
   src/vllm/model_executor/models/qwen3_dspark.cpp
   src/vllm/model_executor/models/qwen3_dspark_weights.cpp
   src/vllm/model_executor/models/qwen3_dflash_gguf.cpp
@@ -1071,6 +1093,7 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_decode_inputs.cpp
   src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dflash/speculator.cpp
+  src/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dspark/speculator.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/kv_cache_spec_registry.cpp
@@ -1279,6 +1302,9 @@ add_library(vllm STATIC
   # BigVGAN / DAC vocoder 1-D convolutions (#672). Self-registering, reached the
   # same --whole-archive way as the conformer kernels above.
   src/vt/cpu/cpu_conv1d_general.cpp
+  # General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) — the primitive
+  # the LTX-2.5 video VAE decode had on no device. Self-registering.
+  src/vt/cpu/cpu_conv3d.cpp
   src/vt/cpu/cpu_attn_relpos.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
@@ -1678,6 +1704,9 @@ if(VLLM_CPP_CUDA)
     # BigVGAN / DAC vocoder 1-D convolutions (#672) — the first transposed 1-D
     # convolution in the tree on any device.
     src/vt/cuda/cuda_conv1d_general.cu
+    # General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) — the device arm
+    # the LTX-2.5 video VAE decode never had.
+    src/vt/cuda/cuda_conv3d.cu
     src/vt/cuda/cuda_attention_cross.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
@@ -2339,7 +2368,155 @@ if(VLLM_CPP_SERVER)
   # vendored cpp-httplib header api_server.cpp uses, so it shares that gate. The
   # cache half above stays unconditional because it opens no socket.
   target_sources(vllm PRIVATE src/vllm/transformers_utils/hf_hub.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W3/W4 (#1280): the byte transport and the `--model`
+  # grammar. Both speak HTTP through the same vendored header, so both share
+  # api_server.cpp's gate. The resolver is what `server_main.cpp` calls, so a
+  # build without the server has no `--model` flag to resolve either.
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/downloader.cpp)
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/model_resolver.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W5 (#1280): the one-definition-rule instrument. It
+  # holds the SERVER half's reading (api_server.cpp) beside the FETCHER half's
+  # (hf_hub.cpp) and it deliberately includes no httplib header of its own, so
+  # it cannot contribute a third opinion. server_main.cpp refuses to start on a
+  # disagreement.
+  target_sources(vllm PRIVATE src/vllm/http_transport_abi.cpp)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_SERVER)
+
+  # ── ENG-HF-MODEL-DOWNLOAD W5 (#1280): transport layer security ─────────────
+  # `huggingface.co` speaks https and nothing else, so without this block the
+  # `--model org/repo` grammar that W4 landed can only reach an `http` mirror.
+  #
+  # THE DEFINE GOES ON THE TARGET, PUBLIC, AND NEVER PER SOURCE FILE.
+  # `CPPHTTPLIB_OPENSSL_SUPPORT` is a whole-header switch: it changes the layout
+  # of `httplib::Result` and `httplib::ClientConnection`
+  # (third_party/httplib/httplib.h:2045-2100). This tree includes that one
+  # header from the OpenAI server, from the hub client, from the byte
+  # downloader and from several test binaries, and they all link together. A
+  # per-file define would LINK CLEANLY and then corrupt every response object
+  # crossing the seam, with no diagnostic anywhere. PUBLIC so every consumer of
+  # `vllm` -- tests and examples included -- inherits the same answer.
+  # `src/vllm/http_transport_abi.cpp` and
+  # `tests/vllm/transformers_utils/test_tls_transport.cpp` measure that it held.
+  #
+  # llama.cpp made the same choice at `vendor/cpp-httplib/CMakeLists.txt:184
+  # @ b10451`, `target_compile_definitions(${TARGET} PUBLIC ...)`.
+  if(VLLM_CPP_HF_DOWNLOAD)
+    set(_vllm_tls_source "")
+    if(VLLM_CPP_BUILD_BORINGSSL)
+      # The literal-static lane: a fully static libssl/libcrypto that leaves no
+      # entry in `readelf -dW`, which `scripts/validate-release-archive.py`
+      # refuses on that artifact. Mirrors llama.cpp `LLAMA_BUILD_BORINGSSL`
+      # (`vendor/cpp-httplib/CMakeLists.txt:40-82 @ b10451`), including the
+      # BUILD_SHARED_LIBS/BUILD_TESTING save-and-restore and the pinned tag.
+      # It fetches from the network at CONFIGURE time, which is why it is OFF by
+      # default and why nothing in the default lane depends on it.
+      set(OPENSSL_NO_ASM ON CACHE BOOL "Disable OpenSSL ASM when building BoringSSL")
+      set(FIPS OFF CACHE BOOL "Enable FIPS (BoringSSL)")
+      set(BORINGSSL_GIT "https://boringssl.googlesource.com/boringssl"
+        CACHE STRING "BoringSSL git repository")
+      set(BORINGSSL_VERSION "0.20260813.0" CACHE STRING "BoringSSL version")
+      message(STATUS "Fetching BoringSSL ${BORINGSSL_VERSION}")
+      include(FetchContent)
+      FetchContent_Declare(boringssl
+        GIT_REPOSITORY ${BORINGSSL_GIT}
+        GIT_TAG        ${BORINGSSL_VERSION}
+        EXCLUDE_FROM_ALL)
+      set(_vllm_saved_shared ${BUILD_SHARED_LIBS})
+      set(_vllm_saved_testing ${BUILD_TESTING})
+      set(BUILD_SHARED_LIBS OFF)
+      set(BUILD_TESTING OFF)
+      FetchContent_MakeAvailable(boringssl)
+      set(BUILD_SHARED_LIBS ${_vllm_saved_shared})
+      set(BUILD_TESTING ${_vllm_saved_testing})
+      # Vendored code is not on this project's -Werror path.
+      foreach(_boringssl_target ssl crypto)
+        if(TARGET ${_boringssl_target})
+          target_compile_options(${_boringssl_target} PRIVATE
+            $<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>)
+        endif()
+      endforeach()
+      target_link_libraries(vllm PUBLIC ssl crypto)
+      set(_vllm_tls_source "BoringSSL ${BORINGSSL_VERSION} (static, fetched)")
+    elseif(VLLM_CPP_OPENSSL)
+      find_package(OpenSSL)
+      if(OpenSSL_FOUND)
+        # The version gate is llama.cpp's, verbatim in intent
+        # (`vendor/cpp-httplib/CMakeLists.txt:126-146 @ b10451`): OpenSSL 3.0 or
+        # later, or 1.1.1g or later for BoringSSL and LibreSSL. It is not
+        # invented here, and it is not a `VERSION_GREATER_EQUAL` on
+        # `OPENSSL_VERSION` either, because the version STRING does not say
+        # which of the three implementations answered `find_package`. The
+        # vendored header raises the same `#error` at
+        # `third_party/httplib/httplib.h:411-418`, so a build that skipped this
+        # check would fail later and less legibly.
+        include(CheckCSourceCompiles)
+        set(_vllm_saved_required_includes ${CMAKE_REQUIRED_INCLUDES})
+        set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
+        check_c_source_compiles("
+        #include <openssl/opensslv.h>
+        #if defined(OPENSSL_IS_BORINGSSL) || defined(LIBRESSL_VERSION_NUMBER)
+        #    if OPENSSL_VERSION_NUMBER < 0x1010107f
+        #        error bad version
+        #    endif
+        #else
+        #    if OPENSSL_VERSION_NUMBER < 0x30000000L
+        #        error bad version
+        #    endif
+        #endif
+        int main() { return 0; }
+        " VLLM_CPP_OPENSSL_VERSION_SUPPORTED)
+        set(CMAKE_REQUIRED_INCLUDES ${_vllm_saved_required_includes})
+        if(VLLM_CPP_OPENSSL_VERSION_SUPPORTED)
+          target_link_libraries(vllm PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+          set(_vllm_tls_source "OpenSSL ${OPENSSL_VERSION} (system, dynamic)")
+        else()
+          message(WARNING
+            "VLLM_CPP_OPENSSL=ON but the OpenSSL at ${OPENSSL_INCLUDE_DIR} is "
+            "older than 3.0 (or older than 1.1.1g for BoringSSL/LibreSSL); "
+            "HTTPS support is disabled.")
+        endif()
+      else()
+        message(WARNING
+          "VLLM_CPP_OPENSSL=ON but OpenSSL was not found; HTTPS support is "
+          "disabled. Install the OpenSSL development files, or configure with "
+          "-DVLLM_CPP_BUILD_BORINGSSL=ON.")
+      endif()
+    endif()
+
+    if(_vllm_tls_source STREQUAL "")
+      # The DOWNGRADE, in the VLLM_CPP_SERVER idiom above: a WARNING and an
+      # option that resolves OFF, never a failed configure. The binary still
+      # builds and still serves a local checkpoint; a repository identifier
+      # against an `https` endpoint is refused by
+      # `HfRefuseHttpsWithoutTls` with a message naming these three options.
+      message(WARNING
+        "VLLM_CPP_HF_DOWNLOAD=ON but no transport layer security is available, "
+        "so --model org/repo can only reach an http:// endpoint. Install the "
+        "OpenSSL development files (VLLM_CPP_OPENSSL=ON, the default) or "
+        "configure with -DVLLM_CPP_BUILD_BORINGSSL=ON.")
+      set(VLLM_CPP_HF_DOWNLOAD OFF)
+    else()
+      target_compile_definitions(vllm PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
+      if(APPLE)
+        # cpp-httplib reads the macOS keychain for root certificates whenever a
+        # TLS backend is enabled on an Apple clang build
+        # (third_party/httplib/httplib.h:344-353), which pulls in these two
+        # frameworks. Mirrors llama.cpp `vendor/cpp-httplib/CMakeLists.txt:186-190`.
+        find_library(CORE_FOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+        find_library(SECURITY_FRAMEWORK Security REQUIRED)
+        target_link_libraries(vllm PUBLIC
+          ${CORE_FOUNDATION_FRAMEWORK} ${SECURITY_FRAMEWORK})
+      endif()
+      if(WIN32 AND NOT MSVC)
+        target_link_libraries(vllm PUBLIC crypt32)
+      endif()
+      message(STATUS "HuggingFace download: HTTPS through ${_vllm_tls_source}")
+    endif()
+  else()
+    message(STATUS
+      "HuggingFace download: HTTPS disabled (VLLM_CPP_HF_DOWNLOAD=OFF); "
+      "--model org/repo is refused against an https:// endpoint")
+  endif()
   target_link_libraries(vllm PUBLIC Threads::Threads)
   # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party
   # is already a SYSTEM include on the vllm target).
@@ -2504,6 +2681,33 @@ if(NOT VLLM_CPP_SANITIZE STREQUAL "OFF")
     "$<TARGET_PROPERTY:vllm,INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>")
   target_compile_definitions(vllm_sanitize_test_shared INTERFACE
     "$<TARGET_PROPERTY:vllm,INTERFACE_COMPILE_DEFINITIONS>")
+  # ...and the LINK interface, forwarded by the same rule as the three lines
+  # above. Those forward what a consumer needs to COMPILE against `vllm`. This
+  # one forwards what it needs to LINK, and its absence is issue #1531: the
+  # `CPPHTTPLIB_OPENSSL_SUPPORT` that arrives through the line above makes every
+  # test including the vendored httplib header emit OpenSSL references, while
+  # the only libssl anywhere near the link line was a DT_NEEDED entry of THIS
+  # shared image. GNU ld refuses to resolve through one -- "DSO missing from
+  # command line" -- so eight targets failed to link and both sanitizer lanes
+  # reported `fail` without running a case, on every branch based after
+  # a50c57d69.
+  #
+  # Forward the PROPERTY rather than naming OpenSSL: the answer then lives in
+  # exactly one place, and the next PUBLIC LINK LIBRARY `vllm` acquires cannot be
+  # forgotten here. A per-target `target_link_libraries(test_x OpenSSL::SSL)`
+  # would repair the eight and leave the ninth to be discovered by a red lane.
+  #
+  # These four forwards are not the complete set, and saying so is the point of
+  # the paragraph above. `INTERFACE_COMPILE_OPTIONS`, `INTERFACE_COMPILE_FEATURES`
+  # and `INTERFACE_LINK_DIRECTORIES` are still unforwarded. All three are EMPTY on
+  # `vllm` today, so nothing is broken; the first one that gains a value owes a
+  # fifth line here, and will fail exactly as silently as this one did.
+  #
+  # It must stay INTERFACE with the property genex, and must never become
+  # `PUBLIC vllm`: `vllm` carries the `--whole-archive` INTERFACE link OPTION
+  # set above, and not propagating that is the entire reason this target exists.
+  target_link_libraries(vllm_sanitize_test_shared INTERFACE
+    "$<TARGET_PROPERTY:vllm,INTERFACE_LINK_LIBRARIES>")
 endif()
 
 # make install => a consumable libvllm.so + libvllm.a + vllm.h (llama.cpp-style).

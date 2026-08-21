@@ -3047,6 +3047,289 @@ void DFlashPagedBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query,
   });
 }
 
+// DFlash2 grouped dynamic depthwise convolution (SPEC-DFLASH2 W2, #1314) — the
+// CPU REFERENCE, and the authoritative implementation the CUDA kernel mirrors.
+//
+// BEYOND-PIN. Ported from `_grouped_conv`
+// (vllm/model_executor/models/qwen3_dflash2.py @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`):
+//
+//     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+//     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+//     output = coefficients[:, 0] * blocks
+//     position = torch.arange(hidden_states.shape[0], device=...)
+//     if block_size & (block_size - 1) == 0:
+//         position = position & (block_size - 1)
+//     else:
+//         position = position % block_size
+//     for tap in range(1, taps):
+//         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+//         output += coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+//     return output.flatten(-2)
+//
+// Three things are load-bearing and each is invisible to a token gate if wrong,
+// because a DFlash2 draft with a broken conv still emits the TARGET's tokens
+// (the verify is lossless) and loses only acceptance:
+//
+//  1. THE BLOCK MASK. `position` is the GLOBAL row index reduced modulo the
+//     block, so tap `t` contributes only where the source row `i-t` lies in the
+//     same (1+k) query block. Upstream's `F.pad(blocks[:-tap], ...)` supplies a
+//     zero for the first `tap` rows of the WHOLE batch and the mask supplies it
+//     at every later block boundary; this loop simply stops at `t > pos`, which
+//     is the same set because the mask is monotone in `t`.
+//  2. THE GROUP MAP. `delta` is indexed per GROUP and `base` per CHANNEL, so the
+//     same delta applies to every channel of a group. `g = c / group_size`.
+//  3. THE SIDE. `base` is `[sides, taps, H]` and dim 0 is prepare/finish, NOT a
+//     tap. On the published 27B draft both axes are 2, so a swap is undetectable
+//     by shape alone.
+//
+// ROUNDING. Upstream's chain materializes a tensor of the model dtype after each
+// step (`base + delta`, `coefficients * blocks`, `output += ...`), so each step
+// rounds here too. Every step is elementwise with no reduction-order freedom, so
+// this and the CUDA kernel agree BIT-FOR-BIT rather than within an envelope.
+void DFlashGroupedConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& coefficients,
+                             const Tensor& base, const DFlashGroupedConvArgs& args) {
+  const int64_t rows = x.shape[0];
+  const int64_t taps = args.taps;
+  const int64_t groups = args.num_groups;
+  const int64_t gsize = args.group_size;
+  const int64_t h = groups * gsize;
+  const int64_t sides = coefficients.shape[1];
+  const int64_t side = args.side;
+  const int64_t block = args.block_size;
+  // Upstream's own power-of-two special case, mirrored including the `&` arm:
+  // both published DFlash2 checkpoints resolve to a power-of-two query block
+  // (8 and 16), and upstream's reference test parametrises 5 for the other arm.
+  const bool pot = (block & (block - 1)) == 0;
+  const DType dt = out.dtype;
+  const auto round = [dt](float v) -> float {
+    switch (dt) {
+      case DType::kF32: return v;
+      case DType::kF16: return F16ToF32(F32ToF16(v));
+      case DType::kBF16: return BF16ToF32(F32ToBF16(v));
+      default: VT_CHECK(false, "dflash2-grouped-conv: unsupported dtype"); return 0.0f;
+    }
+  };
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) {
+      const int64_t pos = pot ? (i & (block - 1)) : (i % block);
+      for (int64_t g = 0; g < groups; ++g) {
+        for (int64_t j = 0; j < gsize; ++j) {
+          const int64_t c = g * gsize + j;
+          float acc = 0.0f;
+          for (int64_t t = 0; t < taps && t <= pos; ++t) {
+            const float b = LoadF32(base, (side * taps + t) * h + c);
+            const float d = LoadF32(coefficients, ((i * sides + side) * taps + t) * groups + g);
+            const float k = round(b + d);
+            const float term = round(k * LoadF32(x, (i - t) * h + c));
+            acc = (t == 0) ? term : round(acc + term);
+          }
+          StoreF32(out, i * h + c, acc);
+        }
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// DFlash2 candidate-selector edge lattice (SPEC-DFLASH2 W3, #1314) — the
+// AUTHORITATIVE reference. `Dflash2SelectorEdgesArgs` (include/vt/ops.h) carries
+// the contract, the upstream anchor and the rounding placement; this is the
+// implementation of it.
+//
+// Ported from `_score_edges` (vllm/model_executor/models/qwen3_dflash2.py:208-228
+// @ vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`).
+// Upstream's einsum is `blpr,blcr->blpc` over `predecessors * hidden[:, :, None]`
+// and `successors`; the loop below is that contraction written out, with the two
+// bf16 materializations upstream makes reproduced at the same two points.
+void Dflash2SelectorEdgesKernel(Queue&, Tensor& scores, const Tensor& pred_codebook,
+                                const Tensor& succ_codebook, const Tensor& candidate_ids,
+                                const Tensor& unary, const Tensor& hidden,
+                                const Tensor& anchors,
+                                const Dflash2SelectorEdgesArgs& args) {
+  const int64_t B = candidate_ids.shape[0];
+  const int64_t L = candidate_ids.shape[1];
+  const int64_t K = args.top_k;
+  const int64_t R = pred_codebook.shape[1];
+  const int64_t V = pred_codebook.shape[0];
+  const DType dt = pred_codebook.dtype;
+  const auto round = [dt](float v) -> float {
+    switch (dt) {
+      case DType::kF32: return v;
+      case DType::kF16: return F16ToF32(F32ToF16(v));
+      case DType::kBF16: return BF16ToF32(F32ToBF16(v));
+      default: VT_CHECK(false, "dflash2-selector-edges: unsupported dtype"); return 0.0f;
+    }
+  };
+  const int64_t* cand = candidate_ids.Ptr<int64_t>();
+  const int64_t* anchor = anchors.Ptr<int64_t>();
+  const float* un = unary.Ptr<float>();
+  float* out = scores.Ptr<float>();
+  // A candidate or anchor id outside the codebook is an id-space error (the
+  // org-vocab rebase, or a draft vocabulary that does not match the selector's).
+  // Upstream would index out of bounds; this names it.
+  for (int64_t b = 0; b < B; ++b)
+    VT_CHECK(anchor[b] >= 0 && anchor[b] < V,
+             "dflash2-selector-edges: anchor token id outside the codebook vocabulary");
+  for (int64_t i = 0; i < B * L * K; ++i)
+    VT_CHECK(cand[i] >= 0 && cand[i] < V,
+             "dflash2-selector-edges: candidate token id outside the codebook vocabulary");
+  ForRows(B * L, [&](int64_t r0, int64_t r1) {
+    // `gated[p][r]` is upstream's `predecessors * hidden[:, :, None]`, which is a
+    // MATERIALIZED bf16 tensor there and is rounded here for the same reason.
+    std::vector<float> gated(static_cast<size_t>(K * R));
+    for (int64_t idx = r0; idx < r1; ++idx) {
+      const int64_t b = idx / L, l = idx - b * L;
+      for (int64_t p = 0; p < K; ++p) {
+        // The PREDECESSOR of slot p: the verified anchor at step 0 (the same
+        // token for every p), else the previous step's candidate p.
+        const int64_t pid = (l == 0) ? anchor[b] : cand[(b * L + (l - 1)) * K + p];
+        for (int64_t r = 0; r < R; ++r)
+          gated[static_cast<size_t>(p * R + r)] =
+              round(LoadF32(pred_codebook, pid * R + r) * LoadF32(hidden, idx * R + r));
+      }
+      for (int64_t p = 0; p < K; ++p) {
+        for (int64_t c = 0; c < K; ++c) {
+          const int64_t cid = cand[idx * K + c];
+          float acc = 0.0f;
+          for (int64_t r = 0; r < R; ++r)
+            acc += gated[static_cast<size_t>(p * R + r)] * LoadF32(succ_codebook, cid * R + r);
+          // The einsum's OWN output is a bf16 tensor upstream; `unary + <bf16>`
+          // then promotes to f32 by torch's type-promotion rule, so the add is
+          // f32 and only the contraction rounds.
+          out[idx * K * K + p * K + c] = un[idx * K + c] + round(acc);
+        }
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// DFlash2 candidate-selector PATH WALK (SPEC-DFLASH2 W4, #1314) — the
+// AUTHORITATIVE reference. `Dflash2PathWalkArgs` (include/vt/ops.h) carries the
+// contract, the tie-break, the -inf rule and the upstream anchor.
+//
+// Ported from `_selector_walk_kernel`
+// (vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:16-79 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`) at
+// `SAMPLE_PROBABILISTIC=False`, where `gumbel_noised_argmax` reduces to
+// `tl.max(logits, axis=0, return_indices=True)`.
+//
+// THE THREE THINGS THIS LOOP HAS TO GET RIGHT, none of which raises when wrong:
+//   * `previous` carries. Step l reads block row `previous`, the slot step l-1
+//     chose. Step 0 reads row 0 because the lattice puts the verified ANCHOR in
+//     every predecessor slot of step 0, so a walk that never carried would agree
+//     with this one at L == 1 and diverge at every longer block.
+//   * the tie-break is the LOWEST slot, which is `tl.max`'s own. It picks the
+//     next step's predecessor row too, so it moves the rest of the path.
+//   * an all -inf row answers slot 0. Upstream reaches that value by loading
+//     masked lanes with `other=-inf`; the seed below (`best = -inf`, `index =
+//     K`, strict `>`, then collapse `K` to 0) is the same answer in a form the
+//     CUDA arm can reduce in parallel and reach bit-identically. Strictness is
+//     also what keeps a NaN from ever winning on either arm.
+//
+// A `>=` REDUCTION BREAKS ALL THREE OF THE ABOVE, not just the NaN row (#1518
+// corrects an earlier note here that said the tie rows and the -inf row do not
+// measure strictness). This scan ascends, so `>=` keeps the LAST maximum
+// instead of the first: the tie row then answers slot K-1 rather than slot 0,
+// and the all -inf row claims K-1 rather than leaving `index == K` for the
+// collapse. Measured by turning `>` into `>=` in this function
+// (tests/vt/test_ops_dflash2_path_walk.cpp): `a tie resolves to the LOWEST
+// slot` fails 2 assertions (got 13 for 11, 22 for 20), `an all -inf row
+// resolves to slot 0` fails 1 (33 for 31) and `a NaN never wins a slot` fails
+// 2 (83 for 81, and 83 != 83) -- 3 cases / 5 assertions, `Status: FAILURE!`.
+// What the NaN case adds that the other two do not is the NaN CLASS itself,
+// and it is the row on which the two backends actually diverged before W4's
+// review reconciled the CUDA lane comparator.
+//
+// Requests are independent, so the OUTER loop parallelizes and the inner step
+// loop stays serial -- which is exactly the shape upstream's one-program-per-
+// request grid has.
+void Dflash2PathWalkKernel(Queue&, Tensor& tokens, const Tensor& scores,
+                           const Tensor& candidate_ids,
+                           const Dflash2PathWalkArgs& args) {
+  const int64_t B = candidate_ids.shape[0];
+  const int64_t L = candidate_ids.shape[1];
+  const int64_t K = args.top_k;
+  const float* sc = scores.Ptr<float>();
+  const int64_t* cand = candidate_ids.Ptr<int64_t>();
+  int64_t* out = tokens.Ptr<int64_t>();
+  ForRows(B, [&](int64_t b0, int64_t b1) {
+    for (int64_t b = b0; b < b1; ++b) {
+      int64_t previous = 0;
+      for (int64_t l = 0; l < L; ++l) {
+        const int64_t flat = b * L + l;
+        const float* row = sc + (flat * K + previous) * K;
+        float best = -std::numeric_limits<float>::infinity();
+        int64_t index = K;
+        for (int64_t j = 0; j < K; ++j) {
+          if (row[j] > best) {
+            best = row[j];
+            index = j;
+          }
+        }
+        if (index == K) index = 0;  // an all -inf (fully masked) row
+        out[flat] = cand[flat * K + index];
+        previous = index;
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Top-k that EMITS the surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2, #1314)
+// — the AUTHORITATIVE reference. `TopKValuesIndicesArgs` (include/vt/ops.h)
+// carries the contract, the tie-break and the upstream anchor.
+//
+// Ported from `_topk` (vllm/model_executor/models/qwen3_dflash2.py:60-64 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`),
+// whose off-CUDA arm is `torch.topk(scores, k, dim=-1)`.
+//
+// `std::partial_sort` with the explicit (value DESC, index ASC) comparator IS the
+// tie-break contract, not an incidental property of the sort: `partial_sort` is
+// not stable, so leaving ties to the comparator's `false` branch would let the
+// order depend on the algorithm's internal swaps.
+void TopKValuesIndicesKernel(Queue&, Tensor& values, Tensor& indices, const Tensor& logits,
+                             const TopKValuesIndicesArgs& args) {
+  const int64_t rows = logits.shape[0], V = logits.shape[1];
+  const int64_t k = args.k, pad = args.num_org_vocab_padding;
+  const int64_t usable = V - pad;  // the padded tail can never be a candidate
+  const float* lg = logits.Ptr<float>();
+  float* val = values.Ptr<float>();
+  int64_t* idx = indices.Ptr<int64_t>();
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    std::vector<int64_t> order(static_cast<size_t>(usable));
+    for (int64_t row = r0; row < r1; ++row) {
+      const float* src = lg + row * V;
+      for (int64_t j = 0; j < usable; ++j) order[static_cast<size_t>(j)] = j;
+      // DESCENDING value, ties by ASCENDING index -- `torch.topk`'s CPU order,
+      // which `## Owed` O10 records as the contract this op's CUDA arm has to
+      // reproduce. NaN is handled EXPLICITLY and first, for two reasons. It is
+      // upstream's order (`torch.topk(largest=True)` treats NaN as the largest
+      // value), and without it this is not a strict weak ordering at all:
+      // `src[a] != src[b]` is TRUE for a NaN against anything, both `>` are
+      // FALSE, so NaN compares EQUIVALENT to every value while those values are
+      // not equivalent to each other -- and an intransitive equivalence is
+      // undefined behaviour in `std::partial_sort`, not merely a surprising
+      // answer. No shipped path feeds this op a NaN logit today; the ordering is
+      // defined here so that the day one arrives it is a defined answer rather
+      // than whichever comparison the sort happened to make.
+      std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k),
+                        order.end(), [src](int64_t a, int64_t b) {
+                          const float x = src[a], y = src[b];
+                          const bool nx = std::isnan(x), ny = std::isnan(y);
+                          if (nx != ny) return nx;
+                          if (!nx && x != y) return x > y;
+                          return a < b;
+                        });
+      for (int64_t j = 0; j < k; ++j) {
+        idx[row * k + j] = order[static_cast<size_t>(j)];
+        val[row * k + j] = src[order[static_cast<size_t>(j)]];
+      }
+    }
+  });
+}
+
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). Elementwise fusions of the
 // small host-side loops between the big decode ops; all math f32, dims inferred
 // from the tensor shapes.
@@ -3486,6 +3769,18 @@ struct Registrar {
     RegisterOp(OpId::kDFlashPagedBlockAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<DFlashPagedBlockAttentionFn>(&DFlashPagedBlockAttentionKernel)));
+    RegisterOp(OpId::kDFlashGroupedConv, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<DFlashGroupedConvFn>(&DFlashGroupedConvKernel)));
+    RegisterOp(OpId::kDflash2SelectorEdges, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2SelectorEdgesFn>(&Dflash2SelectorEdgesKernel)));
+    RegisterOp(OpId::kDflash2PathWalk, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2PathWalkFn>(&Dflash2PathWalkKernel)));
+    RegisterOp(OpId::kTopKValuesIndices, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<TopKValuesIndicesFn>(&TopKValuesIndicesKernel)));
     RegisterOp(OpId::kCastBf16, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kCPU,

@@ -348,9 +348,22 @@ class SharedHeadSource {
   // Fill the draft's two shared tensors. Both arms produce the SAME thing: bf16
   // `[vocab, H]` with nk=false for the gather table and the same `[vocab, H]`
   // with nk=true for the MatmulBT head. Throws naming the source on absence.
-  void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head) const {
+  //
+  // `head_was_quantized` is REQUIRED and has no default, which is a deliberate
+  // change from the defaulted `= nullptr` it carried through W3. SPEC-DFLASH2's
+  // fresh review found that deleting the third ARGUMENT at the DFlash call site
+  // below compiled clean and left all 38 dflash/gguf suites green after a full
+  // relink: the default silently turned the carry off, `lm_head_dequantized`
+  // stayed false, and D12's `RefuseQuantizedDflash2LmHead` guard lost its
+  // trigger while every gate stayed green. That is a silent-wrong the type system
+  // can refuse outright, so it does: every caller now names what it wants, and
+  // dropping the argument is a COMPILE ERROR rather than a green run. The DSpark
+  // caller passes `nullptr` explicitly and says why.
+  void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head,
+                bool* head_was_quantized) const {
+    if (head_was_quantized != nullptr) *head_was_quantized = false;
     if (gguf_ != nullptr) {
-      vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head);
+      vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head, head_was_quantized);
     } else {
       *embed = LoadNamedBf16(
           *shards_, "model.language_model.embed_tokens.weight", false);
@@ -449,21 +462,44 @@ std::vector<std::string> ReadDflashDraftArchitectures(const std::string& path) {
   return architectures;
 }
 
-// Refuse a DFlash2 draft BY NAME, before any weight is read.
+// Classify a DFlash2 draft BY NAME, before any weight is read, and refuse the arm
+// that is still missing.
 //
 // Upstream selects a different model class and a different speculator on the
 // `DFlash2DraftModel` architecture (registry.py:628 and
 // v1/worker/gpu/spec_decode/__init__.py:12-17 @ vllm-project/vllm#52816 head
 // `19c9351904df4c63042671bc67a866ca48dc7d6f`). This engine selects the draft lane
 // from the CLI method string alone, and a DFlash2 checkpoint's tensor set is
-// DFlash1's PLUS the conv and selector tensors -- so it loads through the DFlash1
-// loader with nothing missing and nothing thrown, and drafts with both new
-// mechanisms simply absent. That draft proposes worse tokens, the verify is
-// lossless, so the emitted tokens are still the target's and only acceptance
-// falls. AGENTS.md requires an unimplemented arm to refuse with the missing part
-// named rather than to degrade in silence, and this refusal is what SPEC-DFLASH2
-// W1 ships.
-void RefuseDflash2Draft(const std::string& draft_model_path) {
+// DFlash1's PLUS the conv and selector tensors -- so without this classification
+// it loads through the DFlash1 loader with nothing missing and nothing thrown,
+// and drafts with both new mechanisms simply absent. That draft proposes worse
+// tokens, the verify is lossless, so the emitted tokens are still the target's
+// and only acceptance falls.
+//
+// SPEC-DFLASH2 W2 (#1314) SPLITS the two container arms, because they are no
+// longer in the same state:
+//
+//  * SAFETENSORS is ADMITTED. Its grouped dynamic depthwise convolution is
+//    implemented (`vt::DFlashGroupedConv`), loaded (`LoadQwen3DFlash` reads the
+//    per-layer `attention_conv`/`mlp_conv` tensors) and RUN (every layer body of
+//    `Qwen3DFlashModel`), and as of W3 so is its CANDIDATE SELECTOR
+//    (`vllm::v1::Dflash2SelectCandidates`). What is still missing is the PATH
+//    WALK, and that is refused BY NAME one step later, after both have executed,
+//    at `RefuseDflash2PathWalk`. Refusing here instead would leave every
+//    line of W2 and W3 unreachable from any production entry point -- AGENTS.md
+//    `## Nothing lands dead`. The notice below is what a user gets at STARTUP so
+//    the later refusal is not a surprise; it is a notice and not a warning about
+//    a degraded result, because there is no degraded result: the engine refuses.
+//  * GGUF was REFUSED through W4, because the GGUF drafter ARM was wave W5:
+//    neither the config reader nor the weight path had a name for a conv tensor,
+//    so admitting the file would have loaded a DFlash1 draft out of a DFlash2
+//    checkpoint -- the exact silent degradation this function exists to prevent.
+//    W5 (#1314) LANDS that arm, so the refusal is gone and this container gets
+//    the same startup notice the other one does. Both arms now print and neither
+//    throws; the function stays because the notice is what tells a user the port
+//    is beyond the parity pin and carries no throughput number, which is not
+//    readable off any checkpoint.
+void CheckDflash2DraftArm(const std::string& draft_model_path) {
   // WHAT IDENTIFIED THE FILE, which differs by container and is quoted back to
   // the user because the two arms are otherwise indistinguishable in a message.
   std::string identity;
@@ -483,31 +519,43 @@ void RefuseDflash2Draft(const std::string& draft_model_path) {
     } catch (const std::exception&) {
       return;
     }
-    identity = "carries the DFlash2-only metadata key \"" + matched + "\"";
+    identity = "carries the DFlash2-only metadata key \"" + matched +
+               "\" (a GGUF declares no architecture this could read: the "
+               "published DFlash2 drafter writes the same \"dflash\" a DFlash1 "
+               "drafter writes)";
   } else {
+    // The safetensors arm, ADMITTED as of W2 and drafting as of W4. This is the
+    // container upstream classifies on, and the only one that HAS an
+    // architecture string to classify with.
     const std::vector<std::string> architectures =
         ReadDflashDraftArchitectures(draft_model_path);
     if (!vllm::SpeculativeConfig::IsDflash2Draft(architectures)) return;
     identity = "declares architecture \"DFlash2DraftModel\"";
   }
-  throw std::invalid_argument(
-      "speculative-config: the draft checkpoint at \"" + draft_model_path +
-      "\" " + identity +
-      ", and the DFlash2 draft lane "
-      "is not implemented here. Two mechanisms are missing: the grouped dynamic "
-      "depthwise convolution wrapped around each attention and each MLP sublayer, "
-      "and the candidate selector that replaces the per-slot argmax with a scored "
-      "path walk over the target head's top-K "
-      "(vllm/model_executor/models/qwen3_dflash2.py and "
-      "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py @ "
-      "vllm-project/vllm#52816 head 19c9351904df4c63042671bc67a866ca48dc7d6f). "
-      "Loading it through the DFlash1 lane instead would succeed, because a "
-      "DFlash2 checkpoint carries DFlash1's whole tensor set, and it would draft "
-      "worse tokens with no visible symptom: the verify is lossless, so the "
-      "emitted tokens are still the target's and only acceptance falls. Owed by "
-      "row SPEC-DFLASH2 (.agents/specs/dflash2-spec-decode.md), issue #1314 "
-      "(https://github.com/mudler/vllm.cpp/issues/1314). Use a DFlashDraftModel "
-      "checkpoint until that row lands.");
+  // W4 (#1314) removed the boundary on the safetensors arm; W5 removes it on the
+  // GGUF one, so this notice is now the function's WHOLE output and both
+  // containers reach it. It still prints, because three things a user cannot
+  // read off the checkpoint are true -- the port is beyond the parity pin, no
+  // throughput number has been taken for it, and the GGUF arm dequantizes a
+  // quantized drafter to bf16 -- and because a notice that vanished the moment
+  // the lane started working would leave a DFlash2 run indistinguishable from a
+  // DFlash1 one in the log.
+  std::cerr
+      << "vllm.cpp: the draft checkpoint at \"" << draft_model_path << "\" "
+      << identity
+      << ". Its grouped dynamic depthwise convolution, its CANDIDATE SELECTOR "
+         "and its PATH WALK are all implemented and will run, so this draft "
+         "DRAFTS -- from safetensors and from GGUF alike (row SPEC-DFLASH2 waves "
+         "W1-W5, .agents/specs/dflash2-spec-decode.md, issue #1314). Two things "
+         "are still owed and neither is silent: a GGUF drafter is DEQUANTIZED "
+         "wholesale to bf16 at load, so a k-quant draft costs its bf16 residency "
+         "rather than its file size, and no throughput number has been taken for "
+         "this architecture -- a DFlash2 draft runs its block forward off the "
+         "paged CUDA-graph fast path, because the candidate selector needs the "
+         "hidden states of the same forward its logits came from. This port "
+         "mirrors vllm-project/vllm#52816, which is OPEN upstream at head "
+         "66e5414c6d75a8529473d977f7458c140bbab8a0; it does not advance the "
+         "parity pin.\n";
 }
 
 // SPEC-DSPARK-QWEN3-ROUTING (#1193): the two keys upstream classifies a DSpark
@@ -700,7 +748,10 @@ std::unique_ptr<DflashDraft> LoadDsparkDraft(const vllm::SpeculativeConfig& spec
       draft->dspark->backbone.lm_head.Empty()) {
     vllm::OwnedTensor shared_embed;
     vllm::OwnedTensor shared_lm_head;
-    shared.LoadInto(&shared_embed, &shared_lm_head);
+    // nullptr, and NOT a default: the DSpark lane has no DFlash2 selector, so no
+    // guard reads a dequantized-head flag here. Named rather than omitted so the
+    // DFlash caller's third argument cannot be deleted without a build failure.
+    shared.LoadInto(&shared_embed, &shared_lm_head, /*head_was_quantized=*/nullptr);
     if (draft->dspark->backbone.embed_tokens.Empty()) {
       draft->dspark->backbone.embed_tokens = std::move(shared_embed);
     }
@@ -770,7 +821,8 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
   // exactly as vLLM's skip_substrs(embed_tokens)/tie handling. Common to BOTH
   // draft sources and BOTH target containers since B1 - the source abstraction
   // is what lets the four combinations share one code path.
-  shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head);
+  shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head,
+                  &draft->weights.lm_head_dequantized);
   draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
   // A DFLASH GGUF draft carries NO vocab KV and no embedding tensor (it SHARES
   // the target's), so MakeDflashGgufConfig leaves vocab_size 0 - right for the
@@ -786,6 +838,47 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
   // the rule at B1, where the rows now come from a GGUF target's token_embd.
   if (draft->config.vocab_size == 0) {
     draft->config.vocab_size = draft->weights.embed_tokens.shape[0];
+  }
+  // SPEC-DFLASH2 W2 (#1314): the conv's block is the QUERY block, and the
+  // resolved `k` is its authority -- exactly as upstream sizes the conv from
+  // `1 + speculative_config.num_speculative_tokens` and never from the config key
+  // (`DFlash2Qwen3DecoderLayer.__init__` @ vllm-project/vllm#52816 head
+  // `66e5414c6d75a8529473d977f7458c140bbab8a0`). A conv masking against the wrong
+  // block is acceptance-only and token-invisible, so it is set from ONE place.
+  //
+  // W4 (#1314) made that one place the ONLY place: `LoadQwen3DFlash` no longer
+  // seeds the field from the checkpoint's `block_size`, so deleting this line
+  // leaves 0 rather than a plausible default and the first DFlash2 forward
+  // refuses by name (`Qwen3DFlashModel`'s `conv_block_size must be set` check).
+  // That is the discharge of spec `## Owed` O5's first item: the line was
+  // mutation-proven UNGATED by W2 -- deleting it compiled clean and left every
+  // suite green -- and it is now covered by the production reachability gate,
+  // tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp, which generates
+  // through this loader path.
+  if (draft->weights.IsDflash2()) {
+    draft->weights.conv_block_size = draft->k + 1;
+    // GEOMETRY ONLY, and deliberately NOT the boundary. This line used to append
+    // "the candidate selector is NOT implemented", which W3 made false in the
+    // same wave that wrote it: the selector landed and the boundary moved to the
+    // path walk. A user loading a real DFlash2 directory then got that sentence
+    // AND `CheckDflash2DraftArm`'s corrected notice, which contradict each other,
+    // and the stale one named the wave that had just shipped as still owing the
+    // mechanism.
+    //
+    // The boundary has exactly ONE owner, for the reason `FromModelDir` already
+    // states beside its own call: `CheckDflash2DraftArm` runs on every path that
+    // reaches this function -- `ResolveSpecConfig` for the constructor and
+    // `FromModelDir` line ~1889 ahead of every load -- so its notice has already
+    // been printed by the time anything gets here. A second copy adds nothing a
+    // user can act on and cannot be gated from any entry point this repository
+    // can drive (spec `## Owed` O5), so it went stale within one wave and would
+    // again at W4 and W5. What this line uniquely knows is the RESOLVED conv
+    // geometry, which the notice above cannot report because it runs before any
+    // weight is read, so that is all it says.
+    std::cerr << "vllm.cpp: DFlash2 draft: grouped conv taps="
+              << draft->weights.conv_taps
+              << " group=" << draft->weights.conv_group_size
+              << " block=" << draft->weights.conv_block_size << "\n";
   }
   std::cerr << "vllm.cpp: DFlash draft loaded from " << source_kind << " "
             << draft_dir << " (k=" << draft->k << ", taps=" << num_taps
@@ -1108,7 +1201,7 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
     // OMISSION rather than by decision. This is the production caller
     // `SpeculativeConfig::IsDflash2Draft` would otherwise lack.
     if (cli.draft_model_path.has_value()) {
-      RefuseDflash2Draft(*cli.draft_model_path);
+      CheckDflash2DraftArm(*cli.draft_model_path);
     }
     vllm::SpeculativeConfig cfg =
         vllm::SpeculativeConfig::ResolveDflash(*cli.num_speculative_tokens);
@@ -1412,6 +1505,15 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
                    AttachMtp(MakeQwen3_5DenseLoadedModel(std::move(weights)),
                              std::move(mtp_weights)),
                    std::move(tokenizer), params) {}
+
+// SPEC-DFLASH2 W3 (#1314): the DFlash counterpart of the overload above. See the
+// header for why it exists and what it makes reachable.
+LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
+                           tok::Tokenizer tokenizer, const EngineParams& params,
+                           std::unique_ptr<DflashDraft> dflash_draft)
+    : LoadedEngine(std::move(config), MakeQwen3_5DenseLoadedModel(std::move(weights)),
+                   std::move(tokenizer), params, /*preselected_queue=*/nullptr,
+                   std::move(dflash_draft)) {}
 
 LoadedEngine::LoadedEngine(HfConfig config,
                            std::unique_ptr<LoadedModel> model,
@@ -1816,13 +1918,13 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // checkpoint had already been read through the DFlash1 loader. Both target
   // containers pass through this line, and the `.gguf` branch immediately below
   // returns before the later one. This is a REFUSAL and not a second resolution:
-  // it calls the same `RefuseDflash2Draft` the constructor's `ResolveSpecConfig`
+  // it calls the same `CheckDflash2DraftArm` the constructor's `ResolveSpecConfig`
   // calls and decides nothing else, so the classification keeps one owner and
   // one message.
   if (params.speculative_config.has_value() &&
       params.speculative_config->method == "dflash" &&
       params.speculative_config->draft_model_path.has_value()) {
-    RefuseDflash2Draft(*params.speculative_config->draft_model_path);
+    CheckDflash2DraftArm(*params.speculative_config->draft_model_path);
   }
 
   // LOAD-GGUF-MMPROJ (#821): a projector is a SECOND GGUF beside a GGUF

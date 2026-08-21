@@ -212,8 +212,12 @@ target_include_directories(test_minimax_music3_llm_real PRIVATE
 # (minimax_music3_acoustic_goldens.inc, no weight bytes). The full-scale fp32
 # companion is tests/parity/test_minimax_music3_acoustic_real.cpp.
 vllm_cpp_add_test(test_minimax_music3_acoustic vllm/models/test_minimax_music3_acoustic.cpp)
+# Reaches src/ for `music3_profile.h` — an INTERNAL instrument, deliberately not
+# on the public surface — because the intra-DiT spans (#1542) live inside
+# `DitForwardDevice` and this is the only suite that drives that forward.
 target_include_directories(test_minimax_music3_acoustic PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+  ${CMAKE_SOURCE_DIR}/src)
 # The FULL-SCALE companion: the REAL fp32 2.4B DiT and 0.054B vocoder driven on
 # the REAL inputs, against the committed oracle capture (denoise_{first,last}_*,
 # vocoder_input_chunk0, waveform). Checkpoint-gated exactly as the AR one is;
@@ -572,6 +576,18 @@ vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_dflash_forward vllm/models/test_qwen3_dflash_forward.cpp)
 target_include_directories(test_qwen3_dflash_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W2 (#1314): the DFlash2 draft -- the published configs' nested
+# spellings (spec `## Owed` O3/O4), the conv weights, and the draft forward that
+# runs the grouped convolution.
+vllm_cpp_add_test(test_qwen3_dflash2_draft vllm/models/test_qwen3_dflash2_draft.cpp)
+target_include_directories(test_qwen3_dflash2_draft PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W5 (#1314): the GGUF DFlash2 drafter arm. The container the other
+# suite cannot reach -- a GGUF declares no `architectures` and writes the same
+# `general.architecture = dflash` a DFlash1 drafter writes -- plus the LOWER
+# BOUND its k-quant arms need, because this lane dequantizes to bf16 by design
+# and a token gate therefore cannot see a quantized tensor that never decoded.
+vllm_cpp_add_test(test_qwen3_dflash2_gguf vllm/models/test_qwen3_dflash2_gguf.cpp)
+target_include_directories(test_qwen3_dflash2_gguf PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DSPARK W2: the DSpark Markov transition head + draft->target vocab map.
 vllm_cpp_add_test(test_qwen3_dspark_markov vllm/models/test_qwen3_dspark_markov.cpp)
 target_include_directories(test_qwen3_dspark_markov PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -958,6 +974,17 @@ vllm_cpp_add_test(test_tokenizer_metaspace_split
 target_compile_definitions(test_tokenizer_metaspace_split PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
 vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
+# The load-time MergeTokenOutOfVocabulary refusal asserts that every
+# committed HF golden still loads, so test_bpe reaches the goldens dir.
+target_compile_definitions(test_bpe PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+# SPEC-BPE-QUADRATIC-MERGE (#1365) — the long-pretoken equivalence corpus and
+# the absolute cost bound. The corpus ids are HF `tokenizers` 0.22.2 output over
+# the two committed goldens (an oracle, not a snapshot of ours); the cost case
+# is the row's ONLY timing assertion and it is RED against the O(n^2) merge.
+vllm_cpp_add_test(test_bpe_equivalence vllm/test_bpe_equivalence.cpp)
+target_compile_definitions(test_bpe_equivalence PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 vllm_cpp_add_test(test_detokenizer vllm/test_detokenizer.cpp)
 vllm_cpp_add_test(test_request vllm/test_request.cpp)
 vllm_cpp_add_test(test_kv_cache_utils vllm/v1/test_kv_cache_utils.cpp)
@@ -1340,6 +1367,18 @@ target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # assertion that a DFlash1 checkpoint's resolution is unchanged.
 vllm_cpp_add_test(test_dflash_causality vllm/v1/spec_decode/test_dflash_causality.cpp)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
+# SPEC-DFLASH2 W4 (#1314): the INVERSE guard, once the walk lands and there is
+# no missing mechanism left to refuse -- a DFlash2 block that reaches the DFlash1
+# per-slot argmax throws by name, and the walk's own refusals are gated beside
+# it. W1/W2/W3 read "the candidate-selector refusal" here, which was the boundary
+# the architecture was left at while its selector was unported.
+vllm_cpp_add_test(test_dflash2_argmax_guard
+  vllm/v1/spec_decode/test_dflash2_argmax_guard.cpp)
+# SPEC-DFLASH2 W4 (#1314): reachability (spec G5) -- a real LoadedEngine through
+# GPUModelRunner::propose_drafts_block, with the drafts read off the production
+# trace.
+vllm_cpp_add_test(test_dflash2_runner_reach
+  vllm/v1/spec_decode/test_dflash2_runner_reach.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).
@@ -1510,6 +1549,34 @@ if(VLLM_CPP_SERVER)
   # hub. It starts a REAL cpp-httplib server on an ephemeral port, so it shares
   # api_server.cpp's gate and the RUN_SERIAL treatment two rows below.
   vllm_cpp_add_test(test_hf_hub vllm/transformers_utils/test_hf_hub.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W3/W4 (#1280): the byte transport and the `--model`
+  # grammar, both against an in-process fake hub on an ephemeral port. Same
+  # gate and same RUN_SERIAL treatment as the suite above.
+  vllm_cpp_add_test(test_downloader vllm/transformers_utils/test_downloader.cpp)
+  vllm_cpp_add_test(test_model_resolver
+    vllm/transformers_utils/test_model_resolver.cpp)
+  # ENG-HF-MODEL-DOWNLOAD W5 (#1280): the transport-layer-security suite. It is
+  # the ONE place in this row that speaks https, and the one place that measures
+  # whether the server half and the fetcher half were compiled against the same
+  # cpp-httplib layout. Its TLS arm starts a real `httplib::SSLServer` on
+  # loopback, so it shares the RUN_SERIAL treatment below.
+  vllm_cpp_add_test(test_tls_transport
+    vllm/transformers_utils/test_tls_transport.cpp)
+  # THE EXPECTATION, computed on a path that does NOT read the macro under test.
+  # `VLLM_CPP_TEST_EXPECT_TLS` says "the user asked for the download feature and
+  # this host has the OpenSSL development files", which is a fact about the
+  # CONFIGURATION. The suite then asserts that the BUILD delivered transport
+  # layer security. Deriving the expectation from `CPPHTTPLIB_OPENSSL_SUPPORT`
+  # instead would make the case a tautology that a silently disabled feature
+  # passes, which is the exact failure `scripts/validate-container-image.py`
+  # exists to catch in the container.
+  if(VLLM_CPP_HF_DOWNLOAD_REQUESTED AND VLLM_CPP_OPENSSL)
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND)
+      target_compile_definitions(test_tls_transport PRIVATE
+        VLLM_CPP_TEST_EXPECT_TLS=1)
+    endif()
+  endif()
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
@@ -1534,6 +1601,7 @@ if(VLLM_CPP_SERVER)
   # these two against each other, not against the CPU-hog tests that actually
   # cause the starvation.)
   set_tests_properties(test_openai_api_server test_openai_conformance test_hf_hub
+    test_downloader test_model_resolver test_tls_transport
     PROPERTIES RUN_SERIAL ON)
   # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
   # drives the REAL VllmServerMain (owned by the library behind the same
@@ -1542,6 +1610,18 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_recipe_args
     vllm/entrypoints/openai/test_serve_recipe_args.cpp)
   target_include_directories(test_serve_recipe_args PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # ENG-HF-MODEL-DOWNLOAD W4 (#1280): THE REACHABILITY GATE. It enters at the
+  # REAL VllmServerMain with `--model org/repo` and an in-process fake hub, so
+  # it needs src/ on the include path for server_main.h, exactly as the suite
+  # above does, and the committed llama_embed_e2e checkpoint as the payload the
+  # hub serves. It binds a port and forks a server, so it is RUN_SERIAL for the
+  # same starvation reason as test_openai_api_server.
+  vllm_cpp_add_test(test_serve_hf_model
+    vllm/entrypoints/openai/test_serve_hf_model.cpp)
+  target_include_directories(test_serve_hf_model PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(test_serve_hf_model PRIVATE
+    VLLM_LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+  set_tests_properties(test_serve_hf_model PROPERTIES RUN_SERIAL ON)
   # ENG-MM-INPUT-PIPELINE wave L2 (#607): --language-model-only /
   # --limit-mm-per-prompt. Same shape and the same reason as the row above — it
   # re-execs the REAL VllmServerMain to observe the flags reaching the config and
@@ -2082,6 +2162,16 @@ vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.c
 vllm_cpp_add_test(test_ops_attention_cross vt/test_ops_attention_cross.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
+# SPEC-DFLASH2 W2 (#1314): the DFlash2 grouped dynamic depthwise convolution,
+# gated against upstream's own sequential reference at block 5 (modulo arm), 8
+# and 16 (the two published checkpoints) plus CUDA==CPU bit-identity.
+vllm_cpp_add_test(test_ops_dflash2_grouped_conv vt/test_ops_dflash2_grouped_conv.cpp)
+vllm_cpp_add_test(test_ops_topk_values_indices vt/test_ops_topk_values_indices.cpp)
+vllm_cpp_add_test(test_ops_dflash2_selector_edges vt/test_ops_dflash2_selector_edges.cpp)
+# SPEC-DFLASH2 W4 (#1314): the candidate selector's PATH WALK -- one program per
+# request with the slot-to-slot dependency as a loop inside it, gated against
+# upstream's own `_selector_walk_kernel` control flow plus CUDA==CPU bit-exactness.
+vllm_cpp_add_test(test_ops_dflash2_path_walk vt/test_ops_dflash2_path_walk.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
 # KV-FP8 W1: fp8 KV-cache store (ReshapeAndCacheFp8) + paged-attention read
 # dequant + the ParseCacheDType config wiring.
@@ -2122,6 +2212,13 @@ target_include_directories(test_ops_conv1d_depthwise PRIVATE ${CMAKE_SOURCE_DIR}
 # end-to-end bit-identity gate is tests/vllm/models/test_host_parallel.cpp.
 vllm_cpp_add_test(test_ops_conv1d_general vt/test_ops_conv1d_general.cpp)
 target_include_directories(test_ops_conv1d_general PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007): vt::Conv3d against
+# an independent in-test scalar reference, plus the case that proves its
+# per-input-channel partial is a DIFFERENT number from kConv2d's flat
+# accumulator. The LTX-2.5 decode's own byte-identity gate is
+# tests/vllm/models/test_ltx2_vae.cpp.
+vllm_cpp_add_test(test_ops_conv3d vt/test_ops_conv3d.cpp)
+target_include_directories(test_ops_conv3d PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_attn_relpos vt/test_ops_attn_relpos.cpp)
 target_include_directories(test_ops_attn_relpos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
