@@ -126,9 +126,22 @@ probes only `kMatmulBTQuant`, but `qwen3_5.cpp:6193` `KqGrouped` calls
 `:6167`) and not device-gated; `deepseek_v4.cpp:571,1428` do the same. Register
 the dense op alone and the probe flips true, MoE GGUFs keep their blocks
 compressed, and the first expert GEMM dies with `no kernel for op
-MatmulBTQuantGrouped on device rocm` — a NEW failure on models that load today.
-This is [#1029](https://github.com/mudler/vllm.cpp/issues/1029)'s shape exactly:
-"past that predicate there is no fallback left."
+MatmulBTQuantGrouped on device rocm`. This is
+[#1029](https://github.com/mudler/vllm.cpp/issues/1029)'s shape exactly: "past
+that predicate there is no fallback left."
+
+**CORRECTION (measured at W7).** An earlier draft of this section, and the
+commit that landed the kernel, called that "a NEW failure on models that load
+today". On ROCm that is **overstated**. A Qwen3.5/3.6 MoE GGUF does not run on a
+discrete AMD card at all: it dies earlier, at `kSharedExpertGate`, which is
+registered on `kCPU` and nowhere else, and which the reference tier may not
+cover because this device's memory is not host-addressable
+([#1590](https://github.com/mudler/vllm.cpp/issues/1590)). So the grouped op
+protects a path that is currently UNREACHABLE on this backend rather than one
+that currently works. It still ships here, because it becomes required the
+moment #1590 is fixed and because leaving a predicate with no arm behind it is
+the #1029 defect regardless of who reaches it first. The reasoning was right;
+the claim about today's behaviour was not.
 
 **(b) Unsupported dtypes must delegate, not throw.** With `keep_quant` true, a
 Q2_K or IQ2_XXS tensor also stays compressed and reaches the ROCm provider. The
@@ -208,7 +221,7 @@ the IQ family there is nothing to vendor.
 | W4 | CMake registration; the flip of `GgufQuantComputeAvailable` on `kROCM` | DONE |
 | W5 | Model-level arm: tokens + peak RSS on gfx1200, and the `VT_GGUF_KEEP_QUANT=0` byte-identity control | DONE |
 | W6 | `ctest -R 'rocm\|cross_device'` no-regression | DONE — 5/6; the 1 failure is pre-existing #1513, control-proven |
-| W7 | MoE-model arm (the grouped op in a real GGUF) | OWED |
+| W7 | MoE-model arm (the grouped op in a real GGUF) | BLOCKED by #1590, not owed to this row |
 | W8 | Decode-only speed measurement, to attribute §Outcome's 1.8x | OWED |
 
 ## Tests to port
@@ -398,8 +411,16 @@ and G4 delivers that with margin.
 
 ## Owed (added at implementation)
 
-- **§Tests step 6, the MoE-model arm.** The grouped op is unit-gated but has not
-  run inside a real MoE GGUF, which is where hazard (a) would actually bite.
+- **§Tests step 6, the MoE-model arm: BLOCKED, not owed.** Attempted at W7 on
+  `Qwen3.6-14B-A3B-VibeForged-v2-Q4_K_M.gguf` (arch `qwen35moe`, 8.5 GB, fits
+  the 15.9 GiB card). It cannot run: `no kernel for op SharedExpertGate (id 67)
+  on device rocm`, identically with `VT_GGUF_KEEP_QUANT=0`, so it is independent
+  of this row. Filed as [#1590](https://github.com/mudler/vllm.cpp/issues/1590)
+  against `BACKEND-ROCM`. The grouped op therefore stands on its unit gate
+  alone, and this row says so rather than implying production coverage it does
+  not have. No other vehicle was available: the corpus MoE alternatives are the
+  same `qwen35moe` family, a `deepseek2` arch the GGUF dispatch does not handle,
+  or too large for 15.9 GiB VRAM.
 - **A decode-only speed measurement**, one tool, isolating decode from load, to
   attribute the 1.8x above. Until it exists this row asserts nothing about
   throughput.
