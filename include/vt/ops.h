@@ -459,6 +459,15 @@ enum class OpId : uint8_t {
   // See vt::Conv3d below for the contract. Appended before kCount so no
   // existing op's id shifts.
   kConv3d,
+  // --- EXL3 (exllamav3 trellis) DEVICE kernels, MODEL-DSV4-EXL3 W2a/W2b. The
+  // W1a entries below (`Exl3TileCodeword` ..  `Exl3DequantLinear`) are plain
+  // host functions because they decode a CHECKPOINT FORMAT at load time. These
+  // two are ops, because they run per FORWARD on whatever device the queue names
+  // and are exactly what makes the trellis tower fast rather than merely
+  // readable. See vt::Exl3HadR128 / vt::Exl3Gemm below for the contracts.
+  // Appended before kCount so no existing op's id shifts.
+  kExl3HadR128,
+  kExl3Gemm,
   kCount
 };
 
@@ -506,6 +515,28 @@ struct DropinProbeArgs {
 struct RmsNormArgs {
   float eps = 1e-6f;
   bool gemma = false;  // weight applied as (1 + w), GemmaRMSNorm style
+};
+
+// ─── EXL3 device-kernel argument records — MODEL-DSV4-EXL3 W2 ────────────────
+// Ported from exllamav3 @ 2398c05635fbbad01a0a51dce63c85c6c8a8450e (MIT). See
+// the vt::Exl3HadR128 / vt::Exl3Gemm contracts at the end of this header, and
+// `.agents/specs/model-dsv4-exl3.md` `## W2 design` for the parity contract,
+// the output dtype decision and the shape policy.
+
+// `had_r_128(input, output, pre_scale, post_scale, scale)`
+// (quant/hadamard.cuh:5-12). At most ONE of the two scale vectors may be set —
+// upstream instantiates the kernel as <pre_scale, post_scale> and never with
+// both true (hadamard.cu:112-172).
+struct Exl3HadArgs {
+  const Tensor* pre_scale = nullptr;   // fp16 [cols], multiplied BEFORE the transform
+  const Tensor* post_scale = nullptr;  // fp16 [cols], multiplied AFTER
+  float scale = 1.0f;                  // folded into r_scale = scale / sqrt(128)
+};
+
+struct Exl3GemmArgs {
+  int bits = 0;             // K, bits per weight (1..8); 3 for the 3.0bpw artifact
+  int codebook = 1;         // cb; 1 == mcg, the only codebook this row decodes
+  int force_shape_idx = 0;  // 0 == let Exl3SelectGemmShape decide (the default)
 };
 
 // torch `nn.LayerNorm` arguments (opt.py:146-148,164-166,248-251 construct it
@@ -1384,6 +1415,14 @@ using AttnQkNormRopeFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
              const Tensor&, const RmsNormArgs&, const RopeArgs&);
 using SharedExpertGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+// MODEL-DSV4-EXL3 W2a/W2b. Both take their optional/small parameters through an
+// args struct rather than more Tensor arguments, because `pre_scale`/`post_scale`
+// are genuinely OPTIONAL (upstream's `c10::optional<at::Tensor>`,
+// hadamard.cuh:5-12) and `bits`/`codebook` are compile-time template parameters
+// on the device side that the host launcher dispatches on.
+using Exl3HadR128Fn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3HadArgs&);
+using Exl3GemmFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                            const Tensor&, Tensor&, const Exl3GemmArgs&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -3782,6 +3821,19 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                     const Tensor& query_start_loc, const PagedAttentionArgs& args);
 
+// SPEC-DFLASH2 W10 repair (#1865): process counter of spec-CLASSIFIED batches
+// arriving at the PagedAttention dispatch wrapper — a batch whose
+// `args.uniform_spec_query_len` passes `PagedAttnUniformSpecShape`. This is the
+// seam the W10 review named dead: deleting the model's
+// `pa.uniform_spec_query_len = meta.uniform_spec_query_len` threading redded
+// nothing on a CPU box, because the CUDA lane it feeds is `HasCuda`-gated and
+// the CPU kernel ignores the field. The counter makes the THREADING observable
+// on every backend: the production fixture asserts one arrival per uniform
+// verify step per full-attention layer. In-memory diagnostics, same shape as
+// v1::GraphDispatchStats; reset+read from one test at a time.
+uint64_t PagedAttnSpecClassifiedCount();
+void ResetPagedAttnSpecClassifiedCount();
+
 // --- V1 sampling ops (M1.7 Task 2). Ported from
 // vllm/v1/sample/ops/topk_topp_sampler.py + vllm/v1/sample/sampler.py @ e24d1b24.
 // The Sampler pipeline (M1.7 Task 4) composes these over the model's final
@@ -4042,5 +4094,191 @@ void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& 
 // sigmoid gate (moe-semantics.md §5), applied per token to the shared MLP
 // output. T inferred from out.shape[0], H = out.Numel()/T.
 void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl);
+
+// ─── EXL3 (exllamav3 trellis) reference dequant — CPU tier ───────────────────
+//
+// PORTED FROM exllamav3 @ 2398c05635fbbad01a0a51dce63c85c6c8a8450e (MIT); vLLM
+// implements no EXL3 at the pin, so exllamav3 is the secondary oracle this
+// mirrors (.agents/specs/model-dsv4-exl3.md). Row MODEL-DSV4-EXL3 W1a.
+//
+// An EXL3 linear stores FOUR tensors and NO scales (`exl3.py:38`):
+//   trellis  int16 [k/16, n/16, 16*bits]  — 16x16 tiles of 256 codewords
+//   suh      fp16  [k]                    — left  sign/scale vector
+//   svh      fp16  [n]                    — right sign/scale vector
+//   mcg      int32 scalar                 — codebook marker, never read at
+//                                           inference (quantize.py:1414-1424)
+// and the full-weight reference is `LinearEXL3.get_weight_tensor`
+// (`exl3.py:227-237`): reconstruct -> blockwise Hadamard-128 on the left ->
+// `* suh[:,None]` -> blockwise Hadamard-128 on the right -> `* svh[None,:]`
+// (`exl3_lib/quantize.py:340-358`, both scaled by 1/sqrt(128); `had_k = had_n =
+// 128` at `quantize.py:15`). The RUNTIME instead transforms activations
+// (`had_r_128` in/out, `exl3.py:183-214`) — that arm is MODEL-DSV4-EXL3 W2.
+//
+// These are plain host functions, not OpProvider ops: they decode a CHECKPOINT
+// FORMAT at load time on the host, exactly like the GGUF/NVFP4 block dequants,
+// and W2's device kernels (`exl3_gemm`, `had_r_128`) are gated for byte parity
+// AGAINST them rather than dispatched beside them.
+
+// The 16-bit tail-biting codeword for weight `t` (0..255) of one packed tile.
+// `tile` is the tile's 16*bits int16 words as stored. Mirrors `dq`
+// (`exl3_dq.cuh:15-31`): the window ENDS at weight t, so t's own `bits` bits sit
+// in the low positions and weights t-1, t-2 … wrap around the tile above them.
+uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t);
+
+// The MCG codebook (cb == 1), three instructions (`codebook.cuh:67-75`):
+// `x *= 0xCBAC1FED; x = (x & 0x8fff8fff) ^ 0x3b603b60;` then the two fp16
+// halves summed in fp16. Returns that fp16 value widened to f32.
+float Exl3DecodeMcg(uint16_t codeword);
+
+// Row-major position (0..255) inside the 16x16 tile that codeword `t` decodes
+// into — upstream's `tensor_core_perm` (`exl3_lib/quantize.py:22-42`), which the
+// quantizer applies to a row-major tile before encoding.
+int Exl3TileRowMajorIndex(int t);
+
+// Decode one packed tile into 256 f32 values in ROW-MAJOR 16x16 order.
+void Exl3DecodeTile(const uint16_t* tile, int bits, float* out256);
+
+// `LinearEXL3.get_inner_weight_tensor` (`exl3.py:222-225`): the pre-Hadamard
+// reconstruct. `out` is f32 [k, n] row-major and holds exact fp16 codebook
+// values. `k` and `n` must be multiples of 16.
+void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits,
+                          float* out);
+
+// `LinearEXL3.get_weight_tensor` (`exl3.py:227-237`): the full dequantized
+// weight, f32 [k, n] row-major (k = in_features, both multiples of 128 because
+// both sides were Hadamard-transformed at quantization time). `suh`/`svh` are
+// the raw fp16 bit patterns as stored — they are NOT assumed to be signs; the
+// real DeepSeek-V4 checkpoint folds a per-channel scale into them.
+//
+// DEVIATION, recorded: upstream runs each 128-term Hadamard as an f32 GEMM;
+// this uses the fast Walsh-Hadamard butterfly, which is the same value in exact
+// arithmetic but a different f32 summation order. The fp16 round upstream
+// performs after each transform (`quantize.py:342-346,351-355` `.to(x_dtype)`)
+// absorbs it for all but a fraction of entries, and MODEL-DSV4-EXL3 W2's device
+// parity gate is stated against THIS function, not against torch.
+void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
+                       const uint16_t* svh, int64_t k, int64_t n, int bits,
+                       float* out);
+
+// ─── EXL3 device kernels — MODEL-DSV4-EXL3 W2a / W2b ─────────────────────────
+//
+// The W1a entries above decode a checkpoint FORMAT once, on the host, at load.
+// The two ops below run per FORWARD, on whatever device the queue names, and
+// are what makes the trellis tower fast rather than merely readable. The
+// contracts, the parity tiers, the output-dtype decision and the shape policy
+// are settled in `.agents/specs/model-dsv4-exl3.md` `## W2 design`; the summary
+// that a reader of this header needs is repeated at each declaration.
+//
+// DTYPE, stated once. `A`, `A_had`, `suh`, `svh` and (by default) `C` are
+// **fp16**, mirroring upstream's own memory format — `LinearEXL3
+// .default_out_dtype = out_dtype or torch.half` (`exl3.py:72`) and
+// `reconstruct_hgemm`'s `torch.empty(..., dtype = out_dtype or
+// self.default_out_dtype)` (`exl3.py:167`). `A` in particular has no freedom:
+// `ldmatrix.sync.aligned.m8n8.x4.shared.b16` +
+// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` (`ptx.cuh:52-74,203-212`)
+// read fp16 fragments. `C` may be f32, which is upstream's own `c_fp32` arm
+// (`exl3_gemm.cu:134` reads it off `C.dtype()`), kept because the MoE weighted
+// reduction earns the width — it is NOT the default, and it is NOT inherited
+// from `Exl3DequantLinear`'s `float* out`, which is a host decoder's carrier.
+//
+// The TRELLIS travels as `DType::kI8`, shape `[k/16, n/16, 32*bits]` BYTES —
+// the same opaque-storage idiom the fp8 KV pages use (`DType::kI8` storage,
+// see kFp8KvStore above). It is a packed bit stream, not an array of numbers,
+// and 32*bits bytes is upstream's `16*K` uint16 words per 16x16 tile.
+
+// `had_r_128` (`quant/hadamard.cu:88-110`):
+//   out = (in.view(-1, 128) @ H128) * (args.scale / sqrt(128))
+// with `args.pre_scale` multiplied in BEFORE the transform and
+// `args.post_scale` AFTER; at most one may be set. `in`/`out` are 2-D, same
+// dtype (f16 or f32), same shape, `cols % 128 == 0`, and `out` MAY alias `in`
+// (upstream: "Works inplace if y == x", `hadamard.cu:86`). The scale vectors are
+// fp16 with `cols` elements. H128 is the natural-order Sylvester matrix
+// (`util/hadamard.py:34-42` recurses to `hadamard_1.txt` = "+").
+//
+// PARITY: the CPU and CUDA arms are BYTE-IDENTICAL, not merely close. Both run
+// the same radix-2 FWHT in the same order — levels 1 and 2 on the four values a
+// lane holds (`hadamard_inner.cuh:118-129`), levels 4..64 as five xor-shuffle
+// steps (`shuffle_had_f4x32`, `:17-44`) — every operation in f32, one multiply
+// by `r_scale` at the end, one round to the destination dtype. It is NOT
+// bit-comparable to `Exl3DequantLinear`'s Hadamard, which rounds to fp16 after
+// every 128-block because it transforms WEIGHTS at quantization time.
+void Exl3HadR128(Queue& q, Tensor& out, const Tensor& in, const Exl3HadArgs& args);
+
+// `exl3_gemm` (`exl3_gemm.cu:110-309`): the fused EXL3 linear.
+//   C = had_r_128( had_r_128(A, pre_scale=suh) @ reconstruct(trellis),
+//                  post_scale=svh )
+// which is algebraically `A @ Exl3DequantLinear(trellis, suh, svh)` — the two
+// differ only in whether the Hadamards ride the activations or the weights
+// (`exl3.py:183-214` vs `:227-237`).
+//
+//   c        f16 or f32 [m, n], contiguous, need NOT be zeroed
+//   a        f16 [m, k], contiguous
+//   trellis  i8  [k/16, n/16, 32*bits] (bytes), contiguous
+//   suh      f16 [k]
+//   svh      f16 [n]
+//   a_had    f16 [m, k] scratch for the input transform; MAY alias `a`
+//   k % 16 == 0, n % 128 == 0, both % 128 for the Hadamards to be defined
+//
+// PARITY: the trellis DECODE is bit-exact against `Exl3DecodeTile`; the GEMM is
+// bounded, because `mma.m16n8k16`'s internal accumulation order is unspecified
+// by PTX and a split-K threadblock reduction sits on top. The bound is RMS
+// relative 1.0e-3 and 8 fp16 ulps of the output RMS elementwise, set by the fp16
+// destination (one store round is already 4.9e-4) and not by summation order
+// (f32 over k=4096 contributes 3.8e-6). It is stated here so no gate discovers
+// it; see the spec for why a wrong codeword misses by four orders more.
+void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
+              const Tensor& suh, const Tensor& svh, Tensor& a_had,
+              const Exl3GemmArgs& args);
+
+// ─── The kernel-shape policy, as PURE HOST functions ─────────────────────────
+//
+// Ported verbatim from `exl3_kernel_map.cu:23-91,153-160` and the shape macros
+// at `exl3_kernel_map.cuh:53-60`. They are host functions with no CUDA in them
+// ON PURPOSE: the selection table is the part of W2b that can be gated on a
+// machine with no GPU, and a table that only a device run can check is a table
+// nobody checks.
+
+// Upstream's five-way compute-capability BUCKET (`exl3_devctx.cu:32-46`). Not a
+// new classification: `major >= 10` is Blackwell, so GB10 (sm_121) is
+// kBlackwell, and every threshold below is upstream's.
+enum class Exl3Cc : int {
+  kOld = 1,
+  kAmpere = 2,
+  kAda = 3,
+  kHopper = 4,
+  kBlackwell = 5,
+};
+Exl3Cc Exl3CcFromSm(int sm_major, int sm_minor);
+
+// One row of the shape table (`exl3_kernel_map.cuh:53-60`). `shape_idx` is
+// 1-based; index 0 is upstream's `nullptr` slot and has no geometry.
+struct Exl3GemmShape {
+  int tile_m = 0;
+  int tile_k = 0;
+  int tile_n = 0;
+  int sh_stages = 0;
+  int frag_stages = 0;
+  int block_dim = 0;
+};
+int Exl3GemmNumShapes();
+Exl3GemmShape Exl3GemmShapeParams(int shape_idx);
+
+// `select_gemm_shape` (`exl3_kernel_map.cu:23-75`). Returns a 1-based shape
+// index, or 0 when the bucket has no rule (upstream's fallthrough). `multi` is
+// upstream's mgemm flag; this wave always passes false (the fused MoE mgemm is
+// W2d), and the parameter is kept so the ported table stays readable against its
+// anchor.
+int Exl3SelectGemmShape(Exl3Cc cc, int size_m, int size_k, int size_n, int bits,
+                        bool multi);
+
+// `exl3_gemm_shape_compat` (`exl3_kernel_map.cu:86-91`). DEVIATION, recorded:
+// upstream's signature also takes `size_m` and `K` and reads NEITHER, so they
+// are dropped here rather than carried as unused parameters that `-Werror`
+// would then have to be told about.
+bool Exl3GemmShapeCompat(int shape_idx, int size_k, int size_n);
+
+// The empty-block clamp (`exl3_kernel_map.cu:153-160`): a launch never gets more
+// blocks than there are k x n tiles to give them, and never fewer than one.
+int Exl3GemmNumSms(int shape_idx, int size_k, int size_n, int device_sms);
 
 }  // namespace vt
