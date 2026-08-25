@@ -187,7 +187,140 @@ kernel body's occupancy behavior before committing to `nwarps=8`.
   fix is scoped (per the issue's own "What is NOT established").
 - `Q8_0GemmK` — same defect class per the oracle anchor (Q8_0 is on the RDNA4
   whitelist), not measured by the issue, not touched here.
+- **Q4_K and Q5_K keep the single-warp arm**, and the next hypothesis for them
+  is row-packing, not a different `nwarps`. Every width in {2, 4, 8} lost at
+  every `nsb <= 32` shape (see `## Outcome`), and the mechanism — a superblock
+  header re-read once per warp, and a quant read broken into eighths — gets
+  worse as the split widens, so there is no unmeasured width left to try. What
+  is genuinely untried is `rows_per_cuda_block`: per the correction in
+  `## Upstream anchor`, upstream's RDNA exclusion of row-packing was never
+  benchmarked on RDNA hardware, so "llama.cpp turns it off" is not evidence it
+  loses here. That needs its own row, spec and measurement.
+- **`DotQ6KIsumRange` duplicates `DotQ6K`'s arithmetic** rather than `DotQ6K`
+  calling it at the full range, because the ranged loop costs the donor's
+  unrolling (642.59 us/call against 371.90 on `n=4096 k=12288`, measured). The
+  duplication is held honest by the byte-equality case rather than by a
+  comment, but one body computing Q6_K would be better than two, and a
+  compile-time range parameter is the obvious way to get there.
+
+## Outcome
+
+`DONE`. What landed is narrower than `## Design` proposed, because the sweep
+`## Design` item 3 required contradicted the design's own premise for two of
+the three formats.
+
+### What landed
+
+A cooperative arm, `KQuantGemmKCoopQ6K<OutT, 8>`, dispatched for **Q6_K only**
+at `m == 1 && nsb <= 32`. Eight warps share one output row; warp `w` takes
+sub-block range `[w, w+1)` of each superblock its lane holds. `DotQ4K`,
+`DotQ5K` and `DotQ6K` are byte-for-byte the pre-row bodies, so every arm this
+row did not claim runs the code it ran before.
+
+### The sweep, and why Q4_K and Q5_K were rejected
+
+One `rocprofv3 --kernel-trace --stats` run per `(format, shape)` so the
+per-kernel average attributes to exactly one shape; 100 timed iterations after
+20 warm-up, RX 9060 XT / gfx1200 / ROCm 7.2.3, f32 output. us/call:
+
+| fmt | n x k | pre-row | nw=1 | nw=2 | nw=4 | nw=8 |
+|---|---|---:|---:|---:|---:|---:|
+| Q4_K | 12288 x 4096 | **154.93** | 158.21 | 296.71 | 244.06 | 268.74 |
+| Q4_K | 8192 x 4096 | **104.50** | 105.60 | 201.16 | 167.71 | 183.82 |
+| Q4_K | 1024 x 4096 | **16.65** | 16.79 | 29.22 | 24.56 | 28.12 |
+| Q4_K | 248320 x 4096 | **2475.78** | 2495.02 | 4464.84 | 3885.22 | 4287.58 |
+| Q5_K | 12288 x 4096 | 180.92 | **180.06** | 314.26 | 284.74 | 296.28 |
+| Q5_K | 248320 x 4096 | **2788.14** | 2825.68 | 4546.94 | 4203.04 | 4302.89 |
+| Q6_K | 12288 x 4096 | 393.20 | 453.24 | 464.91 | 496.86 | **389.04** |
+| Q6_K | 1024 x 4096 | 40.13 | 60.35 | 45.95 | 47.82 | **37.67** |
+| Q6_K | 248320 x 4096 | 6625.34 | 6072.71 | 6298.22 | 6765.27 | **5615.01** |
+| Q6_K | 4096 x 12288 (nsb=48) | **371.90** | 642.59 | 640.73 | 649.08 | 659.92 |
+
+**Q4_K and Q5_K lose 1.5x to 1.8x at every width and every `nsb <= 32` shape,
+and the loss does not shrink as `nwarps` falls.** `## Risks` anticipated a
+measured optimum of 1 and that is the answer for both. The mechanism is
+traffic, not occupancy: splitting a superblock makes every warp re-read its
+16-byte header and turns one contiguous 128-byte quant read into eight
+32-byte ones. For a GEMV that is already bandwidth-bound, the bytes cost more
+than the extra resident warps buy. `## Upstream anchor`'s framing — "the real
+win is occupancy, not per-warp lane utilization" — is therefore right about
+where a win would have to come from and wrong that it arrives.
+
+Q6_K escapes because its per-lane cost is not a read. `KQuantGemmK<bf16, Q6_K>`
+reports **272 bytes of scratch per thread and 152 VGPRs** in the kernel trace:
+the donor rebuilds all 256 weights into `int8_t aux8[kQK_K]` and spills it.
+Ranged to one sub-block the array is 32 bytes, and the cooperative kernel
+reports **0 scratch and 72 VGPRs**. That is what pays for the extra traffic,
+and it is why the same restriction does not help the 4-bit formats, whose dot
+bodies never spilled.
+
+### Rejected: making `DotQ6K` call the ranged core
+
+The obvious de-duplication — `DotQ6K` = `DotQ6KIsumRange(0, 8)` — costs
+**642.59 us/call against 371.90** on `n=4096 k=12288` (1.73x, the `nw=1` column
+above). The donor's two fixed 128-wide chunks unroll; a loop over a runtime
+group range does not. `DotQ6K` therefore keeps the donor body and the ranged
+core is a second implementation, listed under `## Owed`.
+
+### Correctness: byte-identical, not within tolerance
+
+The cross-warp reduction carries the **integer** dp4a accumulator, so the
+partials reassemble exactly and the one f32 expression per superblock is
+unchanged. `-ffp-contract=off` (already in the HIP flags) removes the
+remaining way two spellings could diverge. Two gates hold it:
+
+- Host-side, 20000 random block quadruples x 4 splits: the ranged cores equal
+  the donor bodies in **0 of 80000** combinations mismatched.
+- On hardware, through `vt::MatmulBTQuant`: the same activation row at `m == 1`
+  (cooperative) and `m == 2` (single-warp) returns **identical bytes**, for
+  Q4_K/Q5_K/Q6_K at `nsb` 16 and 48. Byte equality, not the family's NMSE bar
+  — the NMSE bar is checked too, but it is not what this row rests on.
+
+### Speed, end to end
+
+`rocprofv3 --kernel-trace --stats`, `--max-tokens 4` differenced against
+`--max-tokens 36` over 32 tokens, `Ornith-1.5-9B-Q4_K_M.gguf`, prompt "The
+capital of France is", batch 1, `build-hip/examples/vllm-cli`. Three runs per
+arm, spread under 0.9%:
+
+| | pre-row | this row | ratio |
+|---|---:|---:|---:|
+| `KQuantGemmK<bf16, Q6_K>` family | 12.296 ms/tok | 11.154 | **1.102x** |
+| `KQuantGemm*` total | 22.566 | 21.459 | 1.052x |
+| total decode GPU time | 54.340 | 53.311 | 1.019x |
+
+The pre-row run reproduces the issue's headline row closely: 583.9 us/call
+over 21 calls/token against the issue's 593 and 21.
+
+### The 593 us/call outlier, attributed
+
+`## Risks` asked for this and the data resolves it. Bucketing the pre-row
+kernel trace by grid size, the single `KQuantGemmK<bf16, Q6_K>` instantiation
+the issue reported as "593 us/call" is an **average over three shapes**:
+
+| calls/tok | n x k | nsb | us/call |
+|---:|---|---:|---:|
+| 16 | 4096 x 12288 | 48 | 345.9 |
+| 4 | 1024 x 4096 | 16 | 41.3 |
+| 1 | **248320 x 4096** (lm_head) | 16 | **6562.7** |
+
+The issue's guess that lm_head is the expensive one is right, but 593 us/call
+was never lm_head's cost — it understated it **11x**. lm_head alone is 6.56 of
+that row's 12.26 ms/token, 53% of it, and 12% of all decode GPU time in one
+dispatch per token. After this row the two `nsb = 16` buckets move to the
+cooperative arm: lm_head 6562.7 -> **5425.3** us/call (1.21x) and n=1024
+41.3 -> **27.1** (1.52x). The `nsb = 48` bucket keeps its kernel and its launch
+config and measures 345.9 -> 349.6, inside run-to-run spread — the
+no-regression condition `## Gate` names.
+
+### Standing gaps
+
+- `QuantizeQ8KK` is now the largest single decode kernel at 12.87 ms/token,
+  24.2% of decode, 129 calls/token. It is issue #1876's kernel, not this row's.
+- The matmul family is still behind llama.cpp `b10451`. This row moves total
+  decode 1.019x. No ceiling is claimed and no number here extrapolates off
+  gfx1200.
 
 ## Now
 
-`READY` — spec committed, no implementation yet.
+`DONE` — Q6_K cooperative decode arm landed, measured and gated.
