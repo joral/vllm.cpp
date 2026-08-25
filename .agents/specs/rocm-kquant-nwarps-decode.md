@@ -36,6 +36,19 @@ llama.cpp pin `10bf611e533d81f739128304991c5e133c6aebd8` (tag `b10451`,
   `should_use_small_k()`'s lambda (`:863-903`) forces `use = false` whenever
   `GGML_CUDA_CC_IS_RDNA(cc)` (`:898`), independent of the table check. Two
   independent gates both refuse row-packing on our hardware family.
+  **Correction, checked via `gh api` blame + PR history against the same
+  pin**: this is not a measured architectural finding. `calc_rows_per_block`'s
+  `GENERIC || GCN` condition never included any RDNA table from its first
+  diff (PR #20635, 2026-03-16, NVIDIA-only benchmarks). The
+  `GGML_CUDA_CC_IS_RDNA(cc) -> use = false` line first appears in PR #20885
+  (batched small-K, RTX 5090 only) and was carried unchanged into PR #20905's
+  `should_use_small_k`; that PR's seven-comment review thread has one AMD
+  contributor spot-checking CDNA (AMD's datacenter line) as "ok" and never
+  mentions RDNA. No AMD RDNA hardware appears in either PR. **Row-packing on
+  RDNA is untested upstream, not proven worse** — do not cite this exclusion
+  as evidence row-packing would regress on our board. The `nwarps` scaling
+  this row ports instead has a real, independent RDNA4 benchmark backing it
+  (next bullet), which is why it is the port target regardless.
 - **What RDNA4 actually does is scale `nwarps` per output row.**
   `calc_nwarps()` (`:354-458`), the `MMVQ_PARAMETERS_RDNA4` branch (`:385-408`):
   for `ncols_dst == 1` (single-token decode, our regime) it returns **8** for
