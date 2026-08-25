@@ -77,7 +77,8 @@ OUT OF SCOPE:
 
 > **THIS ROW DOES NOT CLOSE #1870.** Discovered mid-implementation, on real
 > `gfx1200` hardware: `CheckDeviceWeightFit`'s ONE call site
-> (`model_loader.cpp:2258`) is gated on `target.needs_weight_staging()`, and
+> (`model_loader.cpp:2273`, moved from `:2258` by this row's own hoisted-policy
+> edit) is gated on `target.needs_weight_staging()`, and
 > `RocmPlatform` hardcodes that `false` (`rocm.cpp:88`, a stale W0-era
 > placeholder — ROCm has landed grouped-GEMM, MoE combine/gate, ROCM_ATTN and
 > hipGraph capture since it was written and was never revisited). Measured
