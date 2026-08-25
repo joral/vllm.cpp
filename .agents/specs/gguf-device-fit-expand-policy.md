@@ -1,9 +1,17 @@
 # GGUF-DEVICE-FIT-EXPAND-POLICY — the device-fit bound stops assuming the loader picks the cheaper residency
 
-Issue: [#1870](https://github.com/mudler/vllm.cpp/issues/1870).
+Issue: [#1870](https://github.com/mudler/vllm.cpp/issues/1870). **This row does
+NOT close #1870** — see the boxed note at the end of Scope. It fixes one
+necessary, verified defect in the refusal's arithmetic; a second, deeper gap
+(#1934) keeps the refusal itself unreachable on ROCm today.
 Owed, filed separately: [#1928](https://github.com/mudler/vllm.cpp/issues/1928)
-(ROCm has no `kMoeGroupedGemmBf16` provider).
-Base: `3574065e7eb6a968fc57928a28cf5fb59b748778` (`origin/main` at the claim).
+(ROCm has no `kMoeGroupedGemmBf16` provider) and
+[#1934](https://github.com/mudler/vllm.cpp/issues/1934) (`RocmPlatform::needs_weight_staging()`
+is stale-false, so `CheckDeviceWeightFit` — this row's fix included — never
+runs on ROCm; the ACTUAL blocker for #1870's reproduced crash).
+Base: `3574065e7eb6a968fc57928a28cf5fb59b748778` (`upstream/main` at the claim;
+this checkout's `origin` is a personal fork that lags `upstream` by ~200
+commits — see `.agents/developer-preferences.md`).
 
 ## Scope
 
@@ -61,6 +69,27 @@ OUT OF SCOPE:
 - Moving any residency DEFAULT. `keep_quant`, `keep_f16`, `nvfp4_fp4` availability
   rules are untouched; this row only makes the bound agree with what they
   already decide.
+- `RocmPlatform::needs_weight_staging()`. Filed as #1934, and recorded under
+  `## Owed` below, NOT attempted here: it is a platform-capability graduation
+  with at least six other downstream consumers (load-path optimization, GDN
+  kernel-dispatch defaults) that each need their own correctness check, not a
+  one-line flag flip.
+
+> **THIS ROW DOES NOT CLOSE #1870.** Discovered mid-implementation, on real
+> `gfx1200` hardware: `CheckDeviceWeightFit`'s ONE call site
+> (`model_loader.cpp:2258`) is gated on `target.needs_weight_staging()`, and
+> `RocmPlatform` hardcodes that `false` (`rocm.cpp:88`, a stale W0-era
+> placeholder — ROCm has landed grouped-GEMM, MoE combine/gate, ROCM_ATTN and
+> hipGraph capture since it was written and was never revisited). Measured
+> directly: `VT_DEVICE_WEIGHT_BUDGET_BYTES=1` against a real checkpoint on
+> `--device auto` produced **no refusal**, because `CheckDeviceWeightFit`
+> returns before computing anything when `needs_weight_staging()` is false.
+> The real device allocation #1870's crash comes from (`d.b.Alloc(nb)` in
+> `qwen3_5.cpp`'s `ResidentWeight`) is NOT gated by that flag, so the crash
+> stays fully reachable on ROCm after this row lands. This row's fix is
+> necessary — once the guard runs, the arithmetic must be right — but #1934 is
+> what makes the guard run at all on this platform, and #1870 stays open
+> until it does. See `## Owed`.
 
 ## Upstream chain
 
@@ -169,28 +198,37 @@ site now refuses where it previously loaded past the point of no return.
 
 ## Gates
 
-- `./build-hip/tests/test_gguf_device_fit` (ROCm build, this box, gfx1200)
-- `./build-hip/tests/test_gguf_device_fit_reach`
-- `ctest --test-dir build-hip -R 'gguf_device_fit'`
-- `python3 scripts/check-env-doc.py`
-- `scripts/agent-preflight.sh --staged`
-- A real hardware repro: the two checkpoint arms #1870 reports (or an
-  equivalent locally available dense + MoE GGUF pair sized to expand past 15.92
-  GiB), `--device rocm`, `VT_GGUF_KEEP_QUANT=0`, before and after, showing the
-  raw `hipMalloc: out of memory` crash replaced by
-  `CheckDeviceWeightFit`'s named refusal.
+- `./build-hip/tests/test_gguf_device_fit` (ROCm build, this box, gfx1200) — GREEN, 20/20 cases, 148/148 assertions
+- `./build-hip/tests/test_gguf_device_fit_reach` — GREEN, 15/15 cases, 73/73 assertions
+- `./build-nix-cpu/tests/test_gguf_device_fit` / `test_gguf_device_fit_reach` (CPU build, same box) — GREEN, both suites
+- `python3 scripts/check-env-doc.py` — OK, 373 production env vars documented/classified
+- `python3 scripts/check-commit-trailers.py` / `check-commit-style.py` against the true fork point (`git merge-base upstream/main HEAD`, NOT `origin/main` — see `.agents/developer-preferences.md`) — OK
+- A real hardware repro attempted on this box and **BLOCKED**, not by this
+  row's fix, by #1934: with `needs_weight_staging()` false on `RocmPlatform`,
+  no local checkpoint — real or budget-starved via
+  `VT_DEVICE_WEIGHT_BUDGET_BYTES=1` — can be made to hit the refusal through
+  `vllm-cli` at all today, regardless of this fix. What DID run on real
+  hardware: both unit suites above, built and executed on `gfx1200`, and
+  `tests/vt/test_rocm_backend` / `test_rocm_arch` / `test_backend_cross_device`
+  confirming the platform itself (device probe, real kernel execution) is
+  healthy on this card. See `## Owed`.
 
 ## Evidence
 
-Recorded in the pull request body: the red output of the new test cases before
-the fix, green after, the fresh review's mutation results, and the before/after
-transcript of the real hardware repro (crash vs. named refusal, exact bytes
-reported vs. budget).
+Recorded in the pull request body: the red output (compile failure against the
+unfixed three/six-argument signatures, captured by stashing the implementation
+and rebuilding) before the fix, green after on both CPU and ROCm builds on this
+box, and the real-hardware attempt that surfaced #1934.
 
 ## Owed
 
 - **#1928** — the ROCm `kMoeGroupedGemmBf16` provider gap #1870's "related gap,
   same area" section names. Not fixed in flow; scoped out above.
+- **#1934** — `RocmPlatform::needs_weight_staging()` is stale-false, so this
+  row's fix (and the refusal it corrects) never runs on ROCm. THE ACTUAL
+  remaining blocker for #1870's reproduced crash. Not fixed in flow: it is a
+  platform-capability graduation with its own downstream correctness burden
+  (GDN kernel-dispatch defaults move), scoped out above.
 - **The MIXED-case approximation** stays exactly as conservative (and exactly
   as capable of under-counting on a role this predicate cannot see) as it was
   before this row. No issue filed for it beyond the standing `#1136` note the
@@ -210,5 +248,43 @@ default and no availability rule.
 
 ## Now
 
-`ACTIVE`. Spec committed; implementation, tests and the real-hardware repro
-follow in this same pull request per the recorded PR-shape preference.
+`DONE` for this row's own scope (the arithmetic fix), `PARTIAL` against
+#1870's user-facing symptom. Implementation, tests, docs and CPU+ROCm
+hardware evidence are in; the real end-to-end crash-to-refusal repro is
+blocked on #1934 (recorded above), which is why #1870 stays open rather than
+closing with this PR. Awaiting fresh review and the operator's gate.
+
+## Outcome
+
+**What was measured.** `CheckDeviceWeightFit`'s per-tensor bound
+(`min(gguf_bytes, elems*model_dtype_bytes)`) silently assumed the loader could
+always pick the cheaper residency. `RouteGgufTensor`'s totality guarantee
+makes that assumption false exactly when `keep_quant`, `keep_f16` and
+`nvfp4_fp4` are all off — the case `VT_GGUF_KEEP_QUANT=0` produces on any
+device without a keep-f16 or native-fp4 arm, ROCm included. Fixed by adding
+`policy_forces_full_expand`, a parameter derived once from the resolved
+`GgufLoadPolicy` and threaded through `GgufStagedWeightFootprint` and
+`CheckDeviceWeightFit`, defaulting to `false` (byte-identical for every
+existing caller).
+
+**What was rejected.** Threading a full `GgufLoadPolicy` into the footprint to
+also close the MIXED-case approximation (some flags on, one tensor's
+dtype/role ineligible) — rejected because that needs per-tensor ROLE
+information this file deliberately does not carry, and closing it is a
+different, larger change (see Design's "why not" paragraph). Attempting the
+`kMoeGroupedGemmBf16` ROCm port and the `needs_weight_staging()` platform-flag
+fix in this same row — both rejected as separate-issue-sized platform work
+(#1928, #1934) discovered/scoped during this row rather than folded in under
+time pressure.
+
+**Why the real-hardware repro stayed a compile+unit-level result instead of
+the planned crash-to-refusal transcript.** Every locally available checkpoint
+either uses a GGUF architecture or tensor encoding this build's reader does
+not support (nonstandard high-numbered `ggml_type` ids from a community
+requant pipeline, or standard IQ variants this tree has not ported), or —
+once a loadable file was found — the discovery above: `needs_weight_staging()`
+false on ROCm means no checkpoint, however sized, can reach the refusal
+through the production loader on this platform today. The fix's correctness
+is established by the CPU+ROCm unit and reachability suites instead, which
+construct the exact byte-level scenario directly rather than depending on a
+compatible real checkpoint.
