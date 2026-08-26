@@ -510,7 +510,15 @@ __global__ void KQuantGemmKCoopQ6K(OutT* __restrict__ out, const uint8_t* __rest
       if (sb < nsb) partial += (DF16ToF32(xb->d) * a_sb->d) * isum;
     }
     // Warps 1.. must not overwrite the shared partials before warp 0 has read
-    // them, so the next iteration waits here rather than racing.
+    // them, so a second iteration would wait here rather than race.
+    //
+    // THAT SECOND ITERATION IS UNREACHABLE TODAY, and the fact is written
+    // here rather than left to be re-derived from the dispatch guard:
+    // KQuantDecodeCoopWarps returns a cooperative width only for nsb <= 32,
+    // so `iters` is always exactly 1 and the loop never comes back round.
+    // Deleting this barrier therefore leaves the suite green, which says the
+    // race is untested rather than that the barrier is redundant. It becomes
+    // load-bearing the moment that nsb bound moves.
     __syncthreads();
   }
   if (wid != 0) return;

@@ -2045,7 +2045,11 @@ TEST_CASE("MoeSiluMul matches the CPU oracle within NMSE <= 5e-4") {
     }
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kMoeSiluMul, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      // Wrapped for the same reason as the K-quant case below. This case is
+      // the standing red that issue #1954 tracks on gfx1200, and a bare
+      // CAPTURE logged its device as `1`, which is the one fact a reader
+      // needs from that log.
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -2394,7 +2398,11 @@ TEST_CASE("ROCm Q6_K decode spreads one row's superblocks over several warps") {
   vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
   for (const Fmt& f : fmts) {
     for (int64_t K : ks) {
-      CAPTURE(f.name);
+      // Wrapped because doctest sends a `const char*` through
+      // `filldata<T*>` to `const volatile void*`, which no `operator<<`
+      // accepts and which therefore decays to `bool`. A bare CAPTURE of this
+      // field logs `1` instead of the format name.
+      CAPTURE(std::string(f.name));
       CAPTURE(K);
       const int64_t nsb = K / 256;
       const size_t row_bytes = static_cast<size_t>(nsb) * f.block_bytes;
