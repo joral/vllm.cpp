@@ -32,22 +32,38 @@ bare AR number is published. Our GGUF arm measures 13.0 tok/s AR
 
 ## Now
 
-`ACTIVE`. **W1a, W1b and W2a+W2b have landed.** W1 gave the CPU reference dequant
-(`vt::Exl3*`, `src/vt/cpu/cpu_exl3_dequant.cpp`) and the rank-sliced loader arm.
-W2 gives the two DEVICE ops (`vt::Exl3HadR128`, `vt::Exl3Gemm`), the portable CPU
-arm of both, the CUDA port of both, the shape-selection policy as pure host code,
-and the wiring that makes the loaded tower REACHABLE: `DeepseekV4Model::Forward`
-now routes an EXL3 load through `MoeBlock`'s trellis arm, one `Exl3Gemm` per
-active routed expert per projection.
+`ACTIVE`. **W1a, W1b, W2a+W2b, W2c+W2d and W1c have landed.** W1 gave the CPU
+reference dequant (`vt::Exl3*`, `src/vt/cpu/cpu_exl3_dequant.cpp`) and the
+rank-sliced loader arm. W2a+W2b gave the two DEVICE ops (`vt::Exl3HadR128`,
+`vt::Exl3Gemm`), the portable CPU arm of both, the CUDA port of both, and the
+shape-selection policy as pure host code.
+
+**The W2 waves' "the loaded tower is REACHABLE" claim was FALSE and #1923 is the
+correction of record.** Those waves wired the expert dispatch and gated it on a
+`DeepseekV4Weights` built BY HAND with `has_host_weights = true`; the loader
+never wrote `host` and never set that flag, so an actual EXL3 load could not
+execute and an end-to-end `vllm-server` probe generated ZERO tokens. W1c
+materializes the `carried-*` tower the forward composes with, sets the flag on
+the same arm, and rebuilds the forward suite on the PRODUCTION loader entry so
+the reachability claim is now the thing the tests measure. See `## W1c design`.
+A synthetic rank-sliced checkpoint now loads and emits logits end to end through
+`DeepseekV4Model::Forward`; the REAL artifact remains blocked, on its
+real-geometry DSA tensors (`## W1c design` W1c-4) and on the tokenizer
+([#1924](https://github.com/mudler/vllm.cpp/issues/1924)). W2d replaces that wiring's per-expert loop with `vt::Exl3MoeMlp`
+— ONE fused call per layer over every routed expert of every token, where the
+loop paid `3 * topk * T` — and keeps the loop as upstream's own tail arm for an
+expert over `TEMP_ROWS_FUSED` tokens and as the `VT_DSV4_EXL3_FUSED_MOE=0`
+rollback. W2c adds the m<=8 GEMV arm and its selection policy, ported verbatim
+and reached from the CUDA GEMM launcher.
 
 **The CUDA arm is UNCOMPILED and UNMEASURED, and nothing in this spec pretends
-otherwise.** The implementer host has no `nvcc` and `dgx.casa` hung 2026-08-25
-03:24Z with the GB10 unified-memory OOM-reboot signature, so every device number
-is `PENDING` with its command recorded in `## W2 design` §5 and in `## Owed`.
-The CPU tier is fully gated and is what makes the capability reachable today.
-Next: the device compile + parity run the moment the box returns, then W2c
-(the m<=8 GEMV, with the measurement §3 names), W2d (the fused MoE mgemm), W1c
-(the `carried-*` tower so a real checkpoint runs end to end) and W3.
+otherwise.** The implementer host has no `nvcc` and `dgx.casa` is flapping, so
+every device number is `PENDING` with its command recorded in `## W2 design` §5,
+`## W2cd design` W2cd-9 and `## Owed`. The CPU tier is fully gated and is what
+makes the capability reachable today. **No speed figure has been claimed by this
+row, at any wave.**
+Next: the device compile + parity run the moment the box returns, the shared
+dense-MLA policy the real artifact's DSA geometry needs (`## Owed`), and W3.
 
 ## The format, as measured (spike, cited at exllamav3 `2398c056`)
 
@@ -396,6 +412,568 @@ produces the numbers. A skip that printed a pass would be the
 `assertions: 0` trap this row already carries once; the suite therefore reports
 its skip through an explicit message and its live cases assert.
 
+## W2cd design (this wave: W2d, the fused MoE mgemm, and W2c, the m<=8 GEMV)
+
+`## Work breakdown` gives W2c and W2d one line each and `## W2 design` §4 records
+both as owed. This section settles what they mean BEFORE their gates run, on the
+same terms §1-§5 above set: every number is stated here, every divergence from
+the oracle names its reason, and every measurement this dispatch cannot take is
+`PENDING` with its command rather than inferred.
+
+The order is deliberate. W2d is the SHAPE OUR DECODE HAS — 6 active of 216
+experts per token, three projections each — and the per-expert loop W2b landed
+pays one kernel launch per (expert, projection) where upstream's fused kernel
+pays one per layer. W2c is an ALTERNATIVE ARM for one of those projections whose
+value is unmeasured and, as §W2c-3 below shows, is not purely a speed question.
+
+### W2d-1. A new op id, and why not the existing one
+
+`vt::Exl3MoeMlp` is registered as `OpId::kExl3MoeMlp`, appended before `kCount`
+so no existing id shifts. It is NOT folded into `kExl3Gemm`, because upstream's
+own `exl3_moe` is a separate entry point with a separate argument list
+(`exl3_moe.cuh:8-46`): nine per-expert POINTER TABLES, a token-sorted batching
+triple, four temp buffers and a per-projection bit width. A single op taking the
+union of both signatures would be one op with two disjoint contracts.
+
+The op's arguments mirror `exl3_moe` (`exl3_moe.cu:99-137`) one for one:
+
+| upstream | ours |
+|---|---|
+| `hidden_state` fp16 `[bsz, hidden_dim]` | `hidden_state`, same |
+| `output_state` **f32**, zero-initialized | `output_state`, same |
+| `expert_count` i64 `[num_experts + 1]` | `Exl3MoeRouting::expert_count` |
+| `token_sorted` i64 `[bsz * top_k]` | `Exl3MoeRouting::token_sorted` |
+| `weight_sorted` fp16 `[bsz * top_k]` | `Exl3MoeRouting::weight_sorted` |
+| `temp_state_{g,u}` fp16 `[C, R, hidden]` | `Exl3MoeTemps::state_{g,u}` |
+| `temp_intermediate_{g,u}` fp16 `[C, R, interm]` | `Exl3MoeTemps::intermediate_{g,u}` |
+| `{gate,up,down}_ptrs_{trellis,suh,svh}` | `Exl3MoeExpertTables`, nine i64 tensors |
+| `K_gate`, `K_up`, `K_down` | `Exl3MoeArgs::bits_{gate,up,down}` |
+| `gate_mcg` … `down_mul1` | `Exl3MoeArgs::codebook` (one value; see W2d-5) |
+| `act_function`, `act_limit`, `num_active` | same names on `Exl3MoeArgs` |
+
+**`output_state` is f32 and that is UPSTREAM's width, not a widening we chose.**
+`TORCH_CHECK_DTYPE(output_state, kFloat)` (`exl3_moe.cu:151`) and the epilogue
+accumulates into it with `atomicAdd` (`hadamard_inner.cuh:469-472`), because the
+scatter-add sums one contribution per (token, active expert) and an fp16
+accumulator over six weighted contributions loses bits the tokens can see. Risk
+5's polarity is preserved: `hidden_state` and every temp buffer stay fp16.
+
+**The merged gate/up seam is not taken, and the reason is the FORMAT.** AGENTS.md
+routes mergeable MLP projections through `layers::MlpGateUpMethodBase` and
+`vt::MergedGemmGroup`, which merge gate and up into one GEMM over a STACKED
+weight. An EXL3 gate and up are two independent trellis tensors with their own
+`suh`/`svh` vectors, and stacking them would mean re-quantizing the artifact;
+upstream's own fused kernel keeps them as two GEMM calls
+(`exl3_moe_kernel.cuh:159-161`). So the seam cannot represent this format, which
+is the condition AGENTS.md gives for not taking it. Worth stating plainly: this
+is NOT a property W2c or W2d introduces. `grep -n 'MlpGateUpMethodBase\|MergedGemmGroup'
+src/vllm/model_executor/models/deepseek_v4*.cpp` is empty, so the whole
+DeepSeek-V4 port has always been off that seam and no wave of this row is the
+place to move it.
+
+### W2d-2. The activation is vLLM's, not the oracle's, and the difference is 4.5e-4
+
+This is the one place where mirroring the kernel oracle would mirror the WRONG
+BEHAVIOR, so it is decided here with a number.
+
+Upstream's fused activation (`hadamard_inner.cuh:284-413`, reached through
+`had_hf_r_128_guad_inner`) with `ACT_SILU` and a non-zero `act_limit` computes
+
+    vg = silu(g_had) ; then vg = min(vg, +limit)     (:116-117, AFTER the silu)
+    vu = clamp(u_had, -limit, +limit)                (:112-115)
+    out = vg * vu
+
+vLLM's DeepSeek-V4 expert activation is `SiluAndMulWithClamp`
+(`model_executor/layers/activation.py:197-201`), which this tree already
+implements as `deepseek_v4::ClampedSwiGLU`:
+
+    gate = min(g, +limit)                            (BEFORE the silu)
+    up   = clamp(u, -limit, +limit)
+    out  = gate * sigmoid(alpha * gate) * (up + beta)
+
+The two differ, and by a bounded amount: for `g >= limit` upstream yields
+`limit` while vLLM yields `silu(limit) = limit * sigmoid(limit)`, a difference of
+`limit * sigmoid(-limit)`. At DeepSeek-V4-Flash's `swiglu_limit = 10.0` that is
+`10 * 4.5398e-5 = 4.5398e-4` absolute; for `g < limit` and for every negative `g`
+the two are identical. Small — and it is a MODEL behavior, not a kernel detail.
+AGENTS.md makes vLLM the authority wherever it implements the behavior and makes
+exllamav3 the oracle only where vLLM implements nothing; vLLM implements this
+activation. So the port adds a FOURTH `act_function` value,
+`Exl3MoeAct::kSiluAndMulClamp = 3`, which clamps BEFORE the silu, and leaves
+upstream's 0/1/2 exactly as they are. The DeepSeek-V4 call site passes 3.
+
+A shape gate cannot see this and a token gate can. It is settled here rather
+than discovered by the token gate this row cannot yet run.
+
+### W2d-3. The batching is HOST arithmetic, and is gated as such
+
+`expert_count`, `token_sorted`, `weight_sorted` and `num_active` are computed on
+the host by upstream too (`modules/block_sparse_mlp.py:1079-1105`), so
+`vt::Exl3MoeSortTokensByExpert` is a pure function in `src/vt/exl3_policy.cpp`
+next to the shape table, gateable with no device — the same reason §3 gives for
+putting `select_gemm_shape` there.
+
+Ported semantics, line for line:
+
+- `flat_expert = topk_ids.reshape(-1)`, `flat_weight = topk_weights.reshape(-1)`,
+  `flat_token` the interleaved arange `[0]*topk, [1]*topk, …` (`:1079-1083`).
+- `expert_count = bincount(flat_expert, minlength = E + 1)` (`:1100`). The
+  `E + 1`-th slot is upstream's sentinel for an assignment outside this shard's
+  expert range; a single-shard load never fills it, and it is kept so the tensor
+  the kernel reads has upstream's own length.
+- `token_sorted`/`weight_sorted` = the assignments grouped by expert (`:1095-1097`).
+- `num_active` = the number of experts with `0 < count <= max_tokens_per_expert`
+  (`:1105`).
+
+**DEVIATION, recorded: a stable counting sort where upstream calls
+`Tensor.argsort`.** torch's default `argsort` is NOT stable, so upstream's
+within-expert order is unspecified; ours is the order the tokens appear in. The
+two agree on `expert_count` and on the MULTISET of each expert's segment, and
+nothing downstream reads the within-segment order except which row of the temp
+buffer a token occupies, which the epilogue scatters back by token index. The
+stable form is chosen so a fixture is reproducible and a mutation of the sort is
+detectable.
+
+### W2d-4. `max_tokens_per_expert`, and why the per-expert loop is NOT only a rollback
+
+`max_tokens_per_expert` is upstream's `TEMP_ROWS_FUSED = 128`
+(`block_sparse_mlp.py:19`), the second dimension of the temp buffers. The fused
+kernel SKIPS an expert whose token count exceeds it (`exl3_moe_kernel.cuh:66`)
+and upstream's caller then runs exactly those experts through its own per-expert
+path (`min_rows = TEMP_ROWS_FUSED` at `:1141`, the loop at `:1151-1156`).
+
+Our call site does the same: after `Exl3MoeMlp` returns, `MoeBlock` loops the
+experts the fused arm declined and runs each through the W2b `Exl3Linear` path.
+So the loop W2b landed is upstream's own tail arm, not merely a switch, and it
+stays REACHED at any batch that puts more than 128 assignments on one expert.
+
+`concurrency` is `num_sms / MOE_SMS_PER_EXPERT` (`exl3_moe.cu:14-18`,
+`MOE_SMS_PER_EXPERT = 8`) capped at `MOE_MAX_GROUPS = 64` (`exl3_devctx.cuh:13`),
+exposed as the pure `vt::Exl3MoeMaxConcurrency(int device_sms)`. The CPU arm
+accepts any concurrency `>= 1` and ignores the grouping, because a group is a
+device scheduling unit and the CPU reference has nothing to schedule.
+
+### W2d-5. One codebook per call, mirroring upstream's own refusal
+
+`exl3_moe.cu:182-185` refuses a call whose gate/up/down do not share a codebook
+and refuses anything that is neither `mcg` nor `mul1`. Our `Exl3MoeArgs` carries
+ONE `codebook` value for that reason: three fields that must be equal are three
+chances to disagree. As with `Exl3Gemm`, only codebook 1 (`mcg`) is implemented
+and every other value refuses BY NAME. The three BIT WIDTHS stay separate,
+because upstream keeps them separate and switches `K` at run time when they
+differ (`exl3_moe_kernel.cuh:139-149`).
+
+### W2d-6. The flag
+
+`VT_DSV4_EXL3_FUSED_MOE`, default **on**, `0` falls back to the per-expert loop
+for EVERY expert. House shape: a pure predicate
+`Dsv4Exl3FusedMoeFlagIsOn(const char* env_value)` beside
+`Dsv4Exl3HostBudgetFlagIsOn` in `deepseek_v4.h`, unit-tested without touching the
+environment, plus a process-cached getter at the one read site. Documented in
+`docs/ENVIRONMENT.md` under "Rollback and bisect switches", because it is a
+user-facing behaviour knob and `scripts/check-env-doc.py` splits on exactly that.
+
+Default ON is not a performance claim. It is the arm the row exists to build, the
+CPU arm is gated against the loop arm at a stated bound below, and the switch is
+there so a suspected defect is bisected without a rebuild.
+
+### W2d-7. The parity contract for the fused arm
+
+Tiers 1 and 2 of §1 are unchanged: the fused kernel calls the SAME
+`exl3_gemm_kernel_inner` and the SAME 128-point butterfly, so the decode stays
+bit-exact and the Hadamard stays byte-exact between our two arms.
+
+**Tier 4 — the fused MoE arm against the per-expert loop arm. BOUNDED at 2.0e-2
+relative RMS, and the bound is the ACTIVATION's, not the GEMM's.** The two arms
+compute the same algebra by different routes:
+
+- the loop arm converts each projection's output to f32, runs the clamped SwiGLU
+  in f32 on the host, converts back to fp16 for the down projection;
+- the fused arm keeps the intermediate in fp16 throughout and performs the
+  activation in fp16 (`had_hf_r_128_guad_inner` is `half2` arithmetic end to
+  end), which is upstream's own choice.
+
+One fp16 round of the intermediate costs up to 4.9e-4 relative; the activation
+applies a sigmoid and a multiply to an already-rounded value, and the down
+projection then sums `mi = 2048` of them. `sqrt(2048) * 4.9e-4 = 2.2e-2` is the
+worst case if every rounding error were independent and aligned, so **2.0e-2** is
+the bound, which is the same number `## Evidence`'s reachability pair already
+uses for the EXL3-vs-dequantized-dense comparison and for the same reason. A
+mis-decoded codeword misses by ~2^-3 relative, two orders above it, so the bound
+still discriminates the defect it exists for.
+
+**Tier 4 also covers OUR OWN two arms of the fused op, and that is not a
+weakening.** `had_hf_r_128_guad_inner` computes the activation in fp16 through
+`h2exp` and `h2rcp` (`hadamard_inner.cuh:323-332`), which are HARDWARE
+APPROXIMATIONS with no host equivalent; the CPU arm widens the same fp16 inputs
+to f32, evaluates `x * sigmoid(x)` there and rounds once. So unlike tier 2 —
+where the CPU and CUDA Hadamards run the same f32 operations in the same order
+and a BYTE claim is available — no byte claim is available here, at any effort,
+and asserting one would be asserting that two different transcendental
+implementations agree bit for bit. The device-vs-CPU gate is therefore the same
+2.0e-2, and the reason is written down rather than discovered when it reds.
+
+The bound is NOT widened if the gate reds.
+
+### W2c-1. The line usually cited is COMMENTED OUT, and this dispatch read it
+
+`## W2 design` §3 says the "Ada/Blackwell are memory-bound here" guard is
+disabled. VERIFIED at the pin by reading the file: `exl3_gemv.cu:53` is
+
+    //if (cc != CC_AMPERE) return -1;  // measured win on Ampere; Ada/Blackwell are memory-bound here
+
+and the second copy inside the launcher is disabled too (`:119`,
+`// if (cc != CC_AMPERE) return false;`). The prose at `:22-26` that describes
+the Ampere-only envelope is a COMMENT describing a guard the code no longer
+applies. No compute-capability test is live in the eligibility path, so Blackwell
+is admitted and the shape envelope alone decides.
+
+### W2c-2. What the envelope resolves to for THIS checkpoint, and what it cannot
+
+Ported verbatim as pure host functions in `src/vt/exl3_policy.cpp`:
+`Exl3GemvMaxM` (`exl3_gemv_kernel.cuh:31`, 8), `Exl3GemvHardEligible`
+(`exl3_gemv.cu:110-114`), `Exl3GemvSelectConfig` (`:46-72`, returning -1 not
+eligible / 0 narrow / 1 wide).
+
+At `K = 3`, `cb = 1` (mcg), `m = 1`, `cc = kBlackwell`, mode 1 (the default), the
+live branches are `:64` (`K == 2`, not taken), `:65` (`K == 3 && cc == CC_ADA`,
+not taken), `:66` (`size_n / 32 <= narrow_coresident`), `:67`
+(`size_k <= 2048 && size_n <= 8192`) and `:68` (`K == 3` -> -1):
+
+| linear | k | n | verdict |
+|---|---|---|---|
+| w2 (down) | 2048 | 4096 | `:67` fires -> **config 0 (narrow)**, independent of occupancy |
+| w1, w3 (gate, up) | 4096 | 2048 | `:67` does not fire; `:68` returns **-1** UNLESS `:66` fires, i.e. unless `2048 / 32 = 64 <= narrow_coresident` |
+
+`narrow_coresident = cudaOccupancyMaxActiveBlocksPerMultiprocessor(narrow_kernel,
+512) * num_sms` (`exl3_gemv.cu:127-142`). It is a DEVICE query, it is the only
+input that decides w1/w3, and this dispatch has no device. It is therefore a
+PARAMETER of the pure function rather than a query made inside it — the same
+shape `ReportDeepseekV4Exl3Residency` uses for the host budget, and what makes
+the table above gateable on a machine with no GPU.
+
+**Which arm is FASTER on GB10 is not decided here and is not decidable from the
+source.** It is `PENDING`, with its command in W2cd-9.
+
+### W2c-3. The GEMV is a different NUMERIC arm, not only a faster one
+
+This is the finding that changes what W2c's gate has to be, and it is recorded
+before any of it is measured.
+
+The regular kernel accumulates in f32: `mma.sync.aligned.m16n8k16.row.col
+.f32.f16.f16.f32` (`ptx.cuh:52-74`). The GEMV kernel accumulates in **fp16** —
+`mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16`
+(`exl3_gemv_kernel.cuh:37-52`, `mma_ab_h`) — and folds the fp16 accumulator into
+an f32 pair only every `FOLD` iterations (`:317-330`; `FOLD = 4` for config 0,
+`2` for config 1).
+
+So an fp16 accumulator absorbs up to `FOLD * 16 = 64` k-elements (config 0)
+before it is folded. fp16's unit roundoff is `2^-11 = 4.88e-4`, so the
+accumulation error over one window is on the order of `sqrt(64) * 4.88e-4 =
+3.9e-3` relative — **four times the tier-3 RMS bound of 1.0e-3 that §1 states for
+the regular kernel**. Tier 3 therefore does not cover this arm, and reusing it
+would either fail a correct kernel or force the widening that §1 forbids.
+
+**Tier 3c — the GEMV arm, bounded at 6.0e-3 relative RMS and 64 fp16 ulps of the
+output RMS elementwise.** `6.0e-3` is `sqrt(2) *` the `3.9e-3` window estimate
+above, rounded up: one factor for the f32 sum over the `size_k / 64` windows,
+which is negligible, and the rest of the headroom for the case where the window
+sum grows monotonically rather than as a random walk. A wrong codeword still
+misses by ~`2^-3`, more than an order above the bound.
+
+This is upstream's own accuracy-for-speed trade and it ships enabled by default
+there. We mirror the DEFAULT (W2c-4) and we state the BOUND, because a bound
+nobody stated is a bound a red gate gets to invent.
+
+### W2c-4. The mode knobs mirror upstream's, defaults included
+
+`VT_EXL3_GEMV` mirrors `EXL3_GEMV` (`exl3_gemv.cu:29-34`): `0` disables the path,
+`1` or unset is the heuristic, `2` takes it wherever the hard constraints allow,
+`3` forces the narrow config, `4` forces the wide one. `VT_EXL3_GEMV_SMEM`
+mirrors `EXL3_GEMV_SMEM` (`:37-42`): `-1` or unset is the per-bits default,
+`0` forces shuffle extraction, `1` forces shared-memory staging.
+
+Both are read once per process and both are kernel-internal tuning knobs rather
+than user-facing behaviour, so they go on `scripts/env-doc-allowlist.txt` rather
+than into `docs/ENVIRONMENT.md` — the split `scripts/check-env-doc.py` itself
+draws. `VT_DSV4_EXL3_FUSED_MOE` goes the other way, into the doc, because it
+changes which arm a shipped model runs.
+
+**Inheriting upstream's default is mirroring, not deciding.** AGENTS.md requires
+every applicable mode and default of the reference to be mirrored; it does not
+permit a speed claim, and none is made. The arm is eligible by upstream's own
+heuristic and whether it is faster here is W2cd-9's measurement.
+
+### W2c-5. What the CUDA arm instantiates, and what it declines
+
+Narrowed exactly as `exl3_gemm` is: `bits == 3`, `codebook == 1`. Upstream's
+`exl3_gemv_select_kernel` (`exl3_gemv.cu:74-90`) covers bits 2/3/4 over three
+codebooks; ours covers the shipped arm over `(c_fp32, mmode, cfg, smem)`, which
+is 16 instantiations. Every other width DECLINES by returning false from the
+try-launch and falling through to the regular kernel, which is upstream's own
+failure mode (`exl3_gemv_select_kernel` returns `nullptr`, `try_launch` returns
+false) rather than a throw — a decline here is not an unimplemented arm, it is
+the heuristic saying no.
+
+The wiring mirrors `exl3_gemm.cu:220-236`: the try-launch runs only when the
+caller forced neither a shape nor an SM count, and a false return falls through
+to the shape table unchanged.
+
+### W2cd-8. What is reachable
+
+`vt::Exl3MoeMlp` is dispatched from `MoeBlock` (`deepseek_v4.cpp`) whenever
+`DeepseekV4Weights::has_exl3_weights` is set and `VT_DSV4_EXL3_FUSED_MOE` is on:
+ONE call per layer covering every routed expert of every token in the block,
+replacing the `3 * topk * T` `Exl3Gemm` calls the W2b arm makes. The entry point
+is unchanged — `DeepseekV4Model::Forward` -> `ForwardComposeImpl` -> `MoeBlock`,
+which `deepseek_v4_registry.cpp` routes `ModelRegistry::Forward` to. Deleting
+that dispatch must turn the wave's reachability case RED, and the fresh review
+mutates for exactly that.
+
+**A VALUE GATE CANNOT SEE THAT DISPATCH, and pretending otherwise would be the
+defect.** Delete it and the per-expert loop picks the work up, so the logits stay
+right — which is precisely what makes that loop a genuine tail path rather than
+dead code behind a flag. The reachability case therefore reads
+`vt::OpProviderStats::selections`, the positive signal `include/vt/op_provider.h`
+exists for, and asserts the exact launch counts for BOTH arms: the fused arm is
+`kExl3MoeMlp` once per MoE layer with `kExl3Gemm` at zero, and the rollback is
+the mirror image. `tests/CMakeLists.txt` runs the same suite twice, once under
+`VT_DSV4_EXL3_FUSED_MOE=0`, because the flag is read once per process and one
+run can only measure one arm.
+
+`Exl3GemvSelectConfig` and its siblings are reached from `Exl3GemmKernelCuda`,
+which calls them before the shape table on every EXL3 GEMM on a CUDA queue. The
+GEMV kernel itself is reached from that call when the heuristic accepts. Neither
+is reachable on a CPU queue and neither should be: the GEMV is a device
+occupancy arm, and upstream dispatches it from the CUDA launcher only.
+
+**Which makes W2c's reachability WIRED but UNVERIFIED, and the two words are not
+the same.** `src/vt/cuda/cuda_exl3.cu` is one line of the
+`target_sources(vllm PRIVATE ...)` block inside `if(VLLM_CPP_CUDA)`, so on a CUDA
+build the GEMV policy and kernel sit on the production `Exl3Gemm` path with
+nothing optional between them; this is not a staged slice landing unreached. What
+has not happened is a COMPILE: no `nvcc` has read that file, here or anywhere,
+for W2a, W2b, W2c or W2d. The envelope itself is host code and IS gated on this
+build, which is the whole reason `## W2 design` §3 put the tables in a `.cpp`.
+
+### W2cd-9. The device measurements this wave CANNOT take, and the command for each
+
+`dgx.casa` is flapping (boot, brief contact, drop). Every number below is
+`PENDING` on that box returning. NONE is inferred, estimated, or filled in from a
+CPU run, and no speed figure is quoted anywhere in this wave.
+
+| owed measurement | command, once `rc devices` shows `dgx:gpu0` |
+|---|---|
+| `narrow_coresident` on GB10, which decides whether w1/w3 are GEMV-eligible at all (W2c-2) | `rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemv_device -V` |
+| the tier-3c bound for the GEMV arm, CUDA vs the f64 reference | same target |
+| WHICH arm is faster for w2 (k=2048, n=4096), GEMV vs the regular kernel | `rc run --device dgx:gpu0 -- env VT_EXL3_GEMV=0 …` A/B against `VT_EXL3_GEMV=1`, three reps, idle box |
+| the tier-4 bound for the fused MoE arm, CUDA vs the loop arm | `rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_moe -V` |
+| the launch count actually falls from `3 * topk * T` to 1 per layer | `VT_OP_PROVIDER_STATS=1` on the run above |
+| the CUDA TUs compile for sm_121a | `cmake -S . -B build-cuda -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a && cmake --build build-cuda --target vllm -j 4` |
+
+Both device suites are REGISTERED and SKIP LOUDLY with a named reason and the
+exact command when no CUDA device is present, and each still asserts the
+precondition it skipped on, so neither can report `assertions: 0`.
+
+## W1c design (this wave: the carried tower a forward can actually consume)
+
+`## Work breakdown` gives W1c one line — "dequant-to-bf16 fallback execution arm
+wired to the existing expert path, fixture-gated e2e reachability" — and W2
+overtook the expert half of that sentence: the routed experts now execute
+through `vt::Exl3Gemm` / `vt::Exl3MoeMlp`, so nothing is owed there. What was
+NEVER done is the other half, and
+[#1923](https://github.com/mudler/vllm.cpp/issues/1923) is the measurement that
+says so: an end-to-end probe of `vllm-server` at `cc4ff8681` LOADED a
+rank-sliced EXL3 checkpoint, printed its residency line, and then killed the
+engine on the first `/v1/completions` with
+
+```
+vt: DeepseekV4 forward: host-float weight tower not materialized ...
+at src/vllm/model_executor/models/deepseek_v4.cpp:2960
+```
+
+Zero tokens. `LoadDeepseekV4Exl3`'s carried-tensor pass was
+`require(...)` -> `RequireTensor`, a PRESENCE CHECK that increments a counter.
+It never wrote `w.host` and never set `w.has_host_weights`, so
+`has_exl3_weights && has_host_weights` was unreachable from any load.
+
+### W1c-1. Why three review rounds and a mutation pass did not see it
+
+`tests/vllm/models/test_deepseek_v4_exl3_forward.cpp` set
+`has_host_weights = true` BY HAND at five sites and built `DeepseekV4Weights`
+directly instead of going through `LoadDeepseekV4ForCausalLMWeights`. Every
+mutation the W2 reviews ran was therefore evaluated on a struct no loader can
+produce. This is `.agents/reachability.md`'s documented shape exactly: a unit
+test that constructs the type by hand proves the class works and never that
+anything reaches it.
+
+So the fix has TWO halves and the second is not optional. The forward suite is
+rebuilt on a fixture that goes through the production loader entry, over a
+synthetic rank-sliced EXL3 checkpoint written to disk with REAL carried tensors
+at their real dtypes. Deleting the loader's materialization, or its flag set,
+must redden that suite. Both mutations are recorded under `## Evidence`.
+
+### W1c-2. What the forward consumes, and therefore what the loader writes
+
+`DeepseekV4ForwardExl3` composes with `weights.host` and `be.gguf == nullptr`,
+so EVERY non-expert weight is read as f32 out of `DeepseekV4HostWeights`. The
+loader therefore dequantizes the carried tensors into that layout. The mapping
+is fixed by what `AttentionBlock` / `MoeBlock` / `ForwardComposeImpl` index, and
+each destination is shape-checked against the config-derived expectation before
+the write, so a layout this arm does not implement REFUSES BY NAME instead of
+reading a neighbouring tensor's bytes.
+
+| carried tensor (dtype, measured on the real artifact) | host slot |
+|---|---|
+| `embed.weight` BF16 `[V,H]` | `host.embed` |
+| `head.weight` BF16 `[V,H]` (absent when tied) | `host.lm_head` |
+| `norm.weight` BF16 `[H]` | `host.final_norm_weight` |
+| `hc_head_{base,fn,scale}` F32 | `host.hc_head_{base,fn,scale}` |
+| `layers.L.{attn,ffn}_norm.weight` BF16 `[H]` | `L.{attn,ffn}_norm_weight` |
+| `layers.L.hc_{attn,ffn}_{base,fn,scale}` F32 | the six `L.hc_*` |
+| `attn.{wq_a,wq_b,wkv,wo_a,wo_b}.{weight,scale}` F8_E4M3 + F8_E8M0 | `L.{wq_a,wq_b,wkv,wo_a,wo_b}` |
+| `attn.{q_norm,kv_norm}.weight` BF16 | `L.{q_norm,kv_norm}_weight` |
+| `attn.attn_sink` F32 `[nh]` | `L.attn_sink` |
+| `attn.compressor.{ape,norm.weight,wgate.weight}` | `L.comp_{ape,norm_weight,wgate}` |
+| `attn.indexer.{wq_b.weight+scale, compressor.wkv.weight, weights_proj.weight}` | `L.idx_{wq,wk,wproj}` |
+| `ffn.gate.weight` BF16 `[ne,H]` | `L.gate_weight` |
+| `ffn.gate.bias` F32 `[ne]` / `ffn.gate.tid2eid` I64 `[V,topk]` | `L.gate_bias` / `L.tid2eid` |
+| `ffn.shared_experts.w{1,2,3}.{weight,scale}` FP8-block | `L.shared_w{1,2,3}` |
+
+`L.exp_w{1,2,3}` are deliberately LEFT EMPTY: the routed experts are the EXL3
+tower and `MoeBlock` takes them from `Le`, not from `hw`. `attn.compressor.wkv`
+is accounted and NOT materialized, because the collapsed-geometry compressor
+reuses `kraw` as its KV and no host slot reads it — recorded here rather than
+discovered by a reader who cannot find the destination.
+
+### W1c-3. The block-wise FP8 decode, and where it lives
+
+The carried MLA and shared-expert linears are the artifact's own
+`exl3_base_quantization_config`: `{fmt: e4m3, scale_fmt: ue8m0,
+weight_block_size: [128, 128], activation_scheme: dynamic}`. Measured on
+`carried-001.safetensors` (2026-08-25, header + a 16-byte range read, no
+download): `layers.2.attn.wq_a.weight` is `F8_E4M3 [1024, 4096]` at 4194304
+bytes — ONE byte per element — beside `layers.2.attn.wq_a.scale` `F8_E8M0
+[8, 32]` at 256 bytes, i.e. exactly `[ceil(rows/128), ceil(cols/128)]`.
+
+`DequantFp8BlockToF32` is added to the fp8/nvfp4 dequant family
+(`model_loader/nvfp4_dequant.{h,cpp}`, which already owns `DequantFp8ToBf16` and
+`DequantFp8ChannelToBf16`) rather than being written inline in the DeepSeek
+loader, so it is unit-gateable on its own and the next block-wise checkpoint
+reuses it. Its semantics are taken from the arm that already executes this
+format in this tree — `MatmulFp8BlockScaledKernel` (`src/vt/cpu/cpu_ops.cpp`),
+the port of `native_w8a8_block_matmul` (`tests/kernels/quant_utils.py:91-154`):
+
+```
+out[o][i] = F8E4M3ToF32(w[o][i]) * E8M0ToF32(scale[o / block_n][i / block_k])
+```
+
+The scale MULTIPLIES (it is not a reciprocal), the scale grid is row-major over
+`[ceil(N/block_n), ceil(K/block_k)]`, and a ragged final block is legal — all
+three are the reference kernel's own conventions, and `col / block_n` indexing
+the scale ROW by output column is `offs_bsn = offs_bn // group_n`
+(`fp8_utils.py:823`). Nothing new is decided here; the decode is the existing
+one, evaluated once at load instead of once per K-block in a GEMM.
+
+### W1c-4. The REAL artifact's DSA geometry still refuses, and why that is right
+
+Measured from the real `carried-001.safetensors`, the compressor and indexer
+tensors are TWICE as wide as the host forward's collapsed shapes:
+`attn.compressor.wgate.weight` is `[1024, 4096] = [2*head_dim, H]`,
+`attn.indexer.compressor.wkv.weight` is `[256, 4096] = [2*index_head_dim, H]`,
+and `attn.indexer.wq_b.weight` is `[8192, 1024] = [inh*ihd, q_lora_rank]` — it
+projects from the q-LoRA, not from the hidden state. This is the `coff = 2`
+compressor width `deepseek_v4.cpp` already documents at the `dsa_dense` comment
+(`ds4.c:5016-5021`), and 41 of the real artifact's 43 layers carry a compressor.
+
+So the loader REFUSES BY NAME on those three shapes and names the residual. It
+does not improvise, and it does not widen the host slot to a shape the forward
+would then mis-index: `Gemm`'s host arm is a `MatVec` with no length check, so a
+`[2*hd, H]` buffer read as `[hd, H]` is a silently wrong number, which is the
+`.agents/verification.md` failure this project exists to avoid.
+
+**The obvious fix is wrong and the reason is worth recording.** The GGUF arm
+dodges the same geometry by setting `dsa_dense = (be.gguf != nullptr)` and
+running dense MLA, which is EXACT for `seq_len <= index_topk`. Extending that
+predicate to `|| be.exl3 != nullptr` would break THIS row's own equivalence
+gate: the gate compares the EXL3 arm against a dense forward over
+`Exl3DequantLinear` of the same trellis, and that reference has
+`be.exl3 == nullptr`, so the two arms would take DIFFERENT attention paths and
+the 2.0e-2 bound would be measuring a geometry change rather than the format
+identity. A shared dense-MLA policy that both arms read is the correct shape and
+it is a policy decision this row does not own; it is filed under `## Owed`.
+
+### W1c-5. The row-naming refusal at `deepseek_v4.cpp` is DELETED as dead
+
+#1923's second finding: the EXL3-specific `has_host_weights` refusal inside
+`DeepseekV4ForwardExl3` was already unreachable on the default path, because the
+runner's default `gather` (`src/vllm/v1/worker/gpu/runner.cpp:1716`) routes to
+`ForwardDevice`, whose generic `kHostPending` check fires first.
+
+It is now unreachable on EVERY path, and that is a stronger statement than
+"hard to hit": the ONE arm that sets `has_exl3_weights` is `LoadDeepseekV4Exl3`,
+and after this wave that arm sets `has_host_weights` in the same function before
+returning. `has_exl3_weights && !has_host_weights` cannot be produced by a load.
+Making it reachable would mean inventing a production path that reaches a
+forward with half a tower, which is the opposite of what the row wants. It is
+deleted, its test case with it, and the `has_exl3_weights` check that precedes
+it stays. `MoeBlock` gains the check that actually pays: the host routed-expert
+arm now refuses BY NAME when `exp_w1` is empty, which is the state a
+reachability mutation that deletes the EXL3 dispatch lands in.
+
+### W1c-7. The materialization reads UNALIGNED, and the fixture proves it
+
+The first form of this wave's readers cast the mmap'd safetensors payload
+straight to a typed pointer — `reinterpret_cast<const uint16_t*>(t.data)` on the
+BF16/F16 arms and `reinterpret_cast<const int64_t*>(t.data)` on the `tid2eid`
+arm — and indexed it. A safetensors tensor begins at whatever byte offset the
+header's `data_offsets` names, after a header whose length is arbitrary, so
+those pointers satisfy no alignment above 1 and forming them is undefined
+behaviour. x86 performs the load and returns the right answer, which is why the
+whole local suite was green; `sanitize-cpu (address,undefined)` reported it on
+the pull request, on the BF16 arm of `Exl3CarriedReader::Float` (`const short
+unsigned int`) and the I64 arm of its `HashTable` (`const long int`), failing
+all three of this wave's tests. The verbatim reports, line numbers included,
+are in the evidence section below; they anchor into the head that carried the
+defect and not into this tree.
+
+The tree already had the remedy and the reason recorded: `vt::LoadUnaligned<T>`
+(`include/vt/unaligned.h`, issue #627), which Qwen3.5's GDN loader, Nemotron-H,
+Voxtral, Olmo2, Phi, Parakeet and the LTX-2 loader all use for exactly this. No
+new helper was written. Every arm of the materialization was swept, not only the
+two UBSan named: the `Float` F32 arm and the `HashTable` I32 arm are bulk
+`std::memcpy`, which has no alignment precondition, and `Fp8Block` hands both
+mmap'd buffers to `DequantFp8BlockToF32`, which reads them one `uint8_t` at a
+time — `alignof(uint8_t) == 1`, so an arbitrary offset satisfies it. All three
+carry a comment saying so, because "this one is safe" is exactly the fact a
+later edit needs and cannot re-derive from the code.
+
+The durable half is the fixture. `WriteSafetensors` now pads its JSON header
+with spaces — the same in-spec padding HuggingFace's own writer uses, in the
+opposite direction — until the payload base is ODD, so every entry at an even
+`data_offset` lands at an address that satisfies no alignment above 1.
+`kMisalignedPayloadBase` states that guarantee, and
+`test_deepseek_v4_exl3_loader.cpp`'s MISALIGNED case asserts it on the three
+tensors the widening readers actually consume (`embed.weight` BF16,
+`hc_head_fn` F32, `layers.0.ffn.gate.tid2eid` I64) before driving the
+production loader over them and recomputing every value. Without that
+precondition the pin would be vacuous: an accidentally aligned fixture exercises
+nothing and the sanitizer lane goes quiet without the bug being gone. Setting
+`kMisalignedPayloadBase = 0` reds the case, which is the mutation that proves
+it.
+
+### W1c-6. Residency
+
+`ReportDeepseekV4Exl3Residency` prices the trellis tower against
+`MemAvailable`. It now prices the host tower too, because the host tower is no
+longer zero: on the real artifact it is ~29 GB of f32 beside ~84 GiB of
+trellis, and a refusal that measured only one of them would let the other take
+the box down. The reporter keeps its existing shape — injected budget, 0 means
+unknown and never refuses, `VT_DSV4_EXL3_HOST_BUDGET=0` for the same-binary
+escape — and the projection stays per-layer-exact for the trellis while the host
+tower is measured, not projected, because the model-level tensors (`embed`,
+`lm_head`) are not per-layer.
+
 ## Risks
 
 1. The artifact itself is `runtime_pending` per its publisher — a correctness
@@ -437,6 +1015,16 @@ its skip through an explicit message and its live cases assert.
 | W2b: trellis decode BYTE parity (tier 1) + `exl3_gemm` vs the f64 reference within the stated bound (tier 3) | implementer |
 | W2: the shape-selection table resolves shape 2 for both expert shapes, HOST-side | implementer |
 | W2: the routed-expert dispatch is REACHED from `ModelRegistry::Forward`; deleting the call site goes RED | implementer/reviewer |
+| W2d: the token-sorted batching is upstream's, host-side (`## W2cd design` W2d-3) | implementer |
+| W2d: the fused MoE arm agrees with the per-expert loop arm within tier 4 (2.0e-2 relative RMS) | implementer |
+| W2d: `VT_DSV4_EXL3_FUSED_MOE=0` runs the loop arm and reaches the SAME answer | implementer |
+| W2d: the FUSED dispatch is REACHED from `ModelRegistry::Forward`; deleting it goes RED | implementer/reviewer |
+| W2c: the GEMV envelope is upstream's, value for value, and resolves w2 to config 0 host-side | implementer |
+| W2c: the GEMV arm meets tier 3c (6.0e-3 relative RMS) on the device | operator |
+| W1c: the forward suite reaches the forward through `LoadDeepseekV4ForCausalLMWeights`, not a hand-built struct; deleting the loader's materialization OR its `has_host_weights = true` goes RED | implementer/reviewer |
+| W1c: the materialized carried VALUES equal the checkpoint's, decoded — BF16 widened, F32 straight through, block-wise FP8 times the UE8M0 scale of ITS block; reading block [0] for every element goes RED | implementer |
+| W1c: a carried tensor whose geometry the host forward cannot index REFUSES BY NAME, naming both shapes (the real artifact's `2 * head_dim` DSA tensors) | implementer |
+| W1c: the residency refusal prices the carried host tower as well as the trellis; dropping the host term goes RED | implementer |
 | W2: e2e greedy token gate vs the W3 oracle | operator |
 | W3: oracle gateability file; denominator run; speed table (values + ratios, idle box, 3 reps) | operator |
 
@@ -917,6 +1505,355 @@ block inside `if(VLLM_CPP_CUDA)` in `CMakeLists.txt`, which is the target that
 job builds. So the first compile verdict will come from CI or from the box,
 whichever answers first. Nothing here claims it builds.
 
+### W2c + W2d (2026-08-25, CPU-only build, `-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`)
+
+**Which tree these numbers were measured on.** The branch is
+`row/MODEL-DSV4-EXL3-W2CD`, cut from `row/MODEL-DSV4-EXL3-W2` at `2edf344fd`.
+`origin/main` moved twice underneath it during the wave: first to `d0d4f1f60`
+(the oracle registration) and then to `41c5bec53` + `d7d1ee914`, the second of
+which is **PR #1899 squash-merged**, i.e. W2a+W2b's own commits arriving on main
+in a different shape. Both merges were taken and the spec's four conflicts were
+resolved by KEEPING this branch's side; the resolved file is byte-identical to
+this branch's pre-merge version, which is the check that main brought nothing to
+it beyond what the branch already carried
+(`git diff b3413601d -- .agents/specs/model-dsv4-exl3.md` was empty at the merge).
+
+**The build type changed, and it is recorded rather than left to be noticed.**
+The first full build died at target 639 of 1211 with
+`/usr/bin/ld: final link failed: No space left on device` — the box was at 100%
+with 693 MB free and this worktree's `RelWithDebInfo` build alone held 20 GB. The
+build was reconfigured `-DCMAKE_BUILD_TYPE=Release`, which differs from
+`RelWithDebInfo` only in `-g`; both define `NDEBUG`, so no assert changes state
+between them. That ENOSPC is the failure this tree already files under "a
+checker starved of disk emits a false policy refusal", and it is named here so a
+reader does not read the first log as a code verdict.
+
+**Red first, both suites.** `tests/vt/test_exl3_gemv.cpp` and
+`tests/vt/test_exl3_moe.cpp` were written and registered before any
+implementation existed.
+
+| suite | red command | rc | the failure |
+|---|---|---|---|
+| `test_exl3_gemv` | `ninja -C build test_exl3_gemv` | 1 | six missing symbols: `vt::Exl3GemvSelectConfig`, `Exl3GemvHardEligible`, `Exl3GemvParseMode`, `Exl3GemvParseSmemMode`, `vt::kExl3GemvMaxM`, and `Exl3GemmArgs::force_gemv` |
+| `test_exl3_moe` | `ninja -C build test_exl3_moe` | 1 | thirteen missing `vt` symbols, `vt::OpId::kExl3MoeMlp` and `vt::Exl3MoeAct` among them |
+
+Green, both re-measured by RUNNING the binaries:
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_exl3_gemv` | 6 / 6 | 43 / 43 |
+| `test_exl3_moe` | 8 / 8 | 41 / 41 |
+| `test_deepseek_v4_exl3_forward` (fused arm) | 4 / 4 | 27 / 27 |
+| `test_deepseek_v4_exl3_forward` (`VT_DSV4_EXL3_FUSED_MOE=0`) | 4 / 4 | 27 / 27 |
+
+Full `ctest`: **619 / 619, 0 failed, 337.44 s**, `CTEST_RC=0`, chained BEHIND
+`BUILD_RC=0` over all 1720 targets so a partial tree cannot be tested at all —
+the shape W2a+W2b's evidence adopted after its own abandoned run. All seven EXL3
+entries pass inside it, `test_deepseek_v4_exl3_forward_loop_arm` among them.
+Five tests report `Skipped` and none is this row's: `test_modelopt_mixed_precision_checkpoint`,
+the two `minimax_music3` real-artifact arms, `test_voxtral_e2e` and
+`test_qwen35_paged_engine`.
+
+**One trap was met and avoided in the harness rather than in the numbers.** The
+`ctest` log was appended to a scratchpad file that already held a COMPLETE run
+from the PREVIOUS wave's worktree — `dsv4-w2/build`, 592 tests, "100% tests
+passed". Reading the tail of that file for a pass would have recorded another
+tree's result as this one's. The run above is the portion after the boundary
+line, and its own header names `dsv4-w2cd/build` and 619 tests. This is the
+`the state was not the one you believed` shape, and the only defence is that the
+verdict names the tree it was measured on.
+
+One case in each of the two new suites is a DEVICE case that skips on this
+build. Neither is an `assertions: 0` skip: each prints a named reason and the
+exact `rc run` command, and each still asserts the precondition it skipped on.
+
+**The numbers the bounds were stated against, measured rather than quoted:**
+
+| comparison | bound (`## W2cd design`) | measured |
+|---|---|---|
+| the fused MoE CPU arm vs the per-expert loop arm, relative RMS | tier 4, 2.0e-2 | **6.73e-4** |
+| the same comparison against an UNRELATED routing | > 1.0e-1 | **1.26928** |
+| the forward's EXL3 arm vs the dequantized-dense arm, FUSED | 2.0e-2 | **1.37068e-3** |
+| the forward's EXL3 arm vs the dequantized-dense arm, LOOP | 2.0e-2 | **1.0147e-3** |
+| the forward's EXL3 arm vs an UNRELATED dense arm | > 1.0e-1 | **1.37465** |
+
+The last three are worth reading together. `## Evidence`'s W2a+W2b table recorded
+**1.0147e-3** for this comparison, and that value is REPRODUCED here by the
+`VT_DSV4_EXL3_FUSED_MOE=0` run — which is the check that the rollback is a
+rollback. The fused arm's **1.37068e-3** is a different number for the reason
+W2d-7 states in advance: it keeps the intermediate in fp16 through the
+activation where the loop widens to f32 and back.
+
+**The launch count is not a claim, it is a counter.** A value gate CANNOT see
+the fused dispatch, because deleting it leaves the per-expert loop to pick the
+work up and the logits stay right — which is exactly what makes that loop a
+genuine tail path rather than dead code. So the reachability case reads
+`vt::OpProviderStats::selections`, the positive signal `include/vt/op_provider.h`
+exists for, over one production `DeepseekV4Model::Forward`:
+
+| arm | `kExl3MoeMlp` selections | `kExl3Gemm` selections |
+|---|---|---|
+| default (fused) | **2**, one per MoE layer | **0** |
+| `VT_DSV4_EXL3_FUSED_MOE=0` | **0** | **36** = 3 tokens x 2 experts x 3 projections x 2 layers |
+
+Both rows are asserted, in the SAME case, which ctest runs twice — once plain
+and once under the flag. That is why `tests/CMakeLists.txt` carries
+`test_deepseek_v4_exl3_forward_loop_arm`.
+
+**IMP-MUTATE.** Each records `ninja`'s rc AND its step count beside the verdict,
+because on this row a mutation that fails to build has re-run the stale binary
+and printed SUCCESS five times; zero steps is nothing rebuilt and therefore not
+evidence. The harness applies the edit, asserts the source sha CHANGED, rebuilds,
+REFUSES to run at rc != 0 or 0 steps, runs, restores, asserts the sha is the
+original byte for byte, and rebuilds clean.
+
+| mutation | ninja | verdict |
+|---|---|---|
+| **M1 reachability**: the `Exl3FusedMoePass` dispatch in `MoeBlock` disarmed by a `false` guard, the call site KEPT so it still compiles | rc 0, 3 steps | RED — `test_deepseek_v4_exl3_forward` 3 / 4 cases, 25 / 27 assertions |
+| **M11 rollback reachability**: the loop arm's skip inverted, so it declines the experts the fused arm declined too, under `VT_DSV4_EXL3_FUSED_MOE=0` | rc 0, 3 steps | RED — 2 / 4 cases, 24 / 27 assertions |
+| M2 activation: the clamp moved AFTER the silu — upstream's order, not vLLM's | rc 0, 3 steps | RED — `test_exl3_moe` 7 / 8 cases, 40 / 41 assertions |
+| M3 batching: the grouping walks the tokens BACKWARDS, so it is no longer stable | rc 0, 3 steps | RED — 7 / 8 cases, 38 / 41 assertions |
+| M4 batching: the `max_tokens_per_expert` cut made exclusive (`<=` -> `<`) | rc 0, 3 steps | RED — 7 / 8 cases, 40 / 41 assertions |
+| M8 refusal: the f32 accumulator check widened to admit f16 | rc 0, 3 steps | RED — 7 / 8 cases, 39 / 41 assertions |
+| M9 wiring: the gate and up OUTPUT scales swapped in the fused stage 3 | rc 0, 3 steps | RED — 6 / 8 cases, 39 / 41 assertions |
+| M10 epilogue: the routing weight dropped from the fused scatter-add, `(void)w;` keeping the symbol referenced | rc 0, 3 steps | RED — 7 / 8 cases, 40 / 41 assertions |
+| M5 GEMV envelope: the `size_k` threshold at `:67` widened 2048 -> 4096 | rc 0, 3 steps | RED — `test_exl3_gemv` 4 / 6 cases, 41 / 43 assertions |
+| **M6 GEMV envelope: the COMMENTED-OUT Ampere-only guard RE-ENABLED** | rc 0, 3 steps | RED — 3 / 6 cases, 27 / 43 assertions |
+| M7 GEMV hard check: `EXL3_GEMV_MAX_M` widened to 16 | rc 0, 3 steps | RED — 5 / 6 cases, 42 / 43 assertions |
+
+M6 is the one to read twice. Sixteen assertions move, which is what a guard that
+deletes a whole arm looks like, and it is the mutation that proves the claim this
+wave rests on: if `exl3_gemv.cu:53` were live rather than commented out, this
+checkpoint would have NO GEMV arm at all on GB10, and the row would have been
+right to skip W2c. It is not live, and these cases fail the moment anyone makes
+it so.
+
+**One mutation was VOIDED, and voiding it is the point.** M10's first attempt
+named an anchor that had been reflowed by the formatter and no longer existed in
+the file. The harness reported `VOID — the anchor is not in
+src/vt/cpu/cpu_exl3_kernels.cpp`, restored nothing because it had changed
+nothing, and REFUSED to run. Under the shape this row has met five times it
+would instead have re-run the stale binary and printed SUCCESS, and M10 would
+have gone into the table above as a green mutation proving nothing. The anchor
+was corrected and M10 ran RED.
+
+Restoration verified by sha256 after every mutation, all MATCH:
+`exl3_policy.cpp` `db29377241bb`, `cpu_exl3_kernels.cpp` `b1c1d1c0e95a`,
+`ops.cpp` `6a61e7812ef7`, `deepseek_v4.cpp` `839c83147118`. The tree was rebuilt
+clean afterwards (`ninja -C build` rc 0, 603 steps over every target) and the
+three suites re-run green from those binaries.
+
+
+**Two host-side checks were made WITHOUT a compiler, and only two.**
+
+The first is the GEMV's register-form window read, which is the likeliest silent
+defect in that port: `dq8_regs_3bits` plus its per-lane constants
+(`exl3_gemv_kernel.cuh:199-209`) resolve two words and a funnel shift per lane,
+where `dq8<3, cb, 4>` — already checked against the 1-at-a-time `dq` in W2b —
+resolves the same eight codewords through `ptr[i0 % 24]` and `ptr[i2 % 24]`. Both
+forms were evaluated over a synthetic 24-word K=3 tile for all 32 lanes:
+**0 mismatches out of 256 codewords**, and the three per-lane constants
+(`src_a`, `src_b`, `s2`) agree lane for lane.
+
+The second is the transcription itself, read against its anchors line by line.
+Both gate FORMULAS and neither gates the FILE: they say upstream's two window
+reads agree, not that `src/vt/cuda/cuda_exl3.cu` is what a compiler will accept.
+
+**THE CUDA HALF OF THIS WAVE HAS BEEN COMPILED BY NOBODY.** `which nvcc` on the
+implementer host returns nothing, no CUDA toolkit is installed, and `dgx.casa` is
+flapping (boot, brief contact, drop). `src/vt/cuda/cuda_exl3.cu` grew the fused
+MoE kernel, its two epilogues, the GEMV kernel and the GEMV try-launch, and every
+one of them is a transcription that has passed NO compiler. That is the same
+state W2a+W2b's device half is in and it is stated the same way. The first
+compile verdict comes from `cuda-fat-build` or from the box, whichever answers
+first. **Nothing here claims it builds, and no speed figure is quoted anywhere in
+this wave.**
+
+### W1c (2026-08-25, CPU-only build, `RelWithDebInfo`, base `a73b26968`)
+
+Host `x86_64` Linux 6.8, no `nvcc`, no GPU. Build tree
+`/home/mudler/.cache/sdd/mudler-vllm.cpp/dsv4-w1c/build`, configured
+`cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo`.
+
+**RED FIRST, and it is the defect #1923 measured.** The rewritten forward suite
+was built against the UNCHANGED production sources — the four files this wave
+touches restored with `git checkout --`, `ninja` rc=0 — and run:
+
+```
+tests/vllm/models/test_deepseek_v4_exl3_forward.cpp:190: FATAL ERROR: REQUIRE( w.has_host_weights ) is NOT correct!
+  values: REQUIRE( false )
+[doctest] test cases:  4 |  2 passed | 2 failed | 0 skipped
+[doctest] assertions: 17 | 15 passed | 2 failed |
+```
+
+With that `REQUIRE` and the four tower assertions below it temporarily relaxed
+so the forward is actually entered, the refusal itself is verbatim:
+
+```
+test case THREW exception: vt: DeepseekV4 forward over an EXL3 load: the routed-expert
+TRELLIS tower is loaded and reachable (MODEL-DSV4-EXL3 W2), but the NON-expert tower it
+composes with is not materialized. On the real artifact those are the `carried-*` FP8
+tensors and MODEL-DSV4-EXL3 W1c owns materializing them; see
+.agents/specs/model-dsv4-exl3.md `## Owed`.
+at src/vllm/model_executor/models/deepseek_v4.cpp:2869
+```
+
+That is the `Forward` path's refusal. The server probe in #1923 hit the
+`ForwardDevice` one at `:2960`, because the runner's default `gather` routes
+there; both were the same missing tower.
+
+**GREEN.**
+
+| suite | cases | assertions | verdict |
+|---|---|---|---|
+| `test_deepseek_v4_exl3_forward` (fused arm, default) | 4 | 37 | SUCCESS |
+| `test_deepseek_v4_exl3_forward` (`VT_DSV4_EXL3_FUSED_MOE=0`) | 4 | 37 | SUCCESS |
+| `test_deepseek_v4_exl3_loader` | 10 | 133 | SUCCESS |
+| `test_nvfp4_dequant` (`DequantFp8BlockToF32` added) | 7 | 88 | SUCCESS |
+
+Measured on the loaded synthetic checkpoint, both arms:
+`exl3 vs dequantized-dense rel_rms = 1.679e-3` (fused) / `1.321e-3` (loop),
+against the stated 2.0e-2 bound; `exl3 vs unrelated-dense rel_rms = 4.32`,
+against the stated 1.0e-1 floor. `fused_calls = 2, per_expert_calls = 0` on the
+default arm and `0 / 36` on the rollback, which is the 2 MoE layers and the
+`3 tokens x 2 experts x 3 projections x 2 layers` the case derives.
+
+**MUTATIONS.** Ninja's exit code AND its step count are recorded beside every
+verdict, because a zero-step "rebuild" is a void verdict and this row has met
+that trap before. Every mutation was restored byte-for-byte from a copy taken
+before it was applied, and the restore was re-verified green.
+
+| # | mutation | ninja | verdict |
+|---|---|---|---|
+| M1 | `w.host = DeepseekV4HostWeights{};` before the flag set — the materialization deleted, the flag kept | rc=0, 6 steps | **RED**: forward 2/4 cases failed; loader 3 failed (and aborted, so 2 cases never ran) |
+| M2 | `w.has_host_weights = true` -> `= false` — the flag set deleted | rc=0, 4 steps | **RED**: forward 2/4 failed on `REQUIRE(w.has_host_weights)`; loader 2/10 failed |
+| M3 | `projected = projected_trellis + host_tower` -> `= projected_trellis` — the carried tower dropped from the residency price | rc=0, 3 steps | **RED**: the one-byte-under-budget case stopped refusing |
+| M4 | `E8M0ToF32(srow[k / block_k])` -> `srow[0]` — the block scale always read from block 0 | rc=0, 5 steps | **SPLIT, and the split is the finding**: `test_nvfp4_dequant` RED (2 cases, 9 assertions), `test_deepseek_v4_exl3_loader` **GREEN 10/10 131/131**. The fixture's scale generator had a THREE-value alphabet and the two 128-blocks of `layers.0.attn.wq_a` had collided. Widened to five, and the case now asserts that precondition rather than assuming it. |
+| M4b | the same mutation, after the fixture repair | rc=0, 4 steps | **RED**: loader 1/10 failed, 133 assertions |
+| M5 | `if (false && weights.has_exl3_weights)` in `DeepseekV4Model::Forward` — the reachability mutation | rc=0, 3 steps | **RED**: 2/4 cases threw `DeepseekV4 MoE: no routed-expert weights for this layer ... the EXL3 dispatch was not taken` at `deepseek_v4.cpp`, which is the guard this wave added for exactly that verdict — without it the mutation reads freed memory instead of failing |
+
+M4 is recorded in full rather than tidied away: it is the
+`.agents/verification.md` "instrument's own precondition" failure, it made a
+real mutation read as a pass, and the fixture comment now carries the
+measurement so a future narrowing of that alphabet fails as a broken instrument.
+
+**Real-artifact measurements taken for this wave** (safetensors header plus one
+16-byte range read of `carried-001.safetensors`, no download):
+`layers.2.attn.wq_a.weight` is `F8_E4M3 [1024, 4096]` at 4,194,304 bytes (one
+byte per element) beside `layers.2.attn.wq_a.scale` `F8_E8M0 [8, 32]` at 256
+bytes, which is `[ceil(1024/128), ceil(4096/128)]`; the first scale byte is 115
+(`2^-12`) and the first weight byte 106 (`+1.25 * 2^6`), so the decoded weight
+is ~0.0195. `config.json` carries `quantization_config.base_quantization_config
+= {activation_scheme: dynamic, fmt: e4m3, quant_method: fp8, scale_fmt: ue8m0,
+weight_block_size: [128, 128]}`. The DSA widths that stop the real artifact:
+`compressor.wgate.weight` BF16 `[1024, 4096]`, `compressor.ape` F32
+`[4, 1024]`, `indexer.compressor.wkv.weight` BF16 `[256, 4096]`,
+`indexer.wq_b.weight` `F8_E4M3 [8192, 1024]`, against `head_dim = 512` and
+`index_head_dim = 128`.
+
+**CLEAN BUILD, CHAINED.** `ninja -t clean` then a from-scratch build of the
+three targets, chained by `&&` to `ctest` so a partial tree could not be tested:
+`CLEAN BUILD rc=0 steps=505`, then `100% tests passed, 0 tests failed out of 4`
+(`test_nvfp4_dequant`, `test_deepseek_v4_exl3_loader`,
+`test_deepseek_v4_exl3_forward`, `test_deepseek_v4_exl3_forward_loop_arm`),
+`CHAIN rc=0`.
+
+**AFTER MERGING `origin/main`.** The branch was cut at `a73b26968` and main
+moved to `fc2c5be23` under it, which is why the first staged preflight's trailer
+gates SKIPPED. Merged, rebuilt and re-run on the merge result: ninja rc=0 over
+507 steps, then `100% tests passed, 0 tests failed out of 4`, ctest rc=0. The
+merge touches no file this row changed and `.agents/issue-index.md` union-merged
+with both rows present and no duplicate. The two gates that had SKIPPED then
+RUN and PASS over `$(git merge-base HEAD origin/main)..HEAD`:
+`check-commit-trailers.py` `OK: commit trailer contract` and
+`check-commit-style.py` `OK: commit writing style`, both rc=0. The first run of
+those found the merge commit itself carrying no trailer block, which is why the
+merge commit's message was written rather than left at git's default.
+
+**`scripts/agent-preflight.sh --staged` rc=1 on the pre-merge tree, and neither
+cause is this change.**
+One gate FAILED and two SKIPPED:
+
+- `test_cpu_x86_llamacpp_floor` failed with its own reason printed:
+  `waiting for quiet: 15s busy=111% builders=0 load=39.73`, then
+  `ours rep=1 DISCARDED`. That is the harness refusing to measure on a contended
+  box, and the box carried four concurrent agent builds at load ~40 for this
+  whole dispatch. It is the known load-sensitivity of that suite, not a
+  regression: the same run is green in the non-staged preflight taken at the
+  start of this dispatch (rc=0).
+- `commit-trailers` and `commit-style` SKIPPED, because
+  `origin/main fc2c5be23` is not an ancestor of HEAD — the branch was cut at
+  `a73b26968` and main moved under it. A skipped gate reports nothing about the
+  tree, so this is recorded as UNKNOWN rather than as a pass; the merge and the
+  re-run are the operator's step before the push.
+
+**NOT RUN HERE, and why.** A full local `ctest` is not physically possible in
+this worktree: 621 registered tests, each statically linked against
+`libvllm.a`, measured at 505,844,032 bytes for
+`build/tests/test_deepseek_v4_exl3_loader` in this configuration — about 295 GB
+against 11 GB free on `/` (`df -h /`: 447G total, 98% used, shared with other
+sessions). The 62 registered tests whose names touch
+`deepseek|exl3|nvfp4|mxfp4|fp8|dsv4` were built and run ONE AT A TIME with the
+binary deleted after each, which is the widest local sweep the disk admits:
+**62/62 rc=0**. Ten of them hit `ld: final link failed: No space left on
+device` on the first pass and were re-run once the box freed space — an ENOSPC
+build failure is not a test result and was not counted as one, which is the
+`.agents/environment.md` trap about checkers failing toward a code verdict.
+The whole suite is owed to CI on the pull request.
+
+### W1c sanitizer repair (2026-08-25, `-DVLLM_CPP_SANITIZE='address,undefined'`)
+
+The `sanitize-cpu (address,undefined)` lane on the pull request failed all three
+of this wave's tests on undefined behaviour in the new materialization. See
+`### W1c-7` for the defect and the remedy. Configured exactly as CI's job does
+(`.github/workflows/ci.yml`, `sanitize-cpu`): `-DVLLM_CPP_BUILD_TESTS=ON
+-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SANITIZE='address,undefined'`, run under
+`UBSAN_OPTIONS=print_stacktrace=1
+ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 VT_POOL_BYPASS=1`. Ninja
+rather than CI's Make, so a mutation's rebuild reports a step count.
+
+**RED FIRST, on the unmodified branch head `c9771207e`.** ctest rc=8, 0/3
+passed, three UBSan reports, verbatim:
+
+```
+src/vllm/model_executor/models/deepseek_v4_weights.cpp:431:86: runtime error:
+  load of misaligned address 0x78a101098d15 for type 'const short unsigned int',
+  which requires 2 byte alignment
+src/vllm/model_executor/models/deepseek_v4_weights.cpp:458:93: runtime error:
+  load of misaligned address 0x7dd795e63bde for type 'const long int',
+  which requires 8 byte alignment
+```
+
+(`:458` reported twice, once from each forward arm.) The addresses end `d15`
+and `bde` — odd, and `0xbde % 8 == 6` — so the payload really did land at an
+offset no element type's alignment divides. The existing fixture reproduced it
+without modification; the deliberate odd-base padding was added to stop that
+from being luck.
+
+**GREEN AFTER.** Same build, same three tests: ctest rc=0, `100% tests passed,
+0 tests failed out of 3`, **zero** `runtime error` lines. Run directly for the
+assertion counts, because a doctest binary that executes nothing also exits 0:
+`test_deepseek_v4_exl3_loader` 11 cases / 148 assertions / `Status: SUCCESS!`
+(10 cases / 136 assertions before this change — the new MISALIGNED case is +1
+case and +12 assertions), `test_deepseek_v4_exl3_forward` 4 cases / 37
+assertions / `Status: SUCCESS!`.
+
+**MUTATIONS.** Each applied to the green tree, rebuilt (step count recorded, so
+a build failure cannot be read as a pass), run, then restored and verified with
+`sha256sum -c` against hashes taken before the first mutation — all three files
+`OK`.
+
+| # | Mutation | Rebuild | Result |
+|---|---|---|---|
+| M1 | BF16 arm back to `reinterpret_cast<const uint16_t*>(t.data)` + `p[i]` | ninja 5 steps, rc=0 | ctest **rc=8**, 3/3 FAILED, `deepseek_v4_weights.cpp:440:90: runtime error: load of misaligned address ... 'const short unsigned int'` |
+| M2 | `tid2eid` arm back to `reinterpret_cast<const int64_t*>(t.data)` + `p[i]` | ninja 5 steps, rc=0 | ctest **rc=8**, 3/3 FAILED, `deepseek_v4_weights.cpp:473:97: runtime error: load of misaligned address ... 'const long int'` |
+| M3 | `kMisalignedPayloadBase = 1` -> `0` (align the fixture payload) | ninja 7 steps, rc=0 | ctest **rc=8**, `test_deepseek_v4_exl3_loader` FAILED at `FATAL ERROR: REQUIRE( misaligned_for(embed, alignof(uint16_t)) ) is NOT correct!` |
+
+M3 is the one that matters most, and it also measures the cost of getting the
+fixture wrong: under it the two FORWARD tests PASS. An aligned fixture would
+have made the whole hazard invisible to every lane including the sanitizer,
+which is precisely how this landed green locally in the first place.
+
 ## Owed
 
 - **`exllamav3` is not a REGISTERED secondary oracle.** AGENTS.md says a
@@ -948,12 +1885,25 @@ whichever answers first. Nothing here claims it builds.
   this row; the CPU arm stays generic over all eight widths, so the reference is
   not narrowed with the kernel. Widening the CUDA arm needs upstream's own
   per-K compilation-unit split (`comp_units/exl3_comp_unit_K_cbX.cu`).
-- **W2c, the m<=8 GEMV** (`exl3_gemv.cu`), with the measurement `## W2 design`
-  §3 names: the "Blackwell keeps the regular kernel" line is COMMENTED OUT at
-  `exl3_gemv.cu:53` and the live envelope admits w2's shape.
-- **W2d, the fused MoE mgemm** (`exl3_moe.cu` + `comp_units/exl3_moe_inst_k3_cb1.cu`).
-  This wave loops the dense GEMM per (active expert, projection), which is one
-  launch each where the fused kernel pays one per layer.
+- **`narrow_coresident` on GB10.** It is the ONLY input that decides whether the
+  w1/w3 shape (k=4096, n=2048) is GEMV-eligible at all (`## W2cd design` W2c-2),
+  it is a device occupancy query, and no CPU run can stand in for it. w2
+  (k=2048, n=4096) is eligible without it.
+- **WHICH arm wins on GB10, for either W2c or W2d.** The GEMV arm's eligibility
+  is upstream's heuristic and its default is upstream's default; that it is
+  FASTER here has not been measured and is not claimed. The fused MoE arm's
+  launch-count reduction is arithmetic (`3 * topk * T` -> 1 per layer); the
+  resulting throughput is not. Commands in `## W2cd design` W2cd-9.
+- **The tier-3c and tier-4 bounds have been measured on the CPU arms only.** The
+  device halves of both are `PENDING` on the same box.
+- **The GEMV kernel instantiates `bits == 3`, `codebook == 1` (mcg) ONLY**, the
+  same narrowing `exl3_gemm` carries. Upstream covers bits 2/3/4 over three
+  codebooks. Every other width DECLINES the arm and falls through to the regular
+  kernel, which is upstream's own failure mode rather than a refusal.
+- **`Exl3MoeMlp` skips an expert with more than `max_tokens_per_expert` tokens**,
+  exactly as upstream does, and the caller's per-expert loop covers it. That tail
+  arm has been gated on a fixture; it has never run at a batch large enough to
+  reach it on the real checkpoint, because the real checkpoint does not yet run.
 - **The EXL3 arm runs on a CPU queue, or on a device that can dereference host
   memory.** `Exl3Linear` (`deepseek_v4.cpp`) refuses any other device BY NAME,
   because W1b's coalesced tower is host-resident and handing a host pointer to a
@@ -962,12 +1912,22 @@ whichever answers first. Nothing here claims it builds.
 - The SparkInfer denominator run — `PENDING` on the developer's host-docker
   authorization (asked 2026-08-24).
 - `.agents/oracles/exllamav3.md` with a measured gateability verdict (W3).
-- **Execution of the EXL3 tower — W1c, then W2.** W1b loads and coalesces it;
-  NOTHING consumes it. A forward over an EXL3 load refuses through the existing
-  `has_host_weights` guard, whose message does not name this row: the guard
-  lives in `deepseek_v4.cpp`, outside the W1a/W1b dispatch's authority. W1c owns
-  both the dequant-to-bf16 fallback arm and making that refusal name
-  `MODEL-DSV4-EXL3`.
+- **A shared dense-MLA policy the EXL3 arm can take, so the REAL artifact's DSA
+  tensors load.** W1c materializes every carried tensor the host forward
+  consumes and REFUSES BY NAME on three the real artifact stores at twice the
+  collapsed width (`compressor.wgate` `[2*hd, H]`, `indexer.compressor.wkv`
+  `[2*ihd, H]`, `indexer.wq_b` `[inh*ihd, q_lora_rank]` — `## W1c design`
+  W1c-4). 41 of 43 real layers carry a compressor, so the real artifact stops
+  there. The GGUF arm already dodges the identical geometry with
+  `dsa_dense = (be.gguf != nullptr)`; widening that predicate to the EXL3 source
+  would break this row's own equivalence gate, because the gate's dense
+  reference has `be.exl3 == nullptr` and the two arms would stop taking the same
+  attention path. The fix is a dense-MLA selector BOTH arms read — a policy
+  decision about the DSA residual, not about this format — and no row owns it.
+  `MODEL-DSV4-EXL3` carries it here until one does, which is what this `## Owed`
+  entry is for; it is deliberately NOT attached to
+  [#1923](https://github.com/mudler/vllm.cpp/issues/1923), because that issue is
+  the loader defect and W1c closes it.
 - **Real-checkpoint residency for the coalesced tower — W2.** W1b copies each
   TP1-coalesced linear into host owner buffers. That is right for the fixture
   and for W2's byte-parity gate, and it is ~100 GB on the real 216-expert
