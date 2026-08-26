@@ -1860,14 +1860,18 @@ environment:
   row's `CAPTURE` repair added four comment lines above it. The move is the
   reason the key is the name and not the line.
 
-  Measured 2026-08-25 at `b06928af4` on `row/ROCM-KQUANT-NWARPS-DECODE`, gate
+  Measured 2026-08-25 on `row/ROCM-KQUANT-NWARPS-DECODE`, gate
   `ctest --test-dir build-hip -R 'rocm|cross_device'`, 5 tests / 4 passed / 1
-  failed. Proven pre-existing rather than assumed: reverting that row's two
-  source files to the parent `5888abf11` and rebuilding reproduces the identical
-  failure, at 24 of 25 cases and 1 of 80195 assertions. **Report this gate as
-  one expected red, never as a clean
-  pass**, and re-measure whenever the base SHA moves across `src/`, `include/`
-  or `tests/`.
+  failed. The assertion count and the pass and fail split have not moved since
+  `b06928af4`, which two independent reviews have now confirmed. The line number
+  and the `ROCM` rendering in the row above are read from `d0474321c` instead,
+  because that is the commit that moved the assertion and repaired the `CAPTURE`
+  spelling; at `b06928af4` the same failure sits at `:2063` and logs
+  `DeviceName(dt) := 1`. Proven pre-existing rather than assumed: reverting that
+  row's two source files to the parent `5888abf11` and rebuilding reproduces the
+  identical failure, at 24 of 25 cases and 1 of 80195 assertions. **Report this
+  gate as one expected red, never as a clean pass**, and re-measure whenever the
+  base SHA moves across `src/`, `include/` or `tests/`.
 
 ## Benchmark models on Ettore's dgx.casa profile
 
