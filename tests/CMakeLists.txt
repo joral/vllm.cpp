@@ -380,6 +380,14 @@ target_include_directories(test_ltx2_image_cond
 # resolves to it on a CUDA build too), and process isolation keeps that out of
 # every other suite.
 vllm_cpp_add_test(test_diffusion_device_seam vllm/multimodal/test_diffusion_device_seam.cpp)
+# LTX25-GUIDED-VIDEO link B (#1426): the x0 model's DEVICE branch, run end to end
+# through `LoadVideoEngine` on a SYNTHETIC unified-memory accelerator. Its own
+# executable for the same reason the seam suite above is one — it registers a
+# fake platform in the XPU and CUDA slots, which is process-global — and so that
+# `test_ltx2_video`'s own 105-case baseline stays exactly where it is. The
+# fixture header it shares with `test_ltx2_video` resolves beside the source.
+vllm_cpp_add_test(test_ltx2_video_device_forward
+                  vllm/multimodal/test_ltx2_video_device_forward.cpp)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
@@ -804,6 +812,15 @@ vllm_cpp_add_test(test_deepseek_v4_mtp vllm/models/test_deepseek_v4_mtp.cpp)
 vllm_cpp_add_test(test_deepseek_v4_exl3_loader vllm/models/test_deepseek_v4_exl3_loader.cpp)
 target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_deepseek_v4_exl3_forward vllm/models/test_deepseek_v4_exl3_forward.cpp)
+# MODEL-DSV4-EXL3 W2d: the SAME suite under the rollback arm. The fused MoE flag
+# is read once per process, so the only way to gate both arms is to run the
+# binary twice; without this entry the arm an operator is told to fall back to is
+# ungated, and the fused arm's launch-count claim rests on one number with
+# nothing to contrast it against.
+add_test(NAME test_deepseek_v4_exl3_forward_loop_arm
+  COMMAND test_deepseek_v4_exl3_forward)
+set_tests_properties(test_deepseek_v4_exl3_forward_loop_arm PROPERTIES
+  ENVIRONMENT "VT_DSV4_EXL3_FUSED_MOE=0" SKIP_RETURN_CODE 77)
 target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # DeepSeek-V4-Flash W7-DEVICE — the four NEW V4 op families' CUDA kernels
 # (src/vt/cuda/cuda_deepseek_v4.cu, dispatched through the OpProvider seam) each
@@ -1545,6 +1562,14 @@ target_include_directories(test_dflash2_runner_reach PRIVATE ${CMAKE_SOURCE_DIR}
 # and the reach binary above latches "1".
 vllm_cpp_add_test(test_dflash2_draft_phase_trace
   vllm/v1/spec_decode/test_dflash2_draft_phase_trace.cpp)
+# SPEC-DFLASH2 (#1919): the draft context store's capacity, through the
+# production async front — a >4K-token prompt must not kill EngineCore, and a
+# request that outgrows the store falls back to the non-speculative path. Its
+# OWN binary for the same reason the two above have theirs: `VT_SPEC_TRACE` is
+# latched once per process, and this one needs level 1 with a `max_model_len`
+# above 4096, which no other binary drives.
+vllm_cpp_add_test(test_dflash2_ctx_capacity
+  vllm/v1/spec_decode/test_dflash2_ctx_capacity.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).
@@ -2073,6 +2098,12 @@ target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # rank-sliced DeepSeek-V4 expert linear (skips when the shard is not mounted).
 vllm_cpp_add_test(test_exl3_dequant vt/test_exl3_dequant.cpp)
 vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
+# MODEL-DSV4-EXL3 W2c: the m<=8 GEMV selection envelope, gated host-side because
+# the sentence this row inherited about it describes a guard exl3_gemv.cu:53 has
+# commented out. W2d: the fused MoE mgemm, its host-side token sort, and the
+# activation choice that mirrors vLLM rather than the kernel oracle.
+vllm_cpp_add_test(test_exl3_gemv vt/test_exl3_gemv.cpp)
+vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
@@ -2432,6 +2463,11 @@ vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_bloc
 # and 16 (the two published checkpoints) plus CUDA==CPU bit-identity.
 vllm_cpp_add_test(test_ops_dflash2_grouped_conv vt/test_ops_dflash2_grouped_conv.cpp)
 vllm_cpp_add_test(test_ops_topk_values_indices vt/test_ops_topk_values_indices.cpp)
+# SPEC-DFLASH2 W3 / D2 revisited (#1867): the RADIX selection core the CUDA arm
+# of that op now runs, gated on a host with no `nvcc`. The op's own suite above
+# reaches only the CPU arm here, so without this file the new float ordering, the
+# new tie rule and the new k-th-largest search would all be behind a GPU lease.
+vllm_cpp_add_test(test_ops_radix_topk vt/test_ops_radix_topk.cpp)
 vllm_cpp_add_test(test_ops_dflash2_selector_edges vt/test_ops_dflash2_selector_edges.cpp)
 # SPEC-DFLASH2 W4 (#1314): the candidate selector's PATH WALK -- one program per
 # request with the slot-to-slot dependency as a loop inside it, gated against
@@ -2546,6 +2582,17 @@ target_compile_definitions(test_tokenizer_parity_mistral PRIVATE
 # gate does.
 vllm_cpp_add_test(test_tokenizer_parity_gpt4o vllm/test_tokenizer_parity_gpt4o.cpp)
 target_compile_definitions(test_tokenizer_parity_gpt4o PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+
+# TOK-DEEPSEEK-V3-PRE (issue #1924) — the DeepSeek-V3 / V4-Flash tokenizer
+# parity gate. A FOUR-stage `Sequence` (three `Split(Isolated)` then
+# `ByteLevel(use_regex=false)`) that neither the generic single-Split walk nor
+# the seven-stage DeepSeek-V2 recognizer could read, so `vllm-server` refused
+# every DeepSeek-V4-Flash safetensors checkpoint before a weight byte. The
+# golden `tokenizer.json` is a byte-for-byte copy of the checkpoint's own, so
+# the gate cannot pass on a fixture that reproduces a misreading of the shape.
+vllm_cpp_add_test(test_tokenizer_parity_deepseek_v3 vllm/test_tokenizer_parity_deepseek_v3.cpp)
+target_compile_definitions(test_tokenizer_parity_deepseek_v3 PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
 vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)

@@ -322,8 +322,38 @@ behavior, and record which of the two a stage was gated against.
 
 - The `gateable` measurement (W2), tracked by
   [#1864](https://github.com/mudler/vllm.cpp/issues/1864), which is the issue
-  `.agents/oracles/ltx-2.md` names in its `evidence` field.
+  `.agents/oracles/ltx-2.md` names in its `evidence` field. **Still owed, and
+  the blocker this spec recorded was wrong.** A `dgx:gpu0` lease was held on
+  2026-08-25 and no render followed, because the wall is not hardware: the bf16
+  Gemma-4 text tower is absent locally, it is a 24.46 GiB gated download this
+  box is already granted access to (401 anonymous, 302 authenticated), and no
+  large-download authority is recorded for this row. The four other slots
+  `ti2vid_one_stage` needs are already on the NAS, the local torchao Gemma
+  cannot substitute (upstream reads no torchao tensor at this pin), and no
+  precomputed-embeddings route bypasses the tower for the pipelines that
+  matter. The sizes, hashes, HTTP statuses and the upstream `file:line`
+  citations are in `.agents/oracles/ltx-2.md` under "A lease was taken on
+  2026-08-25". What W2 needs first is a decision on that download, not a
+  device.
+
+  **Both of those blockers are now cleared and W2 is still owed** (2026-08-25,
+  second attempt). The download was authorised and completed: 26,263,858,182
+  bytes on the NAS, sha256 `ef7243612f...61d1` measured off the bytes on disk
+  and agreeing with the advertised `x-linked-etag`, so the checkpoint set
+  `ti2vid_one_stage` needs is complete for the first time. A lease was held
+  again and the render still did not run, for a third reason that is neither
+  hardware nor the download: the job harness wedged at `setup.sh:5` on
+  `HB=$(heartbeat setup)`, a command substitution that never closes because the
+  heartbeat subshell it backgrounds holds the capture pipe open. It burned
+  2h37m of `dgx:gpu0` and wrote a zero-byte log. The reproduction, the
+  one-redirect fix and the costs that stay UNMEASURED are in
+  `.agents/oracles/ltx-2.md` under "2026-08-25, second attempt".
 
 ## Now
 
-`READY`. W1 is this pull request. W2 is unclaimed and needs a GPU lease.
+`READY`. W1 landed. **W2 is unclaimed. It needs neither a device nor a download
+any more — both were obtained on 2026-08-25 and neither produced a render.** It
+needs a lease plus a job harness that runs, and the harness bug that consumed
+the last attempt is diagnosed and has a one-line fix recorded in
+`.agents/oracles/ltx-2.md`. The earlier blockers, "needs a GPU lease" and then
+"needs a large-download authority", were each measured false by satisfying them.
