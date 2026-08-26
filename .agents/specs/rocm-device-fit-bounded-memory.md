@@ -234,5 +234,51 @@ registrar probes the device itself elsewhere in this same file.
 
 ## Now
 
-`ACTIVE`. Spec committed; implementation, tests and the real-hardware repro
-follow in this same pull request.
+`DONE`. Implementation, tests, CPU and real-hardware (gfx1200) evidence are
+in. This row closes #1934 and unblocks #1870, which stays open only pending
+the operator's merge of this PR (per that issue's own record).
+
+## Outcome
+
+**What was measured.** `RocmPlatform::needs_weight_staging()` gates the ONE
+production call site of `CheckDeviceWeightFit`. It hardcodes `false`, so the
+refusal never ran on ROCm — confirmed directly, before this row, with
+`VT_DEVICE_WEIGHT_BUDGET_BYTES=1` (a budget nothing could satisfy) against a
+real checkpoint producing no refusal and proceeding to the next load stage.
+Fixed by adding `Platform::allocates_bounded_device_memory()`, a narrower
+predicate `RocmPlatform` overrides to `true` while leaving
+`needs_weight_staging()` itself untouched, and a real, once-probed
+`ResidencyPolicy::device_memory_total_bytes` via a new HIP-free
+`vt::rocm::DeviceMemoryTotalBytes` free function.
+
+**Real hardware, both directions, same command, same file, same box.**
+`vllm-cli --model /models/Bonsai-27B-Q1_0.gguf --device auto --max-tokens 4`
+with `VT_DEVICE_WEIGHT_BUDGET_BYTES=1`:
+
+- BEFORE (stashed the fix, rebuilt): no refusal, 2.72s to reach an unrelated
+  dequant error three load-stages later.
+- AFTER: refuses in 0.28s —
+  `device 'rocm' cannot serve this GGUF: staging its weights needs at least
+  3787168768 bytes (3.52 GiB) of device memory across 851 tensors, ... and
+  this device's memory pool is 1 bytes (0.00 GiB)`.
+
+**What was rejected.** Flipping `needs_weight_staging()` itself — considered
+first, and rejected once reading `IndexedGdnStateIoEnabled` showed it already
+takes ROCm's fast arm today via an op-registration check that flipping the
+flag would DELETE (see Design), and that at least one sibling consumer
+(`MergedGdnBaEnabled` and its relatives) has no such fallback and would
+activate unconditionally on unverified kernels. Reusing
+`Backend::DeviceMemoryInfo` directly from the platform registrar — rejected
+for the static-init-order hazard the registrar's own existing comment already
+names, and because it is a live per-request probe with a different, currently
+CUDA-dead consumer (issue #1126) that reusing it would silently wake.
+
+**An unrelated pre-existing build break was found and fixed separately, not
+in this row.** A fresh CPU build of the claim base (`2a42cb369`) failed under
+GCC 15's `-Werror=nonnull` in Tenstorrent debug-dump code
+(`qwen3_5.cpp:4019`), unrelated to ROCm or this row's files. Filed as #2021
+and fixed as its own tiny PR (#2022, `BACKEND-TENSTORRENT-QWEN35`) rather than
+riding this branch, per the same one-issue-one-unit-of-work reasoning this
+spec applies to itself — this row's own verification needed it, so it was
+applied locally and reverted before every commit in this branch, never
+landing here.
