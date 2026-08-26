@@ -210,12 +210,18 @@ kernel body's occupancy behavior before committing to `nwarps=8`.
   run one. Filed as
   [#1954](https://github.com/mudler/vllm.cpp/issues/1954), the gfx1200
   counterpart of the CUDA-only bookkeeping in
-  [#1802](https://github.com/mudler/vllm.cpp/issues/1802) and
-  [#907](https://github.com/mudler/vllm.cpp/issues/907) for the same test name
-  and the same assertion. `.agents/environment.md` now carries a gfx1200
-  known-red row for it, so the next reader of this gate reads one expected red
-  rather than a regression. This row's own gate is therefore reported as one
-  pre-existing failure, never as a clean pass.
+  [#1802](https://github.com/mudler/vllm.cpp/issues/1802), which carries this
+  same test name and this same assertion on sm_110.
+  [#907](https://github.com/mudler/vllm.cpp/issues/907) is the same defect
+  family on sm_121a and **NOT the same test**: it records `test_cuda_ops`'s
+  "CUDA silu_and_mul matches CPU" failing at 439 of 440 assertions, a different
+  test and a different assertion. An earlier draft of this section, of the
+  `.agents/environment.md` row and of the #1954 index row claimed #907 carried
+  the same test and assertion, which is false; the corrected body of #1954 is
+  the source of truth for that distinction. `.agents/environment.md` now
+  carries a gfx1200 known-red row for it, so the next reader of this gate reads
+  one expected red rather than a regression. This row's own gate is therefore
+  reported as one pre-existing failure, never as a clean pass.
 - **`KQuantGemmKCoopQ6K`'s multi-iteration barrier is unreachable and
   untested.** `iters = (nsb + 31) / 32` and `KQuantDecodeCoopWarps` returns a
   cooperative width only for `nsb <= 32`, so `iters` is always exactly 1 and the
