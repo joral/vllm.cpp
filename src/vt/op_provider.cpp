@@ -519,6 +519,8 @@ const char* OpNameImpl(OpId op) {
       return "RmsNormGatedGroup";
     case OpId::kLtx2:
       return "Ltx2";
+    case OpId::kLtx2Vae:
+      return "Ltx2Vae";
     case OpId::kConv2d:
       return "Conv2d";
     case OpId::kDepthwiseConv1d:
@@ -539,6 +541,8 @@ const char* OpNameImpl(OpId op) {
       return "Exl3HadR128";
     case OpId::kExl3Gemm:
       return "Exl3Gemm";
+    case OpId::kExl3MoeMlp:
+      return "Exl3MoeMlp";
     case OpId::kCount:
       break;
   }
