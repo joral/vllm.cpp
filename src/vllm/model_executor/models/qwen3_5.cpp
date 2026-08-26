@@ -92,15 +92,14 @@ void ResetQwen3_5MixedSpecInvocations() {
 // BEFORE the dtype change would have removed a term that the dtype rule did not
 // yet subsume, which is why the two edits are one change and in this order.
 //
-// Do not read that as "and now the removal is observable in production", because
-// it is not, in either order (fresh-review finding). `has_packed_ba` needs
-// `in_proj_ba`, written at exactly one site in the tree — the dense loader,
-// qwen3_5_dense_weights.cpp:432 — so on a MoE checkpoint the eligibility is
-// false before the shape term is ever read. Removing it therefore reaches packed
-// decode on NO checkpoint; it removes a contradiction with both references and a
-// second answer to a question the dtype rule already answers. Reaching packed
-// decode on a MoE arm needs the merged `in_proj_ba` owner in the MoE loader,
-// which is #1169, and it is owed.
+// When that removal landed it was not observable in production on its own
+// (fresh-review finding): `has_packed_ba` needs `in_proj_ba`, and the owner was
+// then written at exactly one site in the tree, the dense loader, so on a MoE
+// checkpoint the eligibility was false before the shape term was ever read.
+// GDN-MOE-PACKED-BA (#1169) closed that: the MoE safetensors loader now builds
+// the same merged owner (`LoadGdn`, qwen3_5_weights.cpp), so `has_packed_ba` is
+// true on the 35B and this predicate is what selects the packed leg there. The
+// GGUF MoE loader still keeps the shards split (#1793, owed).
 bool detail::ShouldUsePackedGdnDecode(
     const GdnPackedDecodeEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_ba &&
@@ -2053,6 +2052,22 @@ bool Fa2DecodeOn() {
 #endif
 }
 
+// SPEC-DFLASH2 W10 repair (#1865): the model-side half of the spec-as-decode
+// toggle. MUST match cuda_paged_attn.cu Fa2SpecDecodeEnabled() — the CUDA
+// admission requires a bf16 query, so the model side must select bf16 for a
+// classified verify under exactly the switch the admission reads, or the lane
+// dies at the dtype conjunct with every counter green (the #1865 failure:
+// VT_FA2_SPEC_DECODE flips were a no-op because the verify's dtype rode
+// VT_FA2_PREFILL instead). Read fresh so in-process tests can flip it.
+bool Fa2SpecDecodeOn() {
+#ifdef VLLM_CPP_FLASH_ATTN
+  const char* e = std::getenv("VT_FA2_SPEC_DECODE");
+  return e == nullptr || e[0] != '0';
+#else
+  return false;
+#endif
+}
+
 // 35B ratio-8 (Hq/Hkv=16/2) hd-256 FA2 split-KV decode arm
 // (CLAIM-35B-FA2-DECODE-1). The old ratio-8 decode ran the fused GQA kernel with
 // grid=(num_reqs,num_kv_heads) = 2 blocks/step at c1 (near-zero GB10 occupancy);
@@ -3550,10 +3565,12 @@ DType ResidualDType() {
 }
 
 // vLLM's Qwen3.5/3.6 GDN owns one physical `in_proj_ba` and invokes it once,
-// then exposes logical [b,a] views. W1 enables that topology only for the real
-// 27B loader, which is the only path that populates `in_proj_ba`. The resident
-// owner is shared by both arms: fallback slices its output rows and issues the
-// two legacy F32 GEMMs, never retaining duplicate split weights.
+// then exposes logical [b,a] views. W1 enabled that topology for the real 27B
+// loader; GDN-MOE-PACKED-BA (#1169) made the MoE safetensors loader populate the
+// same owner, so both dense and MoE safetensors checkpoints reach it (the GGUF
+// MoE loader still keeps the split pair, #1793). The resident owner is shared by
+// both arms: fallback slices its output rows and issues the two legacy F32
+// GEMMs, never retaining duplicate split weights.
 // The decomposed fallback emits F32 by default, preserving the already-gated
 // token-correct stream. vLLM emits BF16 from torch.nn.functional.linear; W1D2
 // couples that exact dtype to the packed pure-decode branch. Packed activations
@@ -5356,20 +5373,29 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // fallback.
   const bool fa2_platform =
       vllm::platforms::GetPlatform(d.q.device.type).supports_fa2_attention();
-  const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin &&
-                           fa2_platform &&
-                           kv.dtype == DType::kBF16 && Dh == 256 && T > meta.num_reqs;
-  const bool fa2_decode_r4 = Hq == 16 && Hkv == 4 && Fa2Decode4BOn();
-  const bool fa2_decode_r6 = Hq == 24 && Hkv == 4 && Fa2DecodeOn();
-  const bool fa2_decode_r8 = Hq == 16 && Hkv == 2 && Fa2Decode35BOn();
-  const bool fa2_decode =
-      (fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8) &&
-      FuseAttnPreambleOn(fp4) &&
-                          sdi.has_attn_cos_sin &&
-                          fa2_platform &&
-                          kv.dtype == DType::kBF16 && kv.block_size % 16 == 0 &&
-                          Dh == 256 && T == meta.num_reqs && meta.causal;
-  const bool fa2_attention = fa2_prefill || fa2_decode;
+  // W10 repair (#1865): the FA-2 dtype/lane class is a host-testable seam
+  // (ClassifyDenseFa2, qwen3_5_internal.h) instead of an inline predicate the
+  // CPU tier could never red. Same inputs, same conjuncts; the spec-as-decode
+  // arm selects bf16 through the SPEC lane's own toggles so the verify cannot
+  // be starved to f32 by the PREFILL lever (the #1865 dead link).
+  const DenseFa2Eligibility fa2_elig{
+      /*num_q_heads=*/Hq,
+      /*num_kv_heads=*/Hkv,
+      /*head_dim=*/Dh,
+      /*num_tokens=*/T,
+      /*num_reqs=*/meta.num_reqs,
+      /*uniform_spec_query_len=*/meta.uniform_spec_query_len,
+      /*causal=*/meta.causal,
+      /*kv_cache_bf16=*/kv.dtype == DType::kBF16,
+      /*kv_block_multiple_16=*/kv.block_size % 16 == 0,
+      /*preamble_with_cos_sin=*/FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin,
+      /*fa2_platform=*/fa2_platform,
+      /*prefill_on=*/Fa2PrefillOn(),
+      /*decode_r4_on=*/Fa2Decode4BOn(),
+      /*decode_r6_on=*/Fa2DecodeOn(),
+      /*decode_r8_on=*/Fa2Decode35BOn(),
+      /*spec_decode_on=*/Fa2SpecDecodeOn()};
+  const bool fa2_attention = ClassifyDenseFa2(fa2_elig) != DenseFa2Class::kNone;
   const DType attn_dt = fa2_attention ? DType::kBF16 : DType::kF32;
   DBuf dq3(d, attn_dt, {T, Hq, Dh});
   DBuf dk3(d, attn_dt, {T, Hkv, Dh});
@@ -5488,6 +5514,10 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   vt::PagedAttentionArgs pa_args{scale, meta.causal};
   pa_args.query_start_loc_host = meta.query_start_loc.data();
   pa_args.max_seq_len = meta.max_seq_len;
+  // SPEC-DFLASH2 W10 (#1857): the runner's spec-as-decode classification — a
+  // uniform-qlen verify stays on the FA-2 split-KV DECODE lane instead of the
+  // num_splits=1 prefill ladder. 0 on every non-verify step (routing unchanged).
+  pa_args.uniform_spec_query_len = meta.uniform_spec_query_len;
   dense_attn::ApplyKvCacheQuant(pa_args, kv);
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
@@ -10005,6 +10035,9 @@ void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
   am_out.num_reqs = static_cast<int>(S);
   am_out.num_actual_tokens = static_cast<int>(S);
   am_out.max_query_len = 1;  // pure decode
+  // W10 (#1857): a pure-decode rewrite is never spec-classified. Belt on the
+  // vt shape guard's braces (S == q*S only at q == 1).
+  am_out.uniform_spec_query_len = 0;
   am_out.slot_mapping.assign(static_cast<size_t>(S), -1);
   std::copy(am.slot_mapping.begin(), am.slot_mapping.end(),
             am_out.slot_mapping.begin());
@@ -10377,6 +10410,9 @@ struct Qwen3_5DecodeGraph::Impl {
       attn_meta.max_seq_len = am.max_seq_len;
       attn_meta.block_table_num_cols = am.block_table_num_cols;
       attn_meta.causal = am.causal;
+      // W10 (#1857): the spec-as-decode classification must survive the slot
+      // copy, or the captured verify silently re-routes onto the prefill lane.
+      attn_meta.uniform_spec_query_len = am.uniform_spec_query_len;
       CopyInPlace(gdn_meta.non_spec_state_indices_tensor,
                   gm.non_spec_state_indices_tensor);
       CopyInPlace(gdn_meta.non_spec_query_start_loc, gm.non_spec_query_start_loc);
@@ -10927,6 +10963,9 @@ struct Qwen3_5DenseDecodeGraph::Impl {
       attn_meta.max_seq_len = am.max_seq_len;
       attn_meta.block_table_num_cols = am.block_table_num_cols;
       attn_meta.causal = am.causal;
+      // W10 (#1857): the spec-as-decode classification must survive the slot
+      // copy, or the captured verify silently re-routes onto the prefill lane.
+      attn_meta.uniform_spec_query_len = am.uniform_spec_query_len;
       CopyInPlace(gdn_meta.non_spec_state_indices_tensor,
                   gm.non_spec_state_indices_tensor);
       CopyInPlace(gdn_meta.non_spec_query_start_loc, gm.non_spec_query_start_loc);

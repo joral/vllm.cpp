@@ -183,19 +183,6 @@ vllm::GgufLoadPolicy PolicyWith(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   return p;
 }
 
-// GGUF-DEVICE-FIT-EXPAND-POLICY (#1870). The EXACT boolean `model_loader.cpp`
-// derives from a resolved policy before calling `CheckDeviceWeightFit`, mirrored
-// here rather than re-typed as a case-by-case literal so a test that exercises
-// it is exercising the call site's own expression and not a paraphrase of it.
-// `RouteGgufTensor`'s own totality comment is the citation: with `nvfp4_fp4`,
-// `keep_quant` and `keep_f16` all false, "anything else is kExpandBf16" leaves
-// no other outcome for any tensor, whatever its role. `cpu_ref` gets no term —
-// see the spec's Risks section for why `needs_weight_staging` already excludes
-// every case that would need one.
-bool ForcesFullExpand(const vllm::GgufLoadPolicy& p) {
-  return !(p.keep_quant || p.keep_f16 || p.nvfp4_fp4);
-}
-
 // The lane, as the loader assembles it.
 vllm::StreamedExpertLane Lane(size_t arena_bytes) {
   vllm::StreamedExpertLane lane;
@@ -295,19 +282,24 @@ TEST_CASE("gguf_device_fit: a full-expand load refuses a budget the min-based bo
   CHECK(full_expand.message.find("80") != std::string::npos);
 }
 
-TEST_CASE("gguf_device_fit: ForcesFullExpand mirrors the loader's exact policy expression") {
+TEST_CASE(
+    "gguf_device_fit: GgufPolicyForcesFullExpand is the loader's own predicate") {
+  // This calls the SAME function `model_loader.cpp` calls, not a re-typed copy
+  // of its expression, so dropping a term at the call site reddens this case
+  // instead of leaving it green against a paraphrase.
+  //
   // Only the all-off combination forces full expand; any one flag on (or off
   // combined with cpu_ref, which needs no term of its own — see the spec)
   // leaves the min-based bound in force. cpu_ref is walked through both states
   // at the all-off point on purpose: it must not change the verdict, because
   // the loader's own early return on `!needs_weight_staging` is what excludes
   // cpu_ref from ever reaching a device this predicate runs for.
-  CHECK(ForcesFullExpand(PolicyWith(false, false, false, false)));
-  CHECK(ForcesFullExpand(PolicyWith(false, false, false, true)));
-  CHECK_FALSE(ForcesFullExpand(PolicyWith(true, false, false, false)));
-  CHECK_FALSE(ForcesFullExpand(PolicyWith(false, true, false, false)));
-  CHECK_FALSE(ForcesFullExpand(PolicyWith(false, false, true, false)));
-  CHECK_FALSE(ForcesFullExpand(PolicyWith(true, true, true, false)));
+  CHECK(vllm::GgufPolicyForcesFullExpand(PolicyWith(false, false, false, false)));
+  CHECK(vllm::GgufPolicyForcesFullExpand(PolicyWith(false, false, false, true)));
+  CHECK_FALSE(vllm::GgufPolicyForcesFullExpand(PolicyWith(true, false, false, false)));
+  CHECK_FALSE(vllm::GgufPolicyForcesFullExpand(PolicyWith(false, true, false, false)));
+  CHECK_FALSE(vllm::GgufPolicyForcesFullExpand(PolicyWith(false, false, true, false)));
+  CHECK_FALSE(vllm::GgufPolicyForcesFullExpand(PolicyWith(true, true, true, false)));
 }
 
 // The bound's ONE over-count direction, made executable rather than only

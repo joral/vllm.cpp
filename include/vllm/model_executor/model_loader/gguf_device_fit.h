@@ -212,6 +212,27 @@ bool GgufExpertTowersReachSlotLane(const GgufFile& gguf,
                                    std::string_view tensor_name_suffix,
                                    const GgufLoadPolicy& policy);
 
+// GGUF-DEVICE-FIT-EXPAND-POLICY (issue #1870). The condition under which the
+// per-tensor bound below can be made EXACT rather than a lower bound: with
+// `keep_quant`, `keep_f16` and `nvfp4_fp4` all off, `RouteGgufTensor`'s own
+// totality guarantee ("anything else is kExpandBf16", gguf_keep_quant.h) leaves
+// no other residency for ANY tensor, whatever its role, dtype or shape.
+//
+// This lives here, in production, rather than inline at the one call site,
+// because a test that re-typed the same expression would gate a paraphrase of
+// the loader instead of the loader: dropping a term at the call site would
+// leave such a test green. Both `model_loader.cpp` and
+// `test_gguf_device_fit.cpp` call THIS function, so a change to the condition
+// is a change to what the test measures.
+//
+// `cpu_ref` carries no term. It forces every residency off, so a policy with it
+// set already satisfies the expression; and `CheckDeviceWeightFit` returns
+// before this matters on a platform that does not stage weights, which is every
+// load `cpu_ref` applies to.
+inline bool GgufPolicyForcesFullExpand(const GgufLoadPolicy& policy) {
+  return !(policy.keep_quant || policy.keep_f16 || policy.nvfp4_fp4);
+}
+
 // `model_dtype_bytes` is the resolved model dtype's size (2 for bf16, which is
 // what every GGUF path here loads at). vLLM resolves ONE model dtype and every
 // layer inherits it, so one value is the faithful shape.
