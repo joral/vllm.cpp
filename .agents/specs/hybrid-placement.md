@@ -502,6 +502,53 @@ when all three have landed, not when this one does.
   discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
   bandwidth table currently assumes. Same blocker, same issue.
+- **Placement reaches FIVE architectures, and the earlier entry here undercounted
+  by reading one file per model.** Wired through `RunMoePlaced`:
+  `Qwen3MoeForCausalLM`, Qwen3.5/3.6 (`RunLayer` and `RunLayerPaged`),
+  Nemotron-H, DeepSeek-V2, and **Kimi-Linear** — whose `MoeBlockDevice` and
+  `MoeBlockDeviceBf16` (`kimi_linear_device.cpp:804,1094`) are seam-shaped and
+  were missed because a previous sweep read `kimi_linear_forward.cpp`, saw a host
+  `std::vector<float>` path, and generalised it to the architecture. That is the
+  same mistake this row made about Laguna, made twice.
+
+  Still out, and the reasons are NOT interchangeable: **Laguna** computes its
+  experts on the device but presents a per-token host-float FFN boundary, so it
+  has no `[T,H]` block to hand the seam ([#2050](https://github.com/mudler/vllm.cpp/issues/2050));
+  **Gemma4**'s `ExpertGeGLUHost` / `ExpertGeGLUDeviceAccum` accumulate into a
+  caller's buffer and return `void`, which is a different contract rather than a
+  different spelling; **DeepSeek-V4** runs its experts on the host from host
+  weights, where a placement has nothing to move; and GLM-5-Next, dots3-note,
+  Kimi-K3 and qwen4_exp have no reachable MoE forward at all yet.
+- **W3b's forward BRANCH is not test-driven, though the helper it calls is.**
+  `RunMoeBlockPlaced` executes under `test_placed_moe_roundtrip`, byte-identical
+  to the direct call and mutation-proven. The `RunMoeLayer` branch that SELECTS
+  it cannot be entered by any test here, because selecting it needs the engine
+  device and the placement device to differ. That is the Vulkan gate this row
+  owes: a Vulkan engine with the routed experts on the CPU, token-exact against
+  the same model run wholly on the CPU.
+- ~~**W3a's `MoePlacementPlan` lands UNREACHED**~~ — CLOSED by W3b, which reads
+  the plan in `RunMoeLayer`.
+- **W3a's `MoePlacementPlan` lands UNREACHED**, declared here as
+  `## Nothing lands dead` requires. It resolves a placement to a per-layer
+  decision and nothing calls it: W3b routes on it, and
+  [#2026](https://github.com/mudler/vllm.cpp/issues/2026) tracks that.
+- **W3b IS gateable here, and the entry that said otherwise was wrong.** It
+  claimed the placed path could not be run once on this hardware, reasoning that
+  every fleet device is integrated and a CPU-only build has no second device
+  type. The second half is true and the conclusion does not follow: the placed
+  branch needs the engine device and the placement device to DIFFER, not a
+  discrete accelerator. **Vulkan is a distinct `vt::DeviceType` and lavapipe is
+  installed on this box** (`/usr/share/vulkan/icd.d/lvp_icd.json`), so a Vulkan
+  engine with `cpu_moe` enters the placed branch on the machine this was written
+  on. `BACKEND-VULKAN` already runs models token-exactly, which is what makes it
+  an admissible correctness engine rather than merely a second enum value.
+  So W3b owes a token-exactness gate — Vulkan engine with the routed experts
+  placed on the CPU, against the same model run wholly on the CPU — and that gate
+  is runnable today. What Vulkan-on-lavapipe CANNOT supply is a speed number, and
+  it must never be used for one: it is a software rasteriser, so a placement
+  measured against it would compare CPU against CPU. The SPEED axis stays with
+  W5 and stays blocked on a discrete rig, which is the same rig #149's community
+  offer would supply.
 - **W1's two resolvers land UNREACHED**, which `## Nothing lands dead` permits
   only when it is declared, so it is declared here.
   `ResolvePlacementOverrides()` and `ResolvePlacementFit()`

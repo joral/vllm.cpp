@@ -37,6 +37,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     // scales and packed codes. Kernels consume them through the quant traits
     // table, never through a KernelTensorDesc scalar type.
     case DType::kQ4_0:
+    case DType::kQ5_0:
     case DType::kQ8_0:
     case DType::kQ2_K:
     case DType::kQ3_K:
@@ -49,6 +50,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kIQ2_S:
     case DType::kIQ1_S:
     case DType::kIQ1_XXXS:
+    case DType::kIQ4_NL:
     case DType::kMXFP4:
       break;
   }
@@ -1481,8 +1483,27 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
   VT_CHECK(out.shape[0] == ids.shape[0] && out.shape[1] == table.shape[1],
            "embedding: output shape mismatch");
   VT_CHECK(ids.dtype == DType::kI32 || ids.dtype == DType::kI64, "embedding: ids i32/i64");
-  VT_CHECK(IsFloat(table.dtype) && IsOutFloat(out.dtype),
-           "embedding: float table, f32/bf16 out");
+  // A BLOCK-QUANTIZED table is admitted alongside the elementwise ones: the
+  // kernel then dequantizes ONE ROW per gathered id instead of loading it,
+  // mirroring `ggml_compute_forward_get_rows_q` (llama.cpp @ b10451
+  // ggml/src/ggml-cpu/ops.cpp:4850), which dispatches every quantized get_rows
+  // through the type's `to_float`. This is what lets a gather table stay
+  // COMPRESSED in memory; a 20 M-entry n-gram table has no other affordable
+  // residency (Qwen3.8-Flash-Next: 28.8 GB of IQ4_NL against 102.4 GB of bf16).
+  VT_CHECK(IsFloat(table.dtype) || IsBlockQuant(table.dtype),
+           "embedding: table must be float or block-quantized");
+  VT_CHECK(IsOutFloat(out.dtype), "embedding: f32/bf16 out");
+  // `ggml_row_size` asserts a row is a whole number of blocks; a ragged K has no
+  // row stride at all, so it refuses here rather than mis-striding every row
+  // after the first. (This is also the reason the shipped table is IQ4_NL:
+  // its row is 160, and no 256-element K-quant can encode it.)
+  if (IsBlockQuant(table.dtype)) {
+    VT_CHECK(table.shape[1] % BlockElems(table.dtype) == 0,
+             "embedding: block table K must be a whole number of blocks");
+  }
+  // A block table's strides are logical (elements), exactly as for a
+  // `kMatmulBTQuant` weight: they describe [V, K] row-major, and the kernel
+  // converts to bytes through RowSizeBytes.
   VT_CHECK(table.IsContiguous() && ids.IsContiguous() && out.IsContiguous(),
            "embedding: contiguous required");
   VT_CHECK(table.device == out.device && ids.device == table.device && table.device == q.device,
@@ -3152,15 +3173,17 @@ void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tens
                           const Tensor& value, const DFlashBlockAttentionArgs& args) {
   VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
            "dflash-block-attn: query/key/value/out rank-3 [T,Hq/Hkv,D]");
-  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t tq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t t = key.shape[0];
   const int64_t hk = key.shape[1];
-  VT_CHECK(key.shape[0] == t && value.shape[0] == t,
-           "dflash-block-attn: query/key/value token count must match");
+  VT_CHECK(value.shape[0] == t, "dflash-block-attn: key/value token count must match");
+  VT_CHECK(args.cu_seqlens_q != nullptr || tq == t,
+           "dflash-block-attn: query/key token count must match unless cu_seqlens_q is set");
   VT_CHECK(key.shape[2] == d && value.shape[2] == d,
            "dflash-block-attn: key/value head_dim must match query");
   VT_CHECK(value.shape[1] == hk, "dflash-block-attn: key/value must share the kv-head count");
-  VT_CHECK(out.shape[0] == t && out.shape[1] == hq && out.shape[2] == d,
-           "dflash-block-attn: out must be [T,Hq,D] matching query");
+  VT_CHECK(out.shape[0] == tq && out.shape[1] == hq && out.shape[2] == d,
+           "dflash-block-attn: out must be [Tq,Hq,D] matching query");
   VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
            "dflash-block-attn: Hq must be a positive multiple of Hk (GQA broadcast)");
   VT_CHECK(args.scale > 0.0f, "dflash-block-attn: scale must be set (> 0), e.g. head_dim^-0.5");
@@ -3168,6 +3191,22 @@ void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tens
            "dflash-block-attn: cu_seqlens (host, num_reqs+1) required");
   VT_CHECK(args.cu_seqlens[0] == 0 && args.cu_seqlens[args.num_reqs] == static_cast<int32_t>(t),
            "dflash-block-attn: cu_seqlens must span [0,T]");
+  if (args.cu_seqlens_q != nullptr) {
+    // D1 (#2087): the query block is the per-request SUFFIX of the key block, so
+    // every request's query run must FIT its key run. A qlen > klen would make the
+    // combined offset negative and read the previous request's keys.
+    VT_CHECK(args.cu_seqlens_q[0] == 0 &&
+                 args.cu_seqlens_q[args.num_reqs] == static_cast<int32_t>(tq),
+             "dflash-block-attn: cu_seqlens_q must span [0,Tq]");
+    for (int r = 0; r < args.num_reqs; ++r) {
+      VT_CHECK(args.cu_seqlens_q[r + 1] >= args.cu_seqlens_q[r] &&
+                   args.cu_seqlens[r + 1] >= args.cu_seqlens[r],
+               "dflash-block-attn: cu_seqlens/cu_seqlens_q must be non-decreasing");
+      VT_CHECK(args.cu_seqlens_q[r + 1] - args.cu_seqlens_q[r] <=
+                   args.cu_seqlens[r + 1] - args.cu_seqlens[r],
+               "dflash-block-attn: per-request query rows must not exceed key rows");
+    }
+  }
   VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype,
            "dflash-block-attn: query/key/value must share one float dtype");
   VT_CHECK(IsOutFloat(out.dtype), "dflash-block-attn: out must be f32 or bf16");
@@ -3616,6 +3655,62 @@ void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
              "admit keys that do not exist. Upstream's dots3-note window is "
              "(sliding_window - 1, 0) (attention.py:300 @ bc2d63e650).");
   }
+  // The DSA SELECTED-SLOT arm (dots3-note W4b-3c, #699). Both null is the
+  // ABSENT state and a NOT-TAKEN branch; exactly one present is a caller bug
+  // that would otherwise silently serve dense attention on a sparse model, so
+  // it is refused BY NAME rather than ignored.
+  if (args.topk_indices != nullptr || args.valid_counts != nullptr) {
+    VT_CHECK(args.topk_indices != nullptr && args.valid_counts != nullptr,
+             "mla_decode_attention: topk_indices and valid_counts must be supplied "
+             "TOGETHER — one without the other cannot describe a selection "
+             "(upstream returns both from `triton_convert_req_index_to_global_index`, "
+             "attention.py:760-767 @ bc2d63e650)");
+    const Tensor& ti = *args.topk_indices;
+    const Tensor& vc = *args.valid_counts;
+    VT_CHECK(ti.rank == 2 && vc.rank == 1,
+             "mla_decode_attention: topk_indices must be rank-2 [batch, topk] and "
+             "valid_counts rank-1 [batch]");
+    VT_CHECK(ti.shape[0] == batch && vc.shape[0] == batch,
+             "mla_decode_attention: topk_indices/valid_counts must have `batch` rows");
+    VT_CHECK(ti.shape[1] > 0,
+             "mla_decode_attention: topk_indices must have at least one column — a "
+             "topk of 0 selects nothing and upstream's `index_topk` is a positive "
+             "config field");
+    VT_CHECK(ti.dtype == DType::kI32 && vc.dtype == DType::kI32,
+             "mla_decode_attention: topk_indices/valid_counts must be i32");
+    VT_CHECK(ti.stride[1] == 1 && vc.IsContiguous(),
+             "mla_decode_attention: topk_indices rows must be contiguous and "
+             "valid_counts contiguous");
+    VT_CHECK(ti.device == q.device && vc.device == q.device,
+             "mla_decode_attention: topk_indices/valid_counts device mismatch");
+    // Upstream cannot produce a windowed layer that also selects:
+    // `Dots3NoteSlidingAttention` sets `self.indexer = None` / `is_sparse =
+    // False` (model.py:432-434 @ bc2d63e650), so the sliding geometry carries no
+    // indexer at all. Refusing the pair keeps the two arms' bounds from
+    // silently composing into a key set upstream has no counterpart for.
+    VT_CHECK(!args.window_size.has_value(),
+             "mla_decode_attention: a sliding window and a DSA selection cannot be "
+             "combined — upstream's sliding layers set `self.indexer = None` and "
+             "`is_sparse = False` (model.py:432-434 @ bc2d63e650), so no layer "
+             "carries both");
+    // The COUNT bound. Reading `valid_counts` here would force a device
+    // synchronization on every decode step of a sparse model, which is a
+    // per-step cost on the model path, so the value check runs only where the
+    // memory is host-readable. BOTH kernels additionally clamp `min(count,
+    // topk)`, so an over-large count on a device tensor cannot read out of
+    // bounds — it is refused where it can be seen and contained where it
+    // cannot. Recorded as a deviation rather than left to be discovered.
+    if (vc.device.type == DeviceType::kCPU) {
+      const int32_t* counts = vc.Ptr<int32_t>();
+      for (int64_t b = 0; b < batch; ++b) {
+        VT_CHECK(counts[b] >= 0 && counts[b] <= ti.shape[1],
+                 "mla_decode_attention: valid_counts[" + std::to_string(b) + "] is " +
+                     std::to_string(counts[b]) + " but topk is " +
+                     std::to_string(ti.shape[1]) +
+                     " — a count past the row length names slots that do not exist");
+      }
+    }
+  }
   // Indexing is stride-driven on the leading dims (a cross-layer cache view has
   // gaps — cf. upstream `_page_stride`, triton_decode_attention.py:59-65), so we
   // require only unit innermost strides.
@@ -3638,6 +3733,117 @@ void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
            "(out/query/kv_cache/block_table/seq_lens/queue)");
   reinterpret_cast<MlaDecodeAttentionFn>(GetOp(OpId::kMlaDecodeAttention, q.device.type))(
       q, out, lse, query, kv_cache, block_table, seq_lens, args);
+}
+
+// The DSA "Lightning Indexer" selection pair (dots3-note W4b-3c, #699).
+// Ported from vllm/v1/attention/ops/triton_fp8_mqa_logits.py:120-156 and
+// vllm/model_executor/layers/sparse_attn_indexer.py:509 @ bc2d63e650. The
+// host reference these mirror is vllm::deepseek_v4::DsaIndexerLogits /
+// DsaTopkSelect, which remains the gate's oracle.
+void DsaIndexerLogits(Queue& q, Tensor& logits, const Tensor& q_states, const Tensor& k,
+                      const Tensor& weights, const Tensor& win_start,
+                      const Tensor& win_end, const DsaIndexerLogitsArgs& args) {
+  VT_CHECK(q_states.rank == 3,
+           "dsa_indexer_logits: q must be rank-3 [num_tokens, index_n_heads, "
+           "index_head_dim]");
+  VT_CHECK(k.rank == 2,
+           "dsa_indexer_logits: k must be rank-2 [num_keys, index_head_dim] — the "
+           "indexer is MQA, so there is exactly ONE KV head (deepseek_v2.py:700-707 "
+           "@ bc2d63e650)");
+  VT_CHECK(logits.rank == 2, "dsa_indexer_logits: logits must be rank-2 [num_tokens, num_keys]");
+  VT_CHECK(weights.rank == 2,
+           "dsa_indexer_logits: weights must be rank-2 [num_tokens, index_n_heads]");
+  VT_CHECK(win_start.rank == 1 && win_end.rank == 1,
+           "dsa_indexer_logits: win_start/win_end must be rank-1 [num_tokens]");
+  const int64_t T = q_states.shape[0];
+  const int64_t H = q_states.shape[1];
+  const int64_t D = q_states.shape[2];
+  const int64_t S = k.shape[0];
+  VT_CHECK(T > 0 && H > 0 && D > 0 && S > 0,
+           "dsa_indexer_logits: num_tokens/index_n_heads/index_head_dim/num_keys "
+           "must be > 0");
+  VT_CHECK(k.shape[1] == D,
+           "dsa_indexer_logits: k's width must equal q's index_head_dim (the dot "
+           "spans the WHOLE 128-wide indexer head, triton_fp8_mqa_logits.py:125)");
+  VT_CHECK(logits.shape[0] == T && logits.shape[1] == S,
+           "dsa_indexer_logits: logits must be [num_tokens, num_keys]");
+  VT_CHECK(weights.shape[0] == T && weights.shape[1] == H,
+           "dsa_indexer_logits: weights must be [num_tokens, index_n_heads] (one gate "
+           "per query token per indexer head)");
+  VT_CHECK(win_start.shape[0] == T && win_end.shape[0] == T,
+           "dsa_indexer_logits: win_start/win_end must have one entry per token");
+  VT_CHECK(win_start.dtype == DType::kI32 && win_end.dtype == DType::kI32,
+           "dsa_indexer_logits: win_start/win_end must be i32");
+  VT_CHECK(logits.dtype == DType::kF32,
+           "dsa_indexer_logits: logits must be f32 — upstream's MQA-logit kernel "
+           "accumulates and stores f32 whatever the operand dtype "
+           "(triton_fp8_mqa_logits.py:125 `input_precision=\"ieee\"`)");
+  VT_CHECK(IsFloat(q_states.dtype) && k.dtype == q_states.dtype &&
+               weights.dtype == q_states.dtype,
+           "dsa_indexer_logits: q/k/weights must share one float dtype");
+  VT_CHECK(args.softmax_scale > 0.0f && args.n_head_scale > 0.0f,
+           "dsa_indexer_logits: softmax_scale and n_head_scale must both be > 0 "
+           "(`head_dim**-0.5` deepseek_v2.py:709, `n_head**-0.5` :742)");
+  VT_CHECK(q_states.stride[2] == 1 && k.stride[1] == 1 && weights.stride[1] == 1 &&
+               logits.stride[1] == 1,
+           "dsa_indexer_logits: q/k/weights/logits innermost stride must be 1");
+  VT_CHECK(win_start.IsContiguous() && win_end.IsContiguous(),
+           "dsa_indexer_logits: win_start/win_end must be contiguous");
+  if (args.q_scale != nullptr) {
+    VT_CHECK(args.q_scale->rank == 2 && args.q_scale->shape[0] == T &&
+                 args.q_scale->shape[1] == H,
+             "dsa_indexer_logits: q_scale must be [num_tokens, index_n_heads] — it is "
+             "the per-token-per-head fp8 quantization scale folded into `weights` "
+             "(deepseek_v2.py:838,:840 @ bc2d63e650)");
+    VT_CHECK(args.q_scale->dtype == DType::kF32,
+             "dsa_indexer_logits: q_scale must be f32 (per_token_group_quant_fp8 "
+             "returns an fp32 scale, deepseek_v2.py:831-836)");
+    VT_CHECK(args.q_scale->stride[1] == 1 && args.q_scale->device == q.device,
+             "dsa_indexer_logits: q_scale innermost stride must be 1 and its device "
+             "must match the queue");
+  }
+  VT_CHECK(logits.device == q.device && q_states.device == q.device &&
+               k.device == q.device && weights.device == q.device &&
+               win_start.device == q.device && win_end.device == q.device,
+           "dsa_indexer_logits: device mismatch "
+           "(logits/q/k/weights/win_start/win_end/queue)");
+  reinterpret_cast<DsaIndexerLogitsFn>(GetOp(OpId::kDsaIndexerLogits, q.device.type))(
+      q, logits, q_states, k, weights, win_start, win_end, args);
+}
+
+void DsaTopkSelect(Queue& q, Tensor& indices, Tensor& counts, const Tensor& logits,
+                   const Tensor& win_start, const Tensor& win_end) {
+  VT_CHECK(indices.rank == 2, "dsa_topk_select: indices must be rank-2 [num_tokens, topk]");
+  VT_CHECK(counts.rank == 1, "dsa_topk_select: counts must be rank-1 [num_tokens]");
+  VT_CHECK(logits.rank == 2, "dsa_topk_select: logits must be rank-2 [num_tokens, num_keys]");
+  VT_CHECK(win_start.rank == 1 && win_end.rank == 1,
+           "dsa_topk_select: win_start/win_end must be rank-1 [num_tokens]");
+  const int64_t T = logits.shape[0];
+  const int64_t S = logits.shape[1];
+  const int64_t topk = indices.shape[1];
+  VT_CHECK(T > 0 && S > 0, "dsa_topk_select: num_tokens/num_keys must be > 0");
+  VT_CHECK(topk > 0,
+           "dsa_topk_select: topk must be > 0 — upstream's `index_topk` is a positive "
+           "config field (deepseek_v2.py:685)");
+  VT_CHECK(indices.shape[0] == T && counts.shape[0] == T,
+           "dsa_topk_select: indices/counts must have one row per query token");
+  VT_CHECK(win_start.shape[0] == T && win_end.shape[0] == T,
+           "dsa_topk_select: win_start/win_end must have one entry per token");
+  VT_CHECK(indices.dtype == DType::kI32 && counts.dtype == DType::kI32 &&
+               win_start.dtype == DType::kI32 && win_end.dtype == DType::kI32,
+           "dsa_topk_select: indices/counts/win_start/win_end must be i32 — the pair "
+           "feeds MlaDecodeAttentionArgs::topk_indices/valid_counts directly");
+  VT_CHECK(logits.dtype == DType::kF32, "dsa_topk_select: logits must be f32");
+  VT_CHECK(indices.stride[1] == 1 && logits.stride[1] == 1 && counts.IsContiguous() &&
+               win_start.IsContiguous() && win_end.IsContiguous(),
+           "dsa_topk_select: indices/logits rows must be contiguous and "
+           "counts/win_start/win_end contiguous");
+  VT_CHECK(indices.device == q.device && counts.device == q.device &&
+               logits.device == q.device && win_start.device == q.device &&
+               win_end.device == q.device,
+           "dsa_topk_select: device mismatch (indices/counts/logits/win_start/win_end/queue)");
+  reinterpret_cast<DsaTopkSelectFn>(GetOp(OpId::kDsaTopkSelect, q.device.type))(
+      q, indices, counts, logits, win_start, win_end);
 }
 
 void MlaPrefillAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
@@ -3879,18 +4085,20 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
     VT_CHECK(args.k_scale > 0.0f && args.v_scale > 0.0f,
              "paged_attention: fp8 KV read requires k_scale/v_scale > 0");
     // WHICH BACKENDS HAVE AN fp8 READ. Unlike the fp8 STORE — a separate OpId
-    // that only the CPU and CUDA backends register, so an unimplemented backend
-    // refuses by name inside GetOp — the fp8 read rides ADDITIVE fields on
-    // PagedAttentionArgs of an op that kMETAL and kROCM already register for the
-    // float path (metal_ops.mm, rocm_ops.hip). Nothing in the provider table can
-    // tell those two apart, so without this list an fp8 cache would reach a
-    // kernel that reads the same bytes as floats and returns silent garbage.
-    // AGENTS.md: refuse an unimplemented arm with a message that names the
-    // missing part. CPU landed in W1, CUDA in W2; Metal and ROCm are owed.
-    VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kCUDA,
-             "paged_attention: the fp8 KV read is implemented on CPU (KV-FP8 W1) and "
-             "CUDA (KV-FP8 W2) only; this backend has no fp8 dequant on the cache read "
-             "and would read the fp8 bytes as its float dtype");
+    // that only the CPU, CUDA, and ROCm backends register, so an unimplemented
+    // backend refuses by name inside GetOp — the fp8 read rides ADDITIVE fields
+    // on PagedAttentionArgs of an op that kMETAL and kROCM already register for
+    // the float path (metal_ops.mm, rocm_ops.hip). Nothing in the provider
+    // table can tell those two apart, so without this list an fp8 cache would
+    // reach a kernel that reads the same bytes as floats and returns silent
+    // garbage. AGENTS.md: refuse an unimplemented arm with a message that names
+    // the missing part. CPU landed in W1, CUDA in W2, ROCm in W6; Metal is owed.
+    VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kCUDA ||
+                 q.device.type == DeviceType::kROCM,
+             "paged_attention: the fp8 KV read is implemented on CPU (KV-FP8 W1), "
+             "CUDA (KV-FP8 W2), and ROCm (KV-FP8 W6) only; this backend has no "
+             "fp8 dequant on the cache read and would read the fp8 bytes as its "
+             "float dtype");
   }
   // metadata: block_table [num_reqs, max_blocks] i32, seq_lens [num_reqs] i32,
   // query_start_loc [num_reqs+1] i32.
