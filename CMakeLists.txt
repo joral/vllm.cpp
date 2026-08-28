@@ -737,9 +737,11 @@ add_library(vllm STATIC
   src/vllm/config/cache.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
+  src/vllm/config/generation.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
   src/vllm/config/weight_residency.cpp
+  src/vllm/model_executor/device_placement.cpp
   src/vllm/model_executor/weight_offloader.cpp
   src/vllm/model_executor/weight_offload_policy.cpp
   src/vllm/model_executor/expert_slot_cache.cpp
@@ -772,6 +774,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_5_common.cpp
   src/vllm/model_executor/models/qwen3_5_dense.cpp
   src/vllm/model_executor/models/qwen3_5_moe.cpp
+  # Qwen4-Exp (Qwen3.8-Flash-Next) W4: Qwen Sparse Attention. Host reference
+  # math for the indexer, its side cache and the GATHER consumer (#1991).
+  src/vllm/model_executor/models/qwen4_exp_qsa.cpp
   src/vllm/model_executor/models/qwen3_dense.cpp
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
@@ -784,6 +789,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_moe_registry.cpp
   src/vllm/model_executor/models/qwen3_moe_weights.cpp
   src/vllm/model_executor/models/qwen3_moe.cpp
+  src/vllm/model_executor/models/qwen4_exp_hc.cpp
   src/vllm/model_executor/models/deepseek_v2_registry.cpp
   src/vllm/model_executor/models/deepseek_v2_weights.cpp
   src/vllm/model_executor/models/deepseek_v2.cpp
@@ -799,6 +805,12 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_device.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
+  src/vllm/model_executor/models/qwen4_exp_ple.cpp
+  src/vllm/model_executor/models/qwen4_exp.cpp
+  src/vllm/model_executor/models/qwen4_exp_weights.cpp
+  src/vllm/model_executor/models/qwen4_exp_registry.cpp
+  src/vllm/model_executor/models/glm5_next.cpp
+  src/vllm/model_executor/models/glm5_next_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
   src/vllm/model_executor/models/interfaces.cpp
@@ -809,6 +821,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/muse_glimmer_registry.cpp
   src/vllm/model_executor/models/muse_glimmer_weights.cpp
   src/vllm/model_executor/models/muse_glimmer_gguf_weights.cpp
+  src/vllm/model_executor/models/qwen4_exp_gguf_weights.cpp
+  src/vllm/model_executor/models/glm5_next_weights.cpp
   src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/muse_glimmer_vision.cpp
   src/vllm/model_executor/models/muse_glimmer_mm.cpp
@@ -1323,6 +1337,9 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
   src/vt/cpu/cpu_mla_prefill.cpp
+  # The DSA "Lightning Indexer" selection pair (dots3-note W4b-3c, #699).
+  # Self-registering.
+  src/vt/cpu/cpu_dsa_indexer.cpp
   src/vt/cpu/cpu_paged_attn.cpp
   src/vt/cpu/cpu_sample.cpp)
 add_library(vllm::vllm ALIAS vllm)
@@ -1776,6 +1793,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_layernorm.cu
     src/vt/cuda/cuda_cache.cu
     src/vt/cuda/cuda_mla_attn.cu
+    src/vt/cuda/cuda_dsa_indexer.cu
     src/vt/cuda/cuda_mla_prefill.cu
     src/vt/cuda/cuda_paged_attn.cu
     src/vt/cuda/cuda_combine_tokens.cu
