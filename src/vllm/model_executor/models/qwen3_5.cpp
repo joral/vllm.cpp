@@ -1358,23 +1358,15 @@ void ActDumpStream(Dev d, int64_t step, int64_t layer, DBuf& hidden, DBuf& res,
 // logical view (e.g. {conv_dim, Kw}).
 Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
                          const std::vector<int64_t>& shape) {
-  if (!w.d_dev_f32) {
-    std::vector<float> f = WeightF32(w);
-    // Same defect and same fix as ResidentWeight above (issue #125): this handed
-    // out `std::vector<float>::data()`, a plain heap pointer, to any non-CUDA
-    // device backend. It would have thrown immediately after the embed one was
-    // fixed, on the q/k-norm and GDN f32 weights.
-    if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
-      auto* buf = new std::vector<float>(std::move(f));
-      w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
-    } else {
-      const size_t nb = f.size() * sizeof(float);
-      void* p = d.b.Alloc(nb);
-      d.b.Copy(d.q, p, f.data(), nb);
-      Backend* bk = &d.b;
-      w.d_dev_f32 = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
-    }
-  }
+  // THIS HELPER STAYS PRIVATE (see :790) BUT ITS UPLOAD DOES NOT. The install
+  // is `dense_attn::InstallResidentF32` (dense_device_glue.h, included at :24),
+  // the same one `dense_attn_block.h` uses. What used to be private was a
+  // verbatim second copy of the upload, which is why #2711 -- an asynchronous
+  // `Copy` out of a function-local `std::vector<float>` that died at this
+  // closing brace -- had to be found and repaired twice. The behaviour this
+  // file's version carries beyond the shared one is in `ResidentWeight`, not
+  // here: the two f32 bodies were identical.
+  if (!w.d_dev_f32) dense_attn::InstallResidentF32(d, w, WeightF32(w));
   return MakeTensor(w.d_dev_f32.get(), DType::kF32, d.q.device, shape);
 }
 

@@ -292,5 +292,59 @@ class DBuf {
   Tensor t_{};
 };
 
+// ── The ONE install of an f32-upcast weight (#2711) ─────────────────────────
+//
+// `ResidentWeightF32` exists TWICE -- here in `dense_attn_block.h`, which 49
+// translation units under `src/vllm/model_executor/models/` include, and as a
+// private twin in `qwen3_5.cpp` that stays private on purpose (`:790`). Both
+// carried the same defect, so a repair applied once left it standing. This is
+// the body both now install through, and it is the reason there is one repair
+// rather than two.
+//
+// WHY `f` IS TAKEN BY VALUE AND NAMED. It is the copy SOURCE, and its lifetime
+// is the entire bug. `Backend::Copy` is ASYNCHRONOUS on both device backends --
+// `cudaMemcpyAsync` (`src/vt/cuda/cuda_backend.cu:116-118`) and `hipMemcpyAsync`
+// (`src/vt/rocm/rocm_backend.hip:269-271`) -- and this source is ordinary
+// PAGEABLE heap memory, which the driver may read at any point until the queue
+// drains. Both callers used to build it in a function-local vector and let it
+// die at their closing brace, with nothing in between that drained anything.
+//
+// THE `Synchronize` IS THE FIX, and the tree already states its rule for the
+// same hazard: `glm5_next_kv.cpp:143-150` drains on EVERY span rather than once
+// at the end, because a deferred wait "would hand the driver a pageable source
+// that the next iteration has already overwritten." Same hazard, now handled the
+// same way.
+//
+// WHY NOT KEEP THE SOURCE ALIVE INSTEAD. `vt::Backend` has no completion
+// callback and nothing polls `Event`, so "alive until the copy retires"
+// degenerates to "alive for the model's lifetime" -- a permanent host allocation
+// per upcast weight, reinstating exactly the second host copy
+// `AdoptDeviceBytesAsHost` and `ReleaseResidentQwen3_5DenseHostWeights` exist to
+// drop. The drain is memoised on `d_dev_f32`, so it runs ONCE per distinct
+// weight per process rather than per forward or per token.
+//
+// THE SIBLING `ResidentWeight` DOES NOT DRAIN, AND IS RIGHT NOT TO. Its source
+// is `w.bytes`, an owned buffer or a file mapping that outlives the call. The
+// asymmetry between the two helpers is the whole defect, not an oversight in
+// the other one.
+inline void InstallResidentF32(Dev d, const OwnedTensor& w,
+                               std::vector<float> f) {
+  // Aliasing is a CPU property and not a not-CUDA one (#125, #1946): the
+  // predicate this replaced was `!is_cuda()`, which handed a plain heap pointer
+  // to kMETAL, kVULKAN and kXPU. All three reach the upload arm below.
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
+    auto* buf = new std::vector<float>(std::move(f));
+    w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
+    return;
+  }
+  const size_t nb = f.size() * sizeof(float);
+  void* p = d.b.Alloc(nb);
+  d.b.Copy(d.q, p, f.data(), nb);
+  // BEFORE `f` GOES OUT OF SCOPE, and before this function returns. See above.
+  d.b.Synchronize(d.q);
+  Backend* bk = &d.b;
+  w.d_dev_f32 = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+}
+
 }  // namespace dense_attn
 }  // namespace vllm

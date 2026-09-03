@@ -1,15 +1,27 @@
 # `qwen38-27b-exl3-gb10` — Qwen3.8-27B EXL3 3.5bpw, with and without its DFlash2 draft
 
-The published EXL3 pair runs on GB10. This file records what was measured, on
-what, and — at least as importantly — the three ways the workload differs from
-the number it is naturally compared against.
+The published EXL3 pair loads and generates on GB10. This file has the numbers,
+the conditions they were taken under, and the parts of the upstream recipe that
+are not matched here.
 
 ## Disposition
 
-**Measured, NOT comparable to the published figure.** The speed is real and
-reproducible. It is not a like-for-like reproduction of the upstream README's
-47.5 tok/s, for the reasons under [Limitations](#limitations). Read the ratio
-as "same regime on a favourable prompt", never as a win.
+Measured. On the task and temperature the [Mia-AiLab card][card] quotes, real
+HumanEval at T = 0.6, the pair decodes at 59.5 tok/s where they report 47.5. Our
+acceptance is 4.06 tokens per step against their 4.43, so the speed is not
+coming from an easier drafting task.
+
+Three things about that comparison are still open and are listed under
+[Limitations](#limitations). Their recipe uses a longer context and an NVFP4 KV
+cache, we run with the paged draft route disabled, and their card does not say
+whether its figure counts the prefill. Counted with the prefill in, the same run
+of ours reads 45.1 tok/s.
+
+There are two measurements below. The first uses a short greedy prompt and is
+kept because the correctness evidence lives there. The HumanEval numbers are the
+ones to compare against anything.
+
+[card]: https://huggingface.co/Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw
 
 ## Subject
 
@@ -28,11 +40,11 @@ download-host pins, so the bytes measured are provably the pinned artifact:
 
 ## Method
 
-Both arms ran **interleaved in one process, one boot, one binary** — target,
-draft, target, draft — because a sequential A/B measures drift as well as the
-arm, and this repository has a recorded case of one unchanged binary reading
-36.8 and 78.9 tok/s in the same session. Run 1 of every leg is a cold run and is
-discarded, which is the harness' own convention on every arm.
+Both arms ran interleaved in one process, on one boot, from one binary: target,
+draft, target, draft. A sequential A/B would measure drift along with the arm,
+and this repository has a recorded case of one unchanged binary reading 36.8 and
+78.9 tok/s in the same session. Run 1 of every leg is cold and discarded, which
+is what the harness does on every arm anyway.
 
 ```sh
 VT_DFLASH_PAGED=0 vllm-cli --model <target> --device cuda \
@@ -41,15 +53,16 @@ VT_DFLASH_PAGED=0 vllm-cli --model <target> --device cuda \
   [--speculative-config '{"method":"dflash","model":"<draft>","num_speculative_tokens":7}']
 ```
 
-## Results
+## First measurement: a short greedy prompt
 
 | arm | warm tok/s, runs 2-5 of two interleaved legs | spread |
 |---|---|---|
 | target only | 16.706 16.758 16.796 16.729 / 16.737 16.769 16.670 16.701 | 0.75% |
 | + DFlash2 draft, k=7 | 48.970 49.079 48.944 48.469 / 48.751 48.672 48.677 48.446 | 1.3% |
 
-**2.91x from speculation.** The two target legs are separated by a draft leg and
-agree to 0.75%, so drift does not account for the difference.
+The draft arm runs 2.91 times the target-only rate. The two target legs sit
+either side of a draft leg and agree to 0.75%, so drift does not explain the
+gap.
 
 ## The MATCHED workload: real HumanEval at T = 0.6
 
@@ -132,6 +145,173 @@ tokens, `rc=0`, ` Paris. The capital of Germany is Berlin. The capital of Italy
 is`. A wrong codebook on this format yields a correctly distributed and entirely
 wrong weight, so coherent, factually correct continuation is meaningful evidence
 and not merely a smoke test.
+
+## Reproduce this run
+
+Everything here runs on one GB10 board with CUDA 13.0 and about 20 GB of disk
+free. Set aside ninety minutes or so; the CUDA build eats most of it, and each
+measurement leg is another twenty.
+
+If you are going to quote a number from this, read the
+[limitations](#limitations) as well. Three axes of the upstream comparison are
+not matched here, and one of them is a bug we have open.
+
+### 1. Get the weights
+
+Both checkpoints are pinned by revision below, and it is worth pinning yours
+too. Publishers do requantize in place under an unchanged repository name, so a
+bare repo id can quietly get you different weights than the ones measured here.
+
+```sh
+hf download Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw \
+    --revision 19441ac874c4018295da848e250f23511361cda4 \
+    --local-dir ./target-3.5bpw
+
+hf download Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw \
+    --revision 4f0436269bca761b071f05319e8e04a87cc633f9 \
+    --local-dir ./draft-dflash2-5.0bpw
+```
+
+Then check what you got against the hashes in [subject](#subject).
+
+```sh
+sha256sum ./target-3.5bpw/*.safetensors ./draft-dflash2-5.0bpw/*.safetensors
+```
+
+If those directories live on a NAS or any other network mount, copy them to
+local disk before you run anything. Otherwise the run spends a good part of its
+time waiting on the filesystem instead of the GPU.
+
+### 2. Build
+
+```sh
+cmake -S . -B build -G Ninja \
+    -DVLLM_CPP_CUDA=ON \
+    -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j 4 --target vllm-cli vllm-bench
+```
+
+`121a` is GB10. Change `-DVLLM_CPP_CUDA_ARCHITECTURES` if you are on something else.
+
+### 3. Check that it generates
+
+Do this before you time anything.
+
+EXL3 stores weights as a trellis, and if the codebook resolves wrong you get
+weights with the right distribution and no relationship to the real ones. Every
+shape check still passes. The model still writes fluent English. It writes the
+wrong fluent English, and any throughput number you take in that state is
+worthless.
+
+```sh
+build/examples/vllm-cli --model ./target-3.5bpw --device cuda \
+    --prompt 'The capital of France is' \
+    --max-tokens 16 --temperature 0 --seed 0
+```
+
+You should get ` Paris. The capital of Germany is Berlin. The capital of Italy
+is`, and an exit code of 0. It stops there because it hit the 16-token cap, which
+the `finish_reason=length` line tells you. This is a plain completion prompt with
+no chat template, so the model has no reason to emit an end-of-sequence token —
+it just keeps listing capitals.
+
+### 4. Build the prompt set
+
+The harness wants the 164 HumanEval problems in the ShareGPT shape, so convert
+them once.
+
+```sh
+curl -L -O https://github.com/openai/human-eval/raw/master/data/HumanEval.jsonl.gz
+gunzip HumanEval.jsonl.gz
+
+python3 -c 'import json
+rows = [json.loads(l) for l in open("HumanEval.jsonl")]
+json.dump([{"conversations": [{"from": "human", "value": r["prompt"]},
+                              {"from": "gpt", "value": ""}],
+            "id": r["task_id"]} for r in rows],
+          open("humaneval-sharegpt.json", "w"))'
+```
+
+For reference, `HumanEval.jsonl` should hash to
+`1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2`.
+
+### 5. Measure both arms
+
+`VT_DFLASH_PAGED=0` is not optional right now. With the paged draft route
+enabled, the first run finishes and the second one dies inside the same process
+with an illegal memory access. That is
+[#2274](https://github.com/mudler/vllm.cpp/issues/2274); it predates this
+checkpoint and it is still open.
+
+Target alone first.
+
+```sh
+VT_DFLASH_PAGED=0 build/examples/vllm-bench --model ./target-3.5bpw \
+    --dataset-path humaneval-sharegpt.json --num-prompts 164 \
+    --output-len 128 --temperature 0.6 --seed 0 --concurrency 1
+```
+
+Then the same binary again, with the draft:
+
+```sh
+VT_DFLASH_PAGED=0 build/examples/vllm-bench --model ./target-3.5bpw \
+    --dataset-path humaneval-sharegpt.json --num-prompts 164 \
+    --output-len 128 --temperature 0.6 --seed 0 --concurrency 1 \
+    --speculative-config '{"method": "dflash",
+                           "model": "./draft-dflash2-5.0bpw",
+                           "num_speculative_tokens": 7}'
+```
+
+Now run both legs again, in the same order. A board drifts over minutes, and
+running target-draft-target-draft lets you see whether a difference belongs to
+the arm or to the hour.
+
+### 6. Read the result
+
+The report gives you two throughput lines, and they answer different questions.
+This page quotes the first one.
+
+```text
+Mean per-stream decode rate (tok/s):       59.59
+Output (decode) token throughput (tok/s):  45.12
+Draft tokens proposed:                     30863
+Draft tokens accepted:                     17841
+Acceptance rate (accepted/proposed):       0.58
+```
+
+`Mean per-stream decode rate` is `1 / mean_tpot`, with `tpot` being
+`(latency - ttft) / (output_len - 1)`, so the prefill is out of it.
+`Output (decode) token throughput` divides the same tokens by the whole wall
+time, prefill included. Which one you want depends on what you are comparing
+against, and plenty of published figures do not say which they used.
+
+The acceptance counters are read straight out of the engine. Do not try to back
+them out of the throughput.
+
+### What to expect
+
+| Arm | Mean per-stream decode rate |
+|---|---|
+| Target only | 16.6 to 16.8 tok/s |
+| Target and draft, `num_speculative_tokens: 7` | 59.4 to 59.6 tok/s |
+
+Your two target legs should land within about 1% of each other. If they differ
+by less than that, you are looking at drift rather than at anything you changed.
+
+### Change the draft budget
+
+`num_speculative_tokens` moves this number more than anything else you can set
+from the command line. The drafter's config declares `block_size: 8`, but that
+does not cap the verify budget — the loader takes the budget from your flag and
+prints what it resolved.
+
+Try 12. Look for `block=13` in the startup output, which is the budget plus one
+and tells you the flag actually took.
+
+The [draft budget section](#the-draft-budget-is-a-real-lever-and-our-knee-is-not-theirs)
+above has what each value produced on this box, including where it stops
+helping.
 
 ## Limitations
 

@@ -1880,6 +1880,14 @@ target_include_directories(test_expert_stream_device_slot PRIVATE ${CMAKE_SOURCE
 # UnifiedMemory(), which is a process-global registration and not a per-case flag.
 vllm_cpp_add_test(test_resident_weight_host_addressable vllm/model_executor/test_resident_weight_host_addressable.cpp)
 target_include_directories(test_resident_weight_host_addressable PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM-DEVICE (#2711): does `ResidentWeightF32` still hold its copy
+# source when the copy runs? Its own binary for the same reason as the sibling
+# above -- it registers a fake backend and a fake platform in the process-global
+# kXPU slot -- and separately because its backend DEFERS every `Copy` until a
+# `Synchronize`, which is the opposite of the sibling's eager `memcpy` and would
+# change what every case in that file measures.
+vllm_cpp_add_test(test_resident_weight_f32_copy_retires vllm/model_executor/test_resident_weight_f32_copy_retires.cpp)
+target_include_directories(test_resident_weight_f32_copy_retires PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-EXPERT-STREAM (#1091): the step clock at the MoE entry points ForwardLayers
 # does NOT cover, and the final statistics line. Its own binary because it is the
 # only one that can observe `steps == 0` -- the store is a process-lifetime
