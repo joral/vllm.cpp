@@ -14,6 +14,17 @@ void GeluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+// MLA/DSA campaign W1 (#2715). The batched GEMM lives beside its dense siblings
+// in rocm_matmul_hipblaslt.hip; the three data-movement ops in rocm_mla_ops.hip.
+void BatchedMatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+void ConcatAndCacheMlaKernelRocm(Queue& q, const Tensor& kv_c, const Tensor& k_pe,
+                                 Tensor& kv_cache, const Tensor& slot_mapping);
+void ConcatMlaNopeRopeKernelRocm(Queue& q, Tensor& out, const Tensor& nope,
+                                 const Tensor& rope);
+void GatherMlaCacheKernelRocm(Queue& q, Tensor& dst, const Tensor& src_cache,
+                              const Tensor& block_table, const Tensor& cu_seq_lens,
+                              const Tensor& token_to_seq, const Tensor* seq_starts,
+                              int64_t num_tokens);
 void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
                                const RopeArgs& args);
 void GreedyArgmaxKernelRocm(Queue& q, Tensor& out, const Tensor& logits);
@@ -265,6 +276,25 @@ struct Registrar {
     RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelRocm)));
+    // MLA/DSA campaign W1 (#2715). Before these lines each of these four
+    // resolved to NO native ROCm kernel: the portable CPU reference tier where
+    // it is eligible (which docs/ROCM.md:60-61 disqualifies a performance result
+    // on) and a REFUSAL where #2511 withdrew it — see rocm_mla_ops.hip's header.
+    // The remaining three gating ops (kDsaIndexerLogits, kDsaTopkSelect,
+    // kMlaDecodeAttention) are still absent, so the GLM-5.3 speed axis stays
+    // VOID after this wave.
+    RegisterOp(OpId::kBatchedMatmul, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<BatchedMatmulFn>(&BatchedMatmulKernelRocm)));
+    RegisterOp(OpId::kConcatAndCacheMla, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ConcatAndCacheMlaFn>(&ConcatAndCacheMlaKernelRocm)));
+    RegisterOp(OpId::kConcatMlaNopeRope, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ConcatMlaNopeRopeFn>(&ConcatMlaNopeRopeKernelRocm)));
+    RegisterOp(OpId::kGatherMlaCache, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<GatherMlaCacheFn>(&GatherMlaCacheKernelRocm)));
   }
 } registrar;
 

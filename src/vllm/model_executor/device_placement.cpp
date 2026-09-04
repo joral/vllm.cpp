@@ -255,7 +255,24 @@ void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
   // per layer per token.
   static const char* const path = std::getenv("VT_PLACEMENT_DUMP_MOE");
   if (path == nullptr || path[0] == '\0') return;
-  if (layer_index != 0 || data == nullptr || elems <= 0) return;
+
+  // WHICH LAYER, and it must be selectable rather than pinned to 0.
+  //
+  // `--fit` places TRAILING layers, so with the dump fixed at layer 0 a fit run
+  // compared an UNPLACED layer against an unplaced layer and reported
+  // NMSE=0.000e+00 over 12800 bitwise-identical values. That is a vacuous pass
+  // wearing a perfect score: the dump region and the placement region simply did
+  // not intersect. A gate can only compare a placed layer if it can ASK for one.
+  //
+  // Latched once, like the path: unset means layer 0, which keeps every existing
+  // invocation byte-identical.
+  static const int64_t want_layer = [] {
+    const char* e = std::getenv("VT_PLACEMENT_DUMP_MOE_LAYER");
+    if (e == nullptr || e[0] == '\0') return int64_t{0};
+    const long long v = std::atoll(e);
+    return v >= 0 ? static_cast<int64_t>(v) : int64_t{0};
+  }();
+  if (layer_index != want_layer || data == nullptr || elems <= 0) return;
   // FIRST matching call only. A decode writes this layer once per step, and the
   // gate compares one step against one step; appending every step would compare
   // arms that have already diverged in TOKENS and so no longer share an input.

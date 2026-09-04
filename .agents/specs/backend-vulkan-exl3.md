@@ -278,7 +278,13 @@ is a skip wearing a pass and this family has paid for that once already.
 ## Owed
 
 - `kExl3MoeMlp` on Vulkan — see §Scope for why it is a rewrite and not a
-  transcription. No issue owns it yet; #2530 names it under "Not worth doing".
+  transcription. **Owned by
+  [#2765](https://github.com/mudler/vllm.cpp/issues/2765)**, which carries the
+  numbers: the tiles need 28672 bytes at bits 3 and 37888 at bits 6 against
+  Vulkan's 16384-byte `maxComputeSharedMemorySize` guarantee, and the launcher
+  asks for 92160. The shared memory is the SECOND blocker; the first is that the
+  group barrier needs a grid sync Vulkan has at no version, which no tile choice
+  can supply. #2530 names it under "Not worth doing".
 - `kExl3HadR128` registered on Vulkan. The shader exists in this row and the
   wiring is one line; it waits for a caller so nothing lands unreached.
 - The real-checkpoint arm of #2530's slice 1 — see below.

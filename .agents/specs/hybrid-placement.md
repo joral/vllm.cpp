@@ -849,14 +849,47 @@ half belongs to `ENG-WEIGHT-OFFLOAD` (`ACTIVE`, config-only, refuses at startup)
 and the multi-GPU half to #147 / `BACKEND-DISTRIBUTED-TP` (`ACTIVE`); #149 closes
 when all three have landed, not when this one does.
 
+## W4/W3 outcome — the device gate RAN, and both arms are within the bar
+
+Measured on `dgx:gpu0` (GB10, `sm_121`), `Qwen3.8-Flash-Next-UD-IQ1_S` (67.564
+GiB, three shards, the artifact `docs/USAGE.md` pins), engine `cuda`, tree
+`b66b2b060`. Four arms on ONE binary, each placed arm compared against a
+reference dumping the SAME layer:
+
+| arm | placement | dumped layer | bitwise identical | NMSE | bar |
+|---|---|---|---|---|---|
+| `cpu_moe` | 48/48, `origin stated` | 0 | 9286/12800 | **5.239e-06** | 5e-04 |
+| `fit` | 23/48, `origin fit` | 25 | 3729/12800 | **3.569e-05** | 5e-04 |
+
+Both WITHIN, and reproduced identically across two consecutive runs including
+the identical-value counts. `--fit` priced the model at 72,378,689,280 B, took 23
+trailing layers (19,333,120,000 B) to fit a 53,687,091,200 B budget, and said so.
+
+**THE LAYER CHOICE IS THE MEASUREMENT, and two wrong ones came first.** Layer 0
+is VACUOUS for `fit` — the resolver places TRAILING layers, so both arms computed
+it identically and the gate reported a perfect NMSE of 0 over 12800
+bitwise-identical values. Layer 47 is CONFOUNDED for both — by then the input has
+crossed 46 other placed layers, so the comparison measures ACCUMULATED
+divergence, and it read 8.204e-04 against a bar that bounds ONE op. Only each
+arm's FIRST placed layer has an identical input in both arms, which is what makes
+the per-op bar meaningful. The 23x gap between `fit` at layer 25 (3.569e-05) and
+at layer 47 (8.204e-04), from identical code, is that accumulation measured.
+
+A perfect score was the signal that something was wrong, not right: a
+cross-device round trip does not reproduce bit-for-bit, so all-identical means
+nothing moved. The gate now refuses that case by name.
+
 ## Owed
 
-- **`qwen4_exp` is WIRED to the seam but UNREACHED, and this entry is what makes
-  that admissible** ([#2424](https://github.com/mudler/vllm.cpp/issues/2424), row
-  `ENG-HYBRID-PLACEMENT`). `qwen4_exp_forward.cpp` now routes its MoE step through
-  `RunMoePlacedPair` with the `qwen3_moe.cpp` adapter verbatim — the block already
-  had the seam's shape, so the change is a call swap and not a refactor, and it
-  compiles.
+- **`qwen4_exp` is WIRED to the seam and now REACHED.** The entry below recorded
+  it as unreached, which was accurate until this gate ran: the wiring is
+  `qwen4_exp_forward.cpp` routing its MoE step through `RunMoePlacedPair` with
+  the `qwen3_moe.cpp` adapter verbatim, and the `cpu_moe` arm above executes it
+  on a real checkpoint at 5.239e-06. What made that possible was three CUDA fixes
+  landing meanwhile — `#2449` (inject-weight residency), `a4ced1b13` (rmsnorm
+  widened gamma) and `a578705e9` (device-aware `quant_repack`) — after which the
+  `cudaMemcpyAsync: illegal memory access` seen earlier did not recur, so it was
+  a symptom of those rather than a fourth defect.
 
   What is NOT proven is that anything reaches it. The forward needs a
   `qwen4_exp` GGUF, and the only one available is `Qwen3.8-2.4T-A95B UD-Q1_0` at

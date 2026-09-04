@@ -517,7 +517,13 @@ TEST_CASE("A2-2: the device result moves without losing or double-freeing its bu
 // token case in this file stays green, which is the point: the tokens never
 // moved on this backend either.
 TEST_CASE("A2-2 repair: two live verifies own SEPARATE argmax scratch") {
-  const VerifyStep small = MakeStep({{1}}, {{1, 2}});
+  // The small step's argmaxes are 9 and 5, which appear NOWHERE in the big
+  // step's [1, 2, 3, 7, 4, 5, 6, 8] at the same row. That is deliberate: with
+  // the small step's obvious fixture ({{1}}, {{1, 2}}) its first two argmaxes
+  // are 1 and 2, which are also the big step's first two, so the value
+  // assertions below held under a shared buffer by pure fixture collision and
+  // only the pointer inequality detected it.
+  const VerifyStep small = MakeStep({{9}}, {{9, 5}});
   const VerifyStep big = MakeStep({{1, 2, 3}, {4, 5, 6}}, {{1, 2, 3, 7}, {4, 5, 6, 8}});
   Queue q = Q();
   Tensor small_logits = Tensor::Contiguous(const_cast<float*>(small.logits.data()), DType::kF32,
@@ -542,11 +548,22 @@ TEST_CASE("A2-2 repair: two live verifies own SEPARATE argmax scratch") {
   // On this backend it is host-readable, so assert the values the accept walk
   // read — the per-row argmaxes of each step's OWN logits, which is what a
   // shared buffer would have lost for the first result.
+  //
+  // WHICH ASSERTION DETECTS THE DEFECT. The pointer inequality above is the
+  // deterministic one and it is the claim to make. The two value reads below
+  // corroborate it: under a shared grow-only buffer they read a block the grow
+  // has already freed, so what they see is whatever the allocator left there —
+  // red in practice, not red by construction. Do not quote a failing-assertion
+  // COUNT for that mutation; a read of freed memory does not have one.
   const int32_t* first_argmax = static_cast<const int32_t*>(first.target_argmax_scratch());
-  CHECK(first_argmax[0] == 1);  // row 0 argmax: request 0's first target token
-  CHECK(first_argmax[1] == 2);  // row 1 argmax: the bonus row
+  CHECK(first_argmax[0] == 9);  // row 0 argmax: request 0's first target token
+  CHECK(first_argmax[1] == 5);  // row 1 argmax: the bonus row
   const int32_t* second_argmax = static_cast<const int32_t*>(second.target_argmax_scratch());
+  // The first two rows differ from the first step's 9 and 5, so the two value
+  // assertions above cannot be satisfied by the big step's buffer. That the
+  // fixtures do not collide is asserted here rather than trusted.
   CHECK(second_argmax[0] == 1);
+  CHECK(second_argmax[1] == 2);
   CHECK(second_argmax[3] == 7);
   CHECK(second_argmax[4] == 4);
   CHECK(second_argmax[7] == 8);
@@ -565,7 +582,7 @@ TEST_CASE("A2-2 repair: two live verifies own SEPARATE argmax scratch") {
   CHECK(big_ns[1] == 4);
   const RejectionSamplerOutput small_out = RejectionSampler::finalize(
       small_sampled, first.width(), small_ns, small.cu_num_logits, {});
-  CHECK(small_out.sampled_token_ids[0] == std::vector<int32_t>{1, 2});
+  CHECK(small_out.sampled_token_ids[0] == std::vector<int32_t>{9, 5});
 }
 
 // ─── A2-2 REPAIR: THE EVENT CHOREOGRAPHY, RUN RATHER THAN READ ──────────────
@@ -575,17 +592,29 @@ TEST_CASE("A2-2 repair: two live verifies own SEPARATE argmax scratch") {
 // `RecordEvent`, `QueueWaitEvent`, `SynchronizeEvent` or a second queue, so the
 // five-call sequence the runner actually issues existed only in inspection.
 //
-// This case issues that sequence — the runner's, call for call and in its order:
-// record a fork event on the MAIN queue, make a SECOND queue wait it, issue both
-// D2H copies on the second queue, record a ready event there, block the host on
-// that event alone, and never synchronize the main queue.
+// This case issues that sequence in the runner's own order: record a fork event
+// on one queue, make a second queue wait it, issue both D2H copies on the second
+// queue, record a ready event there, block the host on that event alone.
 //
-// WHAT IT GATES, exactly: that the sequence is well formed and loses nothing. On
-// this backend every event is a null-handle no-op and `Copy` is a memcpy, so it
-// CANNOT observe an overlap and does not claim one — that is G3/G4 at A2-5 and
-// needs a GPU. A test that "passes" here is a test that the ordering primitives
-// are called on the right queues with the right buffers and the tokens survive.
-TEST_CASE("A2-2 repair: the fork/copy/ready event sequence is token-identical") {
+// WHAT IT GATES, EXACTLY, AND WHAT IT CANNOT. It gates that the five calls
+// compile against the real signatures, are well formed against the real buffers,
+// and lose no tokens: the result is byte-identical to `forward`'s.
+//
+// It does NOT gate that the copy went anywhere. `CpuBackend::CreateQueue`
+// returns `Queue{Device{kCPU, 0}, nullptr}` (src/vt/cpu/cpu_backend.cpp), which
+// is byte-identical to this file's own `Q()` apart from the `id` field that no
+// backend call reads. So `copy_q` and `main_q` are the SAME device and the SAME
+// null handle, and `RecordEvent` / `QueueWaitEvent` / `SynchronizeEvent` are all
+// the `vt::Backend` base no-ops (src/vt/backend.cpp). "The main queue is never
+// synchronized" is therefore not a property this tier can hold — synchronizing
+// `copy_q` here IS synchronizing `main_q` — and issuing the copies on `main_q`
+// instead leaves this case green. That was measured, not assumed. The two-queue
+// structure, and any overlap it buys, is G3/G4 at A2-5 and needs a GPU.
+//
+// The assertion below states that limit executably rather than in prose, so a
+// reader who trusts the comment and a reader who runs the test learn the same
+// thing.
+TEST_CASE("A2-2 repair: the fork/copy/ready call sequence is well formed and token-identical") {
   const VerifyStep s = MakeStep({{}, {1, 2}, {7, 8, 9}},
                                 {{4}, {1, 2, 6}, {7, 3, 9, 5}});
   vt::Backend& backend = vt::GetBackend(DeviceType::kCPU);
@@ -597,20 +626,34 @@ TEST_CASE("A2-2 repair: the fork/copy/ready event sequence is token-identical") 
   Tensor logits = Tensor::Contiguous(const_cast<float*>(s.logits.data()), DType::kF32,
                                      Cpu(), {s.num_logits, static_cast<int64_t>(kVocab)});
   RejectionSampler sampler(3);
-  vllm::v1::RejectionSamplerDeviceOutput dev =
-      sampler.verify(main_q, logits, s.draft_sampled, s.cu_num_logits);
-  const int64_t rows = dev.num_reqs();
-  const int64_t width = dev.width();
-  std::vector<int32_t> host_sampled(static_cast<size_t>(rows * width));
-  std::vector<int32_t> host_num_sampled(static_cast<size_t>(rows));
+  std::vector<int32_t> host_sampled;
+  std::vector<int32_t> host_num_sampled;
+  int64_t width = 0;
+  {
+    vllm::v1::RejectionSamplerDeviceOutput dev =
+        sampler.verify(main_q, logits, s.draft_sampled, s.cu_num_logits);
+    const int64_t rows = dev.num_reqs();
+    width = dev.width();
+    host_sampled.assign(static_cast<size_t>(rows * width), 0);
+    host_num_sampled.assign(static_cast<size_t>(rows), 0);
 
-  backend.RecordEvent(fork, main_q);
-  backend.QueueWaitEvent(copy_q, fork);
-  dev.CopyToHost(copy_q, host_sampled.data(), host_num_sampled.data());
-  backend.RecordEvent(ready, copy_q);
-  backend.SynchronizeEvent(ready);
-  // The main queue is NOT synchronized anywhere in this case, which is the one
-  // structural property the route exists for.
+    // THE LIMIT, ASSERTED. On this tier the "second" queue is the same device and
+    // the same handle as the main one, so nothing below can distinguish them and
+    // this case makes no claim that it does.
+    CHECK(copy_q.device.type == main_q.device.type);
+    CHECK(copy_q.device.index == main_q.device.index);
+    CHECK(copy_q.handle == main_q.handle);
+
+    backend.RecordEvent(fork, main_q);
+    backend.QueueWaitEvent(copy_q, fork);
+    dev.CopyToHost(copy_q, host_sampled.data(), host_num_sampled.data());
+    backend.RecordEvent(ready, copy_q);
+    backend.SynchronizeEvent(ready);
+    // `dev` is destroyed HERE: after the wait and while both queues are still
+    // alive. That is the order its destructor requires — it drains the queues its
+    // work is on before it frees (see rejection_sampler.h) — and it is the order
+    // A2-4 has to keep when it moves the wait.
+  }
 
   const RejectionSamplerOutput out = RejectionSampler::finalize(
       host_sampled, width, host_num_sampled, s.cu_num_logits, {});
@@ -624,6 +667,158 @@ TEST_CASE("A2-2 repair: the fork/copy/ready event sequence is token-identical") 
   backend.DestroyEvent(fork);
   backend.DestroyEvent(ready);
   backend.DestroyQueue(copy_q);
+}
+
+// ─── A2-2 REPAIR: THE DESTRUCTOR DRAINS BEFORE IT FREES ─────────────────────
+//
+// A fresh review found the ownership invariant said WHICH buffers the object
+// owns and never said WHEN it may free them. `Release` called `Free` on all
+// three device buffers with no wait of any kind, which is the `g_reject_argmax`
+// defect relocated from the backend into this object's own scope.
+//
+// The caller that makes it real already exists. On the copy-queue route in
+// `GPUModelRunner::sample_tokens_async` the device result is a block-scoped
+// local, and A2-4's stated job is to move `SynchronizeEvent(verify_ready_event_)`
+// past `propose_drafts`. Move it past that closing brace and the destructor
+// frees `sampled_`, `num_sampled_` and `target_argmax_` while the D2H copy is
+// still writing them: a garbage accept prefix, wrong emitted ids, nothing
+// raised, and invisible to every token gate here because the verify is lossless.
+//
+// So the destructor now drains the queues the object's own work is on — the
+// verify queue, and the queue of the last `CopyToHost` when that differs —
+// before it frees. On CPU `Backend::Synchronize` is the base no-op, so no CPU
+// test can turn the defect into a wrong token. What IS observable is the CALL
+// ORDER, and that is the property the fix installs.
+//
+// RED-first, by mutation: deleting the two `Synchronize` calls from `Release`
+// (its shape before this repair) makes `log[0]` a `free` and reds the three
+// ordering assertions across the two cases below — measured, 2 cases and 3
+// assertions failed, exit 1 — while every token case in this file stays green.
+namespace {
+
+// Forwards every backend call to the registered CPU backend and records the
+// order of the two this case is about. The op table dispatches by DEVICE TYPE
+// and not through `vt::Backend` (src/vt/ops.cpp), so the real CPU accept-walk
+// kernel still runs underneath the spy.
+class OrderSpyBackend final : public vt::Backend {
+ public:
+  explicit OrderSpyBackend(vt::Backend& inner) : inner_(inner) {}
+
+  std::vector<std::string> log;
+
+  void* Alloc(size_t bytes) override { return inner_.Alloc(bytes); }
+  void Free(void* p) override {
+    log.emplace_back("free");
+    inner_.Free(p);
+  }
+  void Memset(Queue& q, void* p, int value, size_t bytes) override {
+    inner_.Memset(q, p, value, bytes);
+  }
+  void Copy(Queue& q, void* dst, const void* src, size_t bytes) override {
+    log.emplace_back("copy");
+    inner_.Copy(q, dst, src, bytes);
+  }
+  Queue CreateQueue() override { return inner_.CreateQueue(); }
+  void Synchronize(Queue& q) override {
+    log.emplace_back("sync:" + std::to_string(q.id));
+    inner_.Synchronize(q);
+  }
+  bool UnifiedMemory() const override { return inner_.UnifiedMemory(); }
+
+ private:
+  vt::Backend& inner_;
+};
+
+// Installs a backend for kCPU and restores whatever was there, so the rest of
+// this binary is unaffected however the case exits.
+class CpuBackendSwap {
+ public:
+  explicit CpuBackendSwap(vt::Backend& replacement)
+      : prev_(&vt::GetBackend(DeviceType::kCPU)) {
+    vt::RegisterBackend(DeviceType::kCPU, &replacement);
+  }
+  ~CpuBackendSwap() { vt::RegisterBackend(DeviceType::kCPU, prev_); }
+  CpuBackendSwap(const CpuBackendSwap&) = delete;
+  CpuBackendSwap& operator=(const CpuBackendSwap&) = delete;
+
+ private:
+  vt::Backend* prev_;
+};
+
+}  // namespace
+
+TEST_CASE("A2-2 repair: the device result drains BOTH its queues before it frees") {
+  const VerifyStep s = MakeStep({{1, 2}}, {{1, 2, 6}});
+  vt::Backend& real = vt::GetBackend(DeviceType::kCPU);
+  OrderSpyBackend spy(real);
+  Queue main_q = Q();
+  Queue copy_q = real.CreateQueue();
+  REQUIRE(main_q.id != copy_q.id);  // distinguishable HERE even though the
+                                    // backend cannot act on the difference
+  Tensor logits = Tensor::Contiguous(const_cast<float*>(s.logits.data()), DType::kF32,
+                                     Cpu(), {s.num_logits, static_cast<int64_t>(kVocab)});
+  RejectionSampler sampler(3);
+  std::vector<int32_t> host_sampled;
+  std::vector<int32_t> host_num_sampled;
+  int64_t width = 0;
+
+  {
+    CpuBackendSwap swap(spy);
+    vllm::v1::RejectionSamplerDeviceOutput dev =
+        sampler.verify(main_q, logits, s.draft_sampled, s.cu_num_logits);
+    width = dev.width();
+    host_sampled.assign(static_cast<size_t>(dev.num_reqs() * dev.width()), 0);
+    host_num_sampled.assign(static_cast<size_t>(dev.num_reqs()), 0);
+    dev.CopyToHost(copy_q, host_sampled.data(), host_num_sampled.data());
+    // Everything up to here is setup; the destructor is what this case asserts.
+    spy.log.clear();
+  }  // `dev` dies here, still under the swap and with both queues alive.
+
+  // The drain comes FIRST, and it names both queues the object's work is on.
+  REQUIRE(spy.log.size() >= 3);
+  CHECK(spy.log[0] == "sync:" + std::to_string(main_q.id));
+  CHECK(spy.log[1] == "sync:" + std::to_string(copy_q.id));
+  CHECK(spy.log[2] == "free");
+  // Nothing is freed early and drained afterwards.
+  size_t frees = 0;
+  bool sync_after_first_free = false;
+  for (const std::string& entry : spy.log) {
+    if (entry == "free") {
+      ++frees;
+    } else if (frees > 0 && entry.rfind("sync:", 0) == 0) {
+      sync_after_first_free = true;
+    }
+  }
+  CHECK(frees >= 3);  // sampled, num_sampled, target_argmax
+  CHECK_FALSE(sync_after_first_free);
+
+  // And the tokens the copy delivered are still the right ones, so the drain is
+  // not standing in for a case that stopped computing anything.
+  CHECK(host_num_sampled[0] == 3);
+  const RejectionSamplerOutput out = RejectionSampler::finalize(
+      host_sampled, width, host_num_sampled, s.cu_num_logits, {});
+  CHECK(out.sampled_token_ids[0] == std::vector<int32_t>{1, 2, 6});
+}
+
+TEST_CASE("A2-2 repair: a device result that was never copied drains ONE queue") {
+  const VerifyStep s = MakeStep({{1, 2}}, {{1, 2, 6}});
+  vt::Backend& real = vt::GetBackend(DeviceType::kCPU);
+  OrderSpyBackend spy(real);
+  Queue main_q = Q();
+  Tensor logits = Tensor::Contiguous(const_cast<float*>(s.logits.data()), DType::kF32,
+                                     Cpu(), {s.num_logits, static_cast<int64_t>(kVocab)});
+  RejectionSampler sampler(3);
+
+  {
+    CpuBackendSwap swap(spy);
+    vllm::v1::RejectionSamplerDeviceOutput dev =
+        sampler.verify(main_q, logits, s.draft_sampled, s.cu_num_logits);
+    spy.log.clear();
+  }
+
+  REQUIRE(spy.log.size() >= 2);
+  CHECK(spy.log[0] == "sync:" + std::to_string(main_q.id));
+  CHECK(spy.log[1] == "free");  // exactly one drain: there is no copy queue
 }
 
 // SKIPPED (test-porting rule 6), tracked to M-mtp-3 (spec §5):

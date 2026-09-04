@@ -1301,6 +1301,430 @@ def section_upsampler(out) -> None:
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Section 8b — the latent upsampler's BFLOAT16 arm (A24 wave 5, row
+# LTX25-A24-UPSAMPLER-BF16, issue #2857)
+#
+# Upstream resolves ONE pipeline dtype and it is bfloat16 (`distilled.py:109`),
+# handed to the latent upsampler it constructs at `:138-141`. Section 8 above is
+# the f32 PARITY arm and stays exactly as it was — same arms, same parameter
+# stream, same latents, same tolerances. This section runs the SAME modules with
+# one dtype changed, so the two differ in dtype and in nothing else.
+#
+# WHAT THIS SECTION CANNOT DO, stated before what it does. Upstream's own bf16
+# `Conv3d` differs from the same convolution run on f32 inputs in 2 of 3840
+# elements, because oneDNN picks a different blocking for the bf16 path, and the
+# next `GroupNorm` amplifies those two into 382 of 720 at the temporal arm's
+# output. No accumulation order reproduces that, so the chain is gated by a BAND
+# and not bit-exactly, and the band is only trustworthy because every rejected
+# rule is measured beside it and emitted here as a number the suite compares
+# against.
+#
+# THE SIXTH ARM EXISTS FOR ONE RULE. `torch.nn.GroupNorm`'s `eps` is a plain
+# Python attribute, so `.to(bfloat16)` does not narrow it — unlike a registered
+# buffer, which it does. That difference is invisible while the variance is order
+# 1, because bf16's `1e-5` and f32's differ by ~1.3e-8 and that is under an f32
+# ulp at 1.0. `SmallVar` scales the latent by 1e-2 so the first GroupNorm sees a
+# small variance and the width becomes observable: measured 912 of 1152 elements,
+# a correct chain at 6.1e-05 against a bf16-eps chain at 2.44e-02. A probe at a
+# convenient scale is a mute switch, which this campaign has now paid for twice.
+# ---------------------------------------------------------------------------
+
+# CHOSEN BY A SWEEP, AND THE SWEEP IS THE POINT. R3 needs a small GroupNorm
+# variance to be observable at all, and that is exactly the regime where the
+# chain's own amplification is chaotic: a near-constant conv output makes
+# `1/sqrt(var + eps)` enormous and turns upstream's 2-in-3840 convolution
+# difference into an output-scale one. Measured at this fixture's parameter draw,
+# max|delta| of the port's rules from upstream against the nearest rejected rule:
+#
+#   scale   correct     nearest rejected   all four rules separate?
+#   1.0     0.00390625  0.00390625         no  (R5 and R3 invisible)
+#   0.2     0.00390625  0.00390625         no  (R4 invisible)
+#   0.05    0.00390625  0.017578125        YES
+#   0.02    0.0         0.015625           YES  <- this one
+#   0.01    0.01171875  0.01171875         no  (R4 invisible)
+#   0.002   0.0         0.0126953125       YES
+#
+# 0.02 is the LARGEST scale at which the chain is BIT-EXACT and all four rules
+# separate, so it is picked for those two properties and not for being small.
+# Neighbouring scales failing is not a fragility that can ship: the generator
+# REFUSES to emit an arm whose rules do not separate, so a pin that moved this
+# reds here instead of quietly widening the gate.
+_UPS_BF16_SMALL_SCALE = 2e-2
+
+
+def _ups_bf16_arms():
+    """(tag, kwargs, latent_name, frames, latent_scale) for every bf16 arm."""
+    return (
+        ("PixelShuffle", dict(dims=3, spatial_upsample=True, temporal_upsample=False,
+                              rational_resampler=False, spatial_scale=2.0),
+         "ltx2.ups.latent", _UPS_F, 1.0),
+        ("Rational2", dict(dims=3, spatial_upsample=True, temporal_upsample=False,
+                           rational_resampler=True, spatial_scale=2.0),
+         "ltx2.ups.latent", _UPS_F, 1.0),
+        ("Rational1p5", dict(dims=3, spatial_upsample=True, temporal_upsample=False,
+                             rational_resampler=True, spatial_scale=1.5),
+         "ltx2.ups.latent", _UPS_F, 1.0),
+        ("Temporal", dict(dims=3, spatial_upsample=False, temporal_upsample=True,
+                          rational_resampler=False, spatial_scale=2.0),
+         "ltx2.ups.temporal.latent", _UPS_TEMPORAL_F, 1.0),
+        ("Dims2", dict(dims=2, spatial_upsample=True, temporal_upsample=False,
+                       rational_resampler=False, spatial_scale=2.0),
+         "ltx2.ups.dims2.latent", _UPS_TEMPORAL_F, 1.0),
+        ("SmallVar", dict(dims=3, spatial_upsample=True, temporal_upsample=False,
+                          rational_resampler=False, spatial_scale=2.0),
+         "ltx2.ups.latent", _UPS_F, _UPS_BF16_SMALL_SCALE),
+    )
+
+
+def section_upsampler_bf16(out) -> None:
+    import torch  # noqa: PLC0415
+    import torch.nn.functional as Fn  # noqa: PLC0415
+    from einops import rearrange  # noqa: PLC0415
+
+    from ltx_core.model.upsampler.blur_downsample import BlurDownsample  # noqa: PLC0415
+    from ltx_core.model.upsampler.model import LatentUpsampler  # noqa: PLC0415
+    from ltx_core.model.upsampler.spatial_rational_resampler import (  # noqa: PLC0415
+        SpatialRationalResampler,
+    )
+    from ltx_core.model.video_vae.ops import PerChannelStatistics  # noqa: PLC0415
+
+    section(out, "Section 8b - the latent upsampler at BFLOAT16 (A24 wave 5)")
+    bf = torch.bfloat16
+    eps_f32 = 1e-5
+    eps_bf16 = float(torch.tensor(eps_f32, dtype=bf))
+
+    # ---- the five rules, as switchable simulations of the C++ loop ----------
+    #
+    # Each flag turns ONE rule into the alternative the port rejects. Running the
+    # whole chain with a flag set is what produces the distance the band must sit
+    # under; running it with none set is what proves the port's own rules are the
+    # ones upstream uses.
+    rules = dict(silu_pre_round=False, add_no_round=False, gn_double_round=False,
+                 gn_bf16_eps=False, stats_one_round=False)
+
+    def rnd(t):
+        return t.to(bf)
+
+    def wide(t):
+        return t.float()
+
+    def gn32(x, w, b):
+        shape = x.shape
+        channels = shape[1]
+        rows = wide(x).reshape(shape[0], 32, -1)
+        mean = rows.mean(-1, keepdim=True)
+        var = rows.var(-1, unbiased=False, keepdim=True)
+        eps = eps_bf16 if rules["gn_bf16_eps"] else eps_f32
+        norm = ((rows - mean) / torch.sqrt(var + eps)).reshape(shape)
+        if rules["gn_double_round"]:
+            norm = wide(rnd(norm))
+        view = [1, channels] + [1] * (len(shape) - 2)
+        return rnd(norm * wide(w).reshape(view) + wide(b).reshape(view))
+
+    def silu(x):
+        sig = torch.sigmoid(wide(x))
+        if rules["silu_pre_round"]:
+            sig = wide(rnd(sig))
+        return rnd(wide(x) * sig)
+
+    def cv(x, w, b, two_d):
+        fn = Fn.conv2d if two_d else Fn.conv3d
+        return rnd(fn(wide(x), wide(w), wide(b), padding=1))
+
+    def resblock(x, blk, two_d):
+        residual = x
+        y = cv(x, blk.conv1.weight, blk.conv1.bias, two_d)
+        y = gn32(y, blk.norm1.weight, blk.norm1.bias)
+        y = silu(y)
+        y = cv(y, blk.conv2.weight, blk.conv2.bias, two_d)
+        y = gn32(y, blk.norm2.weight, blk.norm2.bias)
+        if rules["add_no_round"]:
+            total = wide(y) + wide(residual)
+            return rnd(total * torch.sigmoid(total))
+        return silu(rnd(wide(y) + wide(residual)))
+
+    def simulate(module, latent):
+        batch, _, frames, _, _ = latent.shape
+        two_d = module.dims == 2
+        x = rearrange(latent, "b c f h w -> (b f) c h w") if two_d else latent
+        x = cv(x, module.initial_conv.weight, module.initial_conv.bias, two_d)
+        x = gn32(x, module.initial_norm.weight, module.initial_norm.bias)
+        x = silu(x)
+        for blk in module.res_blocks:
+            x = resblock(x, blk, two_d)
+        if not two_d and module.temporal_upsample:
+            x = cv(x, module.upsampler[0].weight, module.upsampler[0].bias, False)
+            x = rearrange(x, "b (c p1) f h w -> b c (f p1) h w", p1=2)[:, :, 1:]
+        elif isinstance(module.upsampler, SpatialRationalResampler):
+            res = module.upsampler
+            x = rearrange(x, "b c f h w -> (b f) c h w")
+            x = cv(x, res.conv.weight, res.conv.bias, True)
+            x = rearrange(x, "b (c p1 p2) h w -> b c (h p1) (w p2)", p1=res.num, p2=res.num)
+            if res.den != 1:
+                size = res.blur_down.kernel_size
+                kernel = wide(res.blur_down.kernel).expand(x.shape[1], 1, size, size)
+                x = rnd(Fn.conv2d(wide(x), kernel, None, stride=res.den,
+                                  padding=size // 2, groups=x.shape[1]))
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=batch, f=frames)
+        else:
+            if not two_d:
+                x = rearrange(x, "b c f h w -> (b f) c h w")
+            x = cv(x, module.upsampler[0].weight, module.upsampler[0].bias, True)
+            x = rearrange(x, "b (c p1 p2) h w -> b c (h p1) (w p2)", p1=2, p2=2)
+            if not two_d:
+                x = rearrange(x, "(b f) c h w -> b c f h w", b=batch, f=frames)
+        for blk in module.post_upsample_res_blocks:
+            x = resblock(x, blk, two_d)
+        x = cv(x, module.final_conv.weight, module.final_conv.bias, two_d)
+        if two_d:
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=batch, f=frames)
+        return x
+
+    rule_names = ("silu_pre_round", "add_no_round", "gn_double_round", "gn_bf16_eps")
+    coverage: list[list[int]] = []
+    emit_i64(out, "kLtx2UpsBf16RuleCount", [len(rule_names)])
+    out.write("// The rejected rules, in the order every `RejectedMaxAbs` row lists\n")
+    out.write("// them: R4 (sigmoid narrowed before the multiply), R5 (the residual\n")
+    out.write("// add kept at compute width), R2 (the normalized value rounded before\n")
+    out.write("// the affine) and R3 (the epsilon narrowed to bf16).\n\n")
+
+    for tag, kwargs, latent_name, frames, scale in _ups_bf16_arms():
+        count = _UPS_IN * frames * _UPS_H * _UPS_W
+        latent = torch.from_numpy(make(latent_name, count, 1.0)).reshape(
+            1, _UPS_IN, frames, _UPS_H, _UPS_W
+        )
+        # `SmallVar` differs from `PixelShuffle` in the LATENT SCALE and in
+        # nothing else -- same module, same prefix, same stream -- so a
+        # difference between the two arms is the scale and cannot be anything
+        # else.
+        latent = (latent * scale).to(bf)
+        emit_f32(out, f"kLtx2UpsBf16{tag}Latent", latent.float().numpy())
+        # The scale as a VALUE the C++ side reads, so the two sides cannot drift
+        # into building the same-named arm from different inputs.
+        emit_f64(out, f"kLtx2UpsBf16{tag}Scale", [scale])
+
+        module = LatentUpsampler(
+            in_channels=_UPS_IN,
+            mid_channels=_UPS_MID,
+            num_blocks_per_stage=_UPS_BLOCKS,
+            **kwargs,
+        )
+        module.eval()
+        # The f32 arm's OWN prefix, so the two arms share every parameter value
+        # and differ only in the dtype they are stored and computed at.
+        fill_module(module, f"ltx2.ups.{'PixelShuffle' if tag == 'SmallVar' else tag}.")
+        module = module.to(bf)
+        with torch.no_grad():
+            golden = module(latent)
+        emit_i64(out, f"kLtx2UpsBf16{tag}OutShape", list(golden.shape))
+        emit_f32(out, f"kLtx2UpsBf16{tag}Golden", golden.float().numpy())
+
+        # The port's OWN rules, simulated, and the four it rejects. The first is
+        # what the band has to admit and the rest are what it has to exclude.
+        for key in rules:
+            rules[key] = False
+        with torch.no_grad():
+            correct = float((golden.float() - simulate(module, latent).float()).abs().max())
+        rejected = []
+        for name in rule_names:
+            for key in rules:
+                rules[key] = False
+            rules[name] = True
+            with torch.no_grad():
+                rejected.append(
+                    float((golden.float() - simulate(module, latent).float()).abs().max())
+                )
+        for key in rules:
+            rules[key] = False
+
+        # WHICH RULES THIS ARM CAN SEE, decided by measurement and per arm.
+        #
+        # No single arm sees all four, and pretending otherwise is how a mute
+        # switch gets shipped with a number beside it. R3 in particular is
+        # invisible on every arm whose GroupNorm sees a variance of order 1 --
+        # which, on the first attempt at this section, made the generator refuse
+        # `PixelShuffle` outright with `gn_bf16_eps` at 0.00390625 against a
+        # correct chain at exactly 0.00390625. That refusal is why `SmallVar`
+        # exists. A rule counts as SEPARATED here only if its distance clears
+        # this arm's band by the 4x margin below, so a rule that merely differs
+        # in the last bit does not get counted as gated.
+        band = 4.0 * correct if correct > 0.0 else 0.0
+        separates = [1 if d > max(band, correct) and d > 0.0 else 0 for d in rejected]
+        emit_f64(out, f"kLtx2UpsBf16{tag}CorrectMaxAbs", [correct])
+        emit_f64(out, f"kLtx2UpsBf16{tag}Band", [band])
+        emit_f64(out, f"kLtx2UpsBf16{tag}RejectedMaxAbs", rejected)
+        emit_i64(out, f"kLtx2UpsBf16{tag}Separates", separates)
+        coverage.append(separates)
+
+    # EVERY RULE IS SEPARATED BY AT LEAST ONE ARM, checked here rather than
+    # assumed. This is the assertion the per-arm one could not make: a rule no arm
+    # can see is not gated at all, and the section refuses to emit rather than
+    # ship four goldens that together prove three rules.
+    for index, name in enumerate(rule_names):
+        if not any(row[index] for row in coverage):
+            raise ValueError(
+                f"upsampler bf16: the rejected rule '{name}' is separated by NO arm, so "
+                "nothing in this section can fail when it is wrong. Add an arm that puts "
+                "the rule where it parts, or stop claiming it is gated."
+            )
+    emit_i64(out, "kLtx2UpsBf16RuleCoverage",
+             [sum(row[i] for row in coverage) for i in range(len(rule_names))])
+
+    # ---- R6: the blur kernel is a REGISTERED BUFFER, so it narrows ----------
+    #
+    # The rule that reads as a no-op and is not. At the pinned `kernel_size = 5`
+    # every entry is a dyadic rational bf16 holds exactly, so the narrowing moves
+    # nothing THERE; 9 and 11 are the control that proves the site is live and
+    # this probe is not blind.
+    narrowed_entries = []
+    for size in (3, 5, 7, 9, 11):
+        f32_kernel = BlurDownsample(dims=2, stride=2, kernel_size=size).kernel
+        bf16_kernel = BlurDownsample(dims=2, stride=2, kernel_size=size).to(bf).kernel
+        if bf16_kernel.dtype != bf:
+            raise ValueError(
+                f"BlurDownsample.kernel did not narrow at kernel_size={size}: it is "
+                f"{bf16_kernel.dtype}. R6 rests on this buffer being registered "
+                "(blur_downsample.py:33); if it stopped being one the rule is wrong."
+            )
+        narrowed_entries.append(int((bf16_kernel.float() != f32_kernel).sum()))
+        if size == kernel_size_pinned():
+            emit_f32(out, "kLtx2UpsBf16BlurKernel", bf16_kernel.float().numpy())
+    if narrowed_entries[:3] != [0, 0, 0] or narrowed_entries[3] == 0:
+        raise ValueError(
+            "R6's control has changed: narrowing was expected to be exact at kernel_size "
+            f"3, 5 and 7 and lossy at 9, and it measured {narrowed_entries}. The claim "
+            "'the pinned width is the quiet one' is then unproven."
+        )
+    emit_i64(out, "kLtx2UpsBf16BlurKernelSizes", [3, 5, 7, 9, 11])
+    emit_i64(out, "kLtx2UpsBf16BlurNarrowedEntries", narrowed_entries)
+
+    # ---- R7: PerChannelStatistics narrows BOTH buffers and rounds TWICE -----
+    stats = PerChannelStatistics(_UPS_IN)
+    std_f32 = torch.from_numpy(make("ltx2.ups.bf16.std", _UPS_IN, 0.5, 1.0))
+    mean_f32 = torch.from_numpy(make("ltx2.ups.bf16.mean", _UPS_IN, 0.5))
+    with torch.no_grad():
+        stats.get_buffer("std-of-means").copy_(std_f32)
+        stats.get_buffer("mean-of-means").copy_(mean_f32)
+    # CAPTURED BEFORE THE CAST. Reading a parameter after `.to(bfloat16)` narrows
+    # it in place and yields a probe that compares a value with itself -- the trap
+    # four sessions in this campaign have hit.
+    std_before = stats.get_buffer("std-of-means").clone()
+    mean_before = stats.get_buffer("mean-of-means").clone()
+    stats_bf = stats.to(bf)
+    if stats_bf.get_buffer("std-of-means").dtype != bf:
+        raise ValueError("PerChannelStatistics' buffers did not narrow; R7(a) is unproven")
+    emit_f32(out, "kLtx2UpsBf16StatsStd", std_before.numpy())
+    emit_f32(out, "kLtx2UpsBf16StatsMean", mean_before.numpy())
+
+    stats_count = _UPS_IN * _UPS_F * _UPS_H * _UPS_W
+    stats_in = torch.from_numpy(make("ltx2.ups.bf16.stats.in", stats_count, 1.0)).reshape(
+        1, _UPS_IN, _UPS_F, _UPS_H, _UPS_W
+    ).to(bf)
+    emit_f32(out, "kLtx2UpsBf16StatsIn", stats_in.float().numpy())
+    with torch.no_grad():
+        un_normalized = stats_bf.un_normalize(stats_in)
+        re_normalized = stats_bf.normalize(un_normalized)
+    emit_f32(out, "kLtx2UpsBf16StatsUnNormalized", un_normalized.float().numpy())
+    emit_f32(out, "kLtx2UpsBf16StatsReNormalized", re_normalized.float().numpy())
+
+    # The two alternatives, each emitted as a SEPARATING COUNT rather than as a
+    # tensor: the C++ case asserts it reproduces upstream AND that these are not
+    # zero, so a rule that stopped separating fails here instead of going quiet.
+    std_bf = stats_bf.get_buffer("std-of-means").float().view(1, -1, 1, 1, 1)
+    mean_bf = stats_bf.get_buffer("mean-of-means").float().view(1, -1, 1, 1, 1)
+    std_wide = std_before.view(1, -1, 1, 1, 1)
+    mean_wide = mean_before.view(1, -1, 1, 1, 1)
+    wide_in = stats_in.float()
+    one_round = (wide_in * std_bf + mean_bf).to(bf)
+    wide_stats = ((wide_in * std_wide).to(bf).float() + mean_wide).to(bf)
+
+    def words_differing(a, b):
+        return int((a.view(torch.int16) != b.view(torch.int16)).sum())
+
+    separating = [words_differing(un_normalized, one_round),
+                  words_differing(un_normalized, wide_stats)]
+    if min(separating) == 0:
+        raise ValueError(
+            "R7's alternatives stopped separating at this fixture "
+            f"({separating}); the golden would then accept the rule it rejects."
+        )
+    emit_i64(out, "kLtx2UpsBf16StatsSeparating", separating)
+
+    # ---- `upsample_video` ITSELF, which is the only shape production calls ---
+    #
+    # The isolated tensors above are evidence; THIS is the gate. A first version
+    # of the C++ case asserted only that the result reported bf16 and carried
+    # bf16-representable values, and a mutation that fused R7's two roundings
+    # into one PASSED it -- a claimed guarantee that nothing measured, which is
+    # the failure every earlier wave of A24 shipped once. Only a golden over the
+    # whole function can see the rule.
+    #
+    # `upsample_video`'s body is executed rather than its wrapper (model.py:140-142
+    # is three lines and its `video_encoder` argument is read for exactly one
+    # attribute). The modules are upstream's own; what is not executed is the
+    # signature around them, and that is stated rather than glossed.
+    ups_module = LatentUpsampler(
+        in_channels=_UPS_IN,
+        mid_channels=_UPS_MID,
+        num_blocks_per_stage=_UPS_BLOCKS,
+        dims=3,
+        spatial_upsample=True,
+        temporal_upsample=False,
+        spatial_scale=2.0,
+        rational_resampler=False,
+    )
+    ups_module.eval()
+    fill_module(ups_module, "ltx2.ups.PixelShuffle.")
+    ups_module = ups_module.to(bf)
+    with torch.no_grad():
+        video_golden = stats_bf.normalize(ups_module(stats_bf.un_normalize(stats_in)))
+    emit_i64(out, "kLtx2UpsBf16UpsampleVideoOutShape", list(video_golden.shape))
+    emit_f32(out, "kLtx2UpsBf16UpsampleVideoGolden", video_golden.float().numpy())
+
+    # The two R7 alternatives run through the SAME whole function, so the C++
+    # case can assert its band excludes each of them rather than trusting that a
+    # rule which separates in isolation still separates here.
+    def upsample_video_with(un_fn, re_fn):
+        with torch.no_grad():
+            return re_fn(ups_module(un_fn(stats_in)))
+
+    def un_one_round(x):
+        return (x.float() * std_bf + mean_bf).to(bf)
+
+    def re_one_round(x):
+        return ((x.float() - mean_bf) / std_bf).to(bf)
+
+    def un_wide_stats(x):
+        return ((x.float() * std_wide).to(bf).float() + mean_wide).to(bf)
+
+    def re_wide_stats(x):
+        return ((x.float() - mean_wide).to(bf).float() / std_wide).to(bf)
+
+    video_rejected = [
+        float((video_golden.float()
+               - upsample_video_with(un_one_round, re_one_round).float()).abs().max()),
+        float((video_golden.float()
+               - upsample_video_with(un_wide_stats, re_wide_stats).float()).abs().max()),
+    ]
+    if min(video_rejected) <= 0.0:
+        raise ValueError(
+            "R7's alternatives do not move `upsample_video`'s own output "
+            f"({video_rejected}); a golden over it would then gate nothing."
+        )
+    emit_f64(out, "kLtx2UpsBf16UpsampleVideoRejectedMaxAbs", video_rejected)
+
+
+def kernel_size_pinned() -> int:
+    """`BlurDownsample.__init__`'s own default, read off upstream's signature."""
+    import inspect  # noqa: PLC0415
+
+    from ltx_core.model.upsampler.blur_downsample import BlurDownsample  # noqa: PLC0415
+
+    return int(inspect.signature(BlurDownsample.__init__).parameters["kernel_size"].default)
+
+
 # ---------------------------------------------------------------------------
 # Section 9 — the duration head (duration_head/duration_head.py)
 # ---------------------------------------------------------------------------
@@ -1844,6 +2268,7 @@ def main() -> int:
         section_patchifiers(out)
         section_recipes(out, root, omni_root)
         section_upsampler(out)
+        section_upsampler_bf16(out)
         section_duration_head(out)
         section_connector(out)
         section_connector_bf16(out)

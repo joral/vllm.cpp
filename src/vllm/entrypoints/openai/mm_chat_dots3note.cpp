@@ -29,10 +29,14 @@
 // install path; reaching for them here would put it back one layer down. What
 // IS shared is everything that is not per-architecture: `ValidateChatMmLimits`
 // (the per-item limit walk), `DecodeImageUrlPart` (the data-URI decode),
-// `BaseProcessingInfo` (the `--limit-mm-per-prompt` fold) and
-// `multimodal::ExpandImagePlaceholders` (the expansion rule, which is upstream's
-// same `prod(grid) // merge**2` for both models).
+// `BaseProcessingInfo` (the `--limit-mm-per-prompt` fold) and, since W8a
+// (#2860), `multimodal::ApplyPromptReplacements` — upstream's own list of
+// per-modality `PromptReplacement`s applied in ONE pass over the id stream
+// (`vllm/multimodal/processing/processor.py:944-957` @ `9035151d6`), which is
+// what lets ONE request carry more than one `mm_feature`.
 #include <filesystem>
+#include <array>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -47,7 +51,7 @@
 #include "vllm/multimodal/processing/context.h"
 #include "vllm/model_executor/models/dots3_note_audio.h"   // the audio refusal
 #include "vllm/model_executor/models/dots3_note_vision.h"  // the tower refusal
-#include "vllm/multimodal/qwen3vl_processor.h"  // ExpandImagePlaceholders
+#include "vllm/multimodal/processing/processor.h"  // the one-pass applier
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/engine/validation_error.h"  // a bad upload is a 400, not a 500
@@ -86,7 +90,8 @@ std::string PathUtf8(const fs::path& path) {
 
 // `get_placeholder_str` (`nvidia/multimodal.py:65-68` @ `9035151d6`), the image
 // branch. The SINGLE `<|imgpad|>` in the middle is what the tokenizer maps to
-// ONE `image_token_id`, which `ExpandImagePlaceholders` then expands to N.
+// ONE `image_token_id`, and the three together are the TARGET the image rule
+// matches (`common/processor.py:749-756` @ `9035151d6`).
 std::string Dots3NoteImageMarker() {
   return "<|img|><|imgpad|><|endofimg|>";
 }
@@ -135,62 +140,93 @@ std::string BuildDots3NoteMarkerContent(const ChatMessage& message,
 }
 
 // This seam's OWN ceiling — the other operand of the `min()` fold
-// (`context.py:392-405`). Upstream's `Dots3NoteProcessingInfo` declares
+// (`context.py:392-405`).
+//
+// W8a (#2860) RAISED IT TO UPSTREAM'S OWN NUMBERS. Upstream's
+// `Dots3NoteProcessingInfo.get_supported_mm_limits` declares
 // `{"image": 512, "video": 1, "audio": 128}` (`common/processor.py:527-534` @
-// `9035151d6`); THIS seam locates exactly ONE image part and, since W7a
-// (#2703), exactly ONE audio part, so the honest ceiling is `{"image": 1,
-// "audio": 1}` and every other modality is ABSENT, which `context.py:414-415`
-// reads as limit 0. A user limit can only LOWER it, so
-// `--limit-mm-per-prompt image=99` still refuses the second image.
+// `9035151d6`). This seam declared `{"image": 1, "audio": 1}` until W8a, and
+// that was the honest ceiling then: it located exactly one part of each kind
+// and the two expanders could not be chained, so a second item could only have
+// been dropped. `ApplyPromptReplacements` consumes one item per target
+// occurrence in ONE pass, so 512 and 128 are now what this seam can actually
+// build.
+//
+// `video` IS DELIBERATELY ABSENT, although upstream declares `{"video": 1}`
+// beside them. `context.py:414-415` reads an absent modality as limit 0, so the
+// entrypoint still refuses a video part with upstream's own "At most 0 video(s)
+// may be provided in one prompt." — byte for byte the refusal this seam
+// produced before W8a. Declaring 1 would promise a capability nothing builds:
+// video decode needs a container demuxer, an H.264/VP9/AV1 bitstream decoder
+// and a JPEG codec, none of which this tree vendors, and it left the row to
+// issue #2814.
 //
 // `has_audio` IS A PARAMETER AND NOT A CONSTANT, because a checkpoint with no
 // `audio_config` has no audio tower and declaring the modality would promise a
-// capability that install could not deliver. VIDEO is W8's; when it lands it
-// raises these numbers and nothing else changes. (W7 IS AUDIO and W8 IS VIDEO —
-// this comment used to say the reverse, against the loader's own deferral
-// table and against #2703's own title.)
+// capability that install could not deliver.
+//
+// A user limit can only LOWER these, so `--limit-mm-per-prompt image=1` is how
+// an operator gets the pre-W8a ceiling back.
 std::map<std::string, std::optional<int>> Dots3NoteChatSupportedMmLimits(
     bool has_audio) {
   std::map<std::string, std::optional<int>> limits{
-      {"image", std::optional<int>(1)}};
-  if (has_audio) limits.emplace("audio", std::optional<int>(1));
+      {"image", std::optional<int>(512)}};
+  if (has_audio) limits.emplace("audio", std::optional<int>(128));
   return limits;
 }
 
-// `RouteImageRgb`'s dots3 twin (`chat_mm.cpp:162-187`): preprocess, expand the
-// single placeholder id to `prod(grid)/merge^2` copies, and build the
-// `mm_features` handle the engine's multimodal generate overload carries onto
-// `Request.mm_features`.
-multimodal::MultiModalInputs RouteDots3NoteImageRgb(
+// ── W8a (#2860): PREPARE, then PLACE. ───────────────────────────────────────
+//
+// Before W8a each of these two functions did both: preprocess ONE item and
+// expand its placeholder, each rebuilding the whole id vector and reporting an
+// offset into the vector IT built. Chaining them over one prompt therefore
+// measured the second one's offsets against the first one's UN-EXPANDED input,
+// which is why the seam refused a mixed request rather than serving it half
+// (spec §4.18.1).
+//
+// The split is upstream's own. `_get_prompt_updates` computes each item's
+// replacement CONTENT (`common/processor.py:740-747` for image, `:768-776` for
+// audio) and hands the whole list to `apply_token_matches`, which is the only
+// thing that decides WHERE anything lands
+// (`processing/processor.py:944-957`). So each `Prepare*` below produces the
+// features, the hash and the placeholder COUNT for one item, and
+// `RouteDots3NoteMultiModal` places every item of every modality in ONE pass.
+
+// One image item, preprocessed but NOT yet placed.
+struct PreparedImage {
+  multimodal::ImageKwargs kwargs;
+  std::string mm_hash;
+  int num_tokens = 0;
+};
+
+// One audio item, the same.
+struct PreparedAudio {
+  multimodal::AudioKwargs kwargs;
+  std::string mm_hash;
+  int num_tokens = 0;
+};
+
+PreparedImage PrepareDots3NoteImage(
     const multimodal::Dots3NoteImageProcessor& proc, const uint8_t* rgb,
-    int64_t height, int64_t width, const std::vector<int32_t>& prompt_ids) {
+    int64_t height, int64_t width) {
   const multimodal::Dots3NoteProcessorConfig& cfg = proc.config();
-  multimodal::ImageKwargs kw = proc.ProcessImage(rgb, height, width);
-  const std::array<int64_t, 3> grid = kw.image_grid_thw;
-
-  std::vector<std::array<int64_t, 3>> grids{grid};
-  std::vector<std::array<int, 2>> placeholders;
-  std::vector<int32_t> expanded = multimodal::ExpandImagePlaceholders(
-      prompt_ids, cfg.image_token_id, cfg.merge_size, grids, &placeholders);
-
-  multimodal::MultiModalInputs out;
-  out.prompt_token_ids = std::move(expanded);
-  if (!placeholders.empty()) {
-    multimodal::MultiModalFeatureSpec spec;
-    spec.modality = "image";
-    spec.offset = placeholders[0][0];
-    spec.length = placeholders[0][1];
-    spec.mm_hash = proc.HashImage(rgb, height, width);
-    spec.data = std::make_shared<multimodal::ImageKwargs>(std::move(kw));
-    out.mm_features.push_back(std::move(spec));
-  }
+  PreparedImage out;
+  out.kwargs = proc.ProcessImage(rgb, height, width);
+  const std::array<int64_t, 3>& grid = out.kwargs.image_grid_thw;
+  const int64_t merge_length =
+      static_cast<int64_t>(cfg.merge_size) * cfg.merge_size;
+  // `image_replacement` (`common/processor.py:743-745` @ `9035151d6`):
+  // `int(grid.prod()) // merge_size**2`. This is the SAME rule
+  // `ExpandImagePlaceholders` applied while walking
+  // (`qwen3vl_processor.cpp:191-192`); it is computed here because the one-pass
+  // applier needs every count BEFORE it can place any span.
+  out.num_tokens =
+      static_cast<int>((grid[0] * grid[1] * grid[2]) / merge_length);
+  out.mm_hash = proc.HashImage(rgb, height, width);
   return out;
 }
 
-// `RouteDots3NoteImageRgb`'s AUDIO twin (W7a, #2703): decode the container,
-// run the front end, expand the single `<|audio_comp_pad|>` id to
-// `ceil(num_samples / token_stride)` copies, and build the `mm_features`
-// handle.
+// `PrepareDots3NoteImage`'s AUDIO twin (W7a, #2703; split out by W8a).
 //
 // WHY THIS IS NOT `RouteAudioWav` (`chat_mm.cpp:131-160`). That function is
 // DEAD in `src/` — nothing outside `tests/` calls it — and its test is the
@@ -198,24 +234,33 @@ multimodal::MultiModalInputs RouteDots3NoteImageRgb(
 // this model in a way no shape check would report: it takes the token count
 // from `AudioProcessorConfig::max_source_positions`, Whisper's FIXED 1500, and
 // dots3's count is `ceil(num_samples / 1280)` and depends on the waveform.
-// Editing it would move another row's gate to serve this one; W7a therefore
-// writes its own, exactly as W6a wrote `RouteDots3NoteImageRgb` rather than
-// editing `RouteImageRgb`.
+// Editing it would move another row's gate to serve this one.
 //
 // THE CONTAINER REFUSAL IS HERE AND NOT IN THE PROCESSOR, because the container
-// is a REQUEST property while the rate is a CONFIG one. `DecodeWavPcm16Mono`
-// already refuses a non-PCM16, non-mono or malformed buffer by name; what this
-// adds is the brick, W7c, so an operator learns what is owed rather than only
-// what failed.
-multimodal::MultiModalInputs RouteDots3NoteAudioWav(
-    const multimodal::Dots3NoteAudioProcessor& proc, const DecodedMedia& audio,
-    const std::vector<int32_t>& prompt_ids) {
-  const multimodal::Dots3NoteAudioProcessorConfig& cfg = proc.config();
-
+// is a REQUEST property while the rate is a CONFIG one.
+// `DecodeWavPcm16MeanToMono` already refuses a non-PCM16 or malformed buffer by
+// name; what this adds is WHO OWES IT, so an operator learns that rather than
+// only what failed.
+//
+// W7c-1 (#2813) and W7c-2 (#2828) NARROWED it, twice. It used to say a
+// multi-channel WAV was owed to W7c and then that a non-16 kHz one was; any
+// channel count is now served, mean-reduced as upstream reduces, and any
+// sampling rate is served, resampled as upstream's own scipy arm resamples. And
+// the container arm left this row entirely: it needs a demuxer this tree does
+// not vendor, five surfaces refuse compressed media for that same missing
+// brick, and #2814 owns it. The refusal stays at the SEAM and stays the SAME
+// predicate as the route, because this throw is HTTP 400 for one request while
+// the same throw from inside `encode_mm` would set `AsyncLLM`'s errored latch
+// and 500 every later request, TEXT ones included.
+PreparedAudio PrepareDots3NoteAudio(
+    const multimodal::Dots3NoteAudioProcessor& proc, const DecodedMedia& audio) {
   multimodal::DecodedAudio decoded;
   try {
-    decoded = multimodal::DecodeWavPcm16Mono(audio.bytes.data(),
-                                             audio.bytes.size());
+    // W7c-1 (#2813): the MEAN-reducing sibling, so a multi-channel PCM16 WAV
+    // at the target rate is SERVED instead of refused. This is the production
+    // call site the reachability mutation deletes.
+    decoded = multimodal::DecodeWavPcm16MeanToMono(audio.bytes.data(),
+                                                   audio.bytes.size());
   } catch (const std::exception& e) {
     // `InputValidationError`, NOT `std::runtime_error`. The container is a
     // property of the REQUEST, so this is a client error and
@@ -227,44 +272,150 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
     // SERVER fault is what the 500 arm is for, and it is not this.
     throw vllm::v1::InputValidationError(
         std::string("dots3-note audio chat seam: this request's audio is not a "
-                    "PCM16 MONO RIFF/WAVE buffer (") + e.what() +
-        "). Only that container is ported; every other one — including the "
-        "`mp3`/`flac`/`ogg` an `input_audio.format` may name, and multi-channel "
-        "or non-16-bit WAV — is owed to W7c. Upstream decodes with librosa "
-        "through its data parser (common/processor.py:523-525 @ 9035151d6). "
-        "See .agents/specs/dots3-note.md §4.14.5 and issue #2703.");
+                    "PCM16 RIFF/WAVE buffer (") + e.what() +
+        "). Only that container is ported. The `mp3`/`flac`/`ogg` an "
+        "`input_audio.format` may name needs a demuxer this tree does not "
+        "vendor; five surfaces refuse compressed media for that same missing "
+        "brick, and it is tracked by issue #2814 — a SHARED brick, not a "
+        "dots3-note one. Any CHANNEL count is served since W7c-1 (#2813): the "
+        "channels are mean-reduced to mono, as upstream's "
+        "`load_audio(..., mono=True)` does "
+        "(vllm/multimodal/media/audio.py:207-208, :220 @ 9035151d6). Any "
+        "SAMPLING RATE is served since W7c-2 (#2828): the waveform is "
+        "resampled to `audio_config.sampling_rate` by upstream's own `scipy` "
+        "AudioResampler arm (resample_audio_scipy, "
+        "vllm/multimodal/audio.py:232-250 @ 9035151d6), NOT its `pyav` "
+        "default, which is libswresample and is not bit-identical to itself "
+        "across CPU dispatch. See .agents/specs/dots3-note.md §4.16 and §4.17, "
+        "and issues #2813 and #2828.");
   }
 
-  // The front end refuses a wrong rate (W7c) and a waveform over one chunk
-  // (W7b) BY NAME; both messages name the brick and the reason.
-  multimodal::AudioKwargs kw = proc.ProcessWaveform(
+  // Since W7c-2 (#2828) the front end RESAMPLES a rate that is not
+  // `audio_config.sampling_rate` rather than refusing it, through upstream's
+  // own `"scipy"` `AudioResampler` arm (spec §4.17). What it still refuses BY
+  // NAME is a non-positive rate; a reduced polyphase ratio past
+  // `kMaxPolyphaseRate`, which is a recorded divergence because the rate is
+  // named by the request and upstream has no such guard; and — since W7b
+  // (#2797) lifted the `chunk_seconds` ceiling — a waveform past ONE chunk on a
+  // checkpoint whose `chunk_samples` is not a whole number of `token_stride`s,
+  // where upstream's own per-segment row sum and its prompt-side
+  // `ceil(total / stride)` disagree (spec §4.15.3). Every message names the
+  // reason and the numbers.
+  //
+  // THIS IS THE FRONT END AND NOT THE ENGINE LOOP, and that is the point of
+  // refusing here: `InputValidationError` becomes HTTP 400 for THIS request,
+  // where the same throw from inside `encode_mm` would set `AsyncLLM`'s errored
+  // latch and 500 every later request, text ones included.
+  //
+  // ONE RESAMPLE PER REQUEST, NOT TWO (PR #2842 F2). The mm-hash below needs the
+  // SAME resampled waveform, and before this it got it by calling
+  // `ResampleAudioScipy` a second time over the same input: on the 1 Hz request
+  // measured in spec §4.17.10 that was 1220.7 MB twice for a 40 KB upload.
+  // `ProcessWaveform` fills `resampled` when it resamples and leaves it empty
+  // when it does not, and the hash below is handed the buffer rather than the
+  // rate to redo it from.
+  std::vector<float> resampled;
+  PreparedAudio out;
+  out.kwargs = proc.ProcessWaveform(
       decoded.samples.data(), static_cast<int64_t>(decoded.samples.size()),
-      decoded.sampling_rate);
+      decoded.sampling_rate, &resampled);
+  // `audio_replacement` (`common/processor.py:770-773` @ `9035151d6`):
+  // `ceil(int(length) / stride)`, already resolved by `ProcessWaveform`.
+  out.num_tokens = static_cast<int>(out.kwargs.num_tokens);
+  // The mm-hash is over the WAVEFORM, before feature extraction, exactly as
+  // the image hash is over the raw pixels — so the encoder cache keys on
+  // audio rather than on what the front end derived from it.
+  //
+  // W7c-2 (#2828) PASSES THE REQUEST'S OWN RATE, and that is a correctness
+  // requirement rather than a refinement. Two requests whose raw buffers are
+  // identical and whose declared rates are not produce DIFFERENT features
+  // since W7c-2, and `mm_hash` is a CROSS-REQUEST encoder-cache key, so a key
+  // over the raw buffer alone would hand the second one the first one's
+  // encoding. The three-argument overload hashes the RESAMPLED waveform,
+  // which separates those two and also lets two requests that resample to the
+  // same audio share one entry.
+  out.mm_hash = proc.HashAudio(decoded.samples.data(),
+                               static_cast<int64_t>(decoded.samples.size()),
+                               decoded.sampling_rate,
+                               resampled.empty() ? nullptr : &resampled);
+  return out;
+}
 
-  std::vector<std::array<int, 2>> placeholders;
-  std::vector<int32_t> expanded = multimodal::ExpandAudioPlaceholders(
-      prompt_ids, cfg.audio_token_id,
-      {static_cast<int>(kw.num_tokens)}, &placeholders);
+// THE ONE PASS (W8a, #2860), and the only place a placeholder gets an offset.
+//
+// Builds one `PromptReplacement` per modality that has items — image first,
+// then audio, which is the order `_get_prompt_updates` appends them in
+// (`common/processor.py:734`, `:757`) and therefore the tie-break upstream's
+// planner would apply — and hands the whole list to
+// `ApplyPromptReplacements`.
+//
+// THE `mm_features` COME OUT IN STREAM ORDER, NOT MODALITY ORDER, and that is a
+// requirement rather than a nicety: `GetMmFeaturesInWindow` (`utils.cpp:9-50`)
+// is a pair of BINARY SEARCHES over `offset`, and both the scheduler
+// (`scheduler.cpp:495`) and the runner (`runner.cpp:2024`) call it, so a list
+// out of order makes both skip an item. `kv_cache_utils.cpp:420` states the
+// same precondition for the prefix-cache keys. The applier reports its spans in
+// ascending offset by construction, so this loop must NOT be restructured as
+// one pass per modality.
+multimodal::MultiModalInputs RouteDots3NoteMultiModal(
+    const multimodal::Dots3NoteProcessorConfig& image_cfg,
+    const multimodal::Dots3NoteAudioProcessorConfig* audio_cfg,
+    std::vector<PreparedImage> images, std::vector<PreparedAudio> audios,
+    const std::vector<int32_t>& prompt_ids) {
+  std::vector<multimodal::PromptReplacement> updates;
+  if (!images.empty()) {
+    std::vector<int> counts;
+    counts.reserve(images.size());
+    for (const PreparedImage& item : images) counts.push_back(item.num_tokens);
+    updates.push_back(multimodal::MakeTokenTripleReplacement(
+        "image", image_cfg.image_start_token_id, image_cfg.image_token_id,
+        image_cfg.image_end_token_id, counts));
+  }
+  if (!audios.empty()) {
+    // Unreachable with a null config while the seam's own limit map and its
+    // audio processor agree; kept so that reaching it is a named refusal and
+    // not a null dereference.
+    if (audio_cfg == nullptr) {
+      throw std::runtime_error(
+          "dots3-note multimodal chat seam: an audio item reached the one-pass "
+          "applier on an install with no audio processor config.");
+    }
+    std::vector<int> counts;
+    counts.reserve(audios.size());
+    for (const PreparedAudio& item : audios) counts.push_back(item.num_tokens);
+    updates.push_back(multimodal::MakeTokenTripleReplacement(
+        "audio", audio_cfg->audio_start_token_id, audio_cfg->audio_token_id,
+        audio_cfg->audio_end_token_id, counts));
+  }
 
+  std::vector<multimodal::AppliedPromptUpdate> applied;
   multimodal::MultiModalInputs out;
-  out.prompt_token_ids = std::move(expanded);
-  if (!placeholders.empty()) {
+  out.prompt_token_ids =
+      multimodal::ApplyPromptReplacements(prompt_ids, updates, &applied);
+  out.mm_features.reserve(applied.size());
+  for (const multimodal::AppliedPromptUpdate& span : applied) {
     multimodal::MultiModalFeatureSpec spec;
-    spec.modality = "audio";
-    spec.offset = placeholders[0][0];
-    spec.length = placeholders[0][1];
-    // The mm-hash is over the RAW waveform, before feature extraction, exactly
-    // as the image hash is over the raw pixels — so the encoder cache keys on
-    // what the request carried rather than on what the front end derived.
-    spec.mm_hash = proc.HashAudio(
-        decoded.samples.data(), static_cast<int64_t>(decoded.samples.size()));
-    spec.audio_data = std::make_shared<multimodal::AudioKwargs>(std::move(kw));
+    spec.modality = span.modality;
+    spec.offset = span.offset;
+    spec.length = span.length;
+    if (span.modality == "image") {
+      PreparedImage& item = images[static_cast<size_t>(span.item_index)];
+      spec.mm_hash = std::move(item.mm_hash);
+      spec.data =
+          std::make_shared<multimodal::ImageKwargs>(std::move(item.kwargs));
+    } else {
+      PreparedAudio& item = audios[static_cast<size_t>(span.item_index)];
+      spec.mm_hash = std::move(item.mm_hash);
+      spec.audio_data =
+          std::make_shared<multimodal::AudioKwargs>(std::move(item.kwargs));
+    }
     out.mm_features.push_back(std::move(spec));
   }
   return out;
 }
 
-// THE CHAT FN, over both modalities (W7a, #2703).
+// THE CHAT FN, over both modalities (W7a, #2703) and over ANY NUMBER of items
+// of each (W8a, #2860).
 //
 // `audio_proc` is NULL when this checkpoint carries no `audio_config`, and then
 // this seam behaves exactly as it did before W7a: the supported-limit map does
@@ -272,10 +423,10 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
 // upstream's own "At most 0 audio(s) may be provided in one prompt." and the
 // marker builder is handed an empty audio marker it never reaches.
 //
-// ONE ITEM OF EACH, and the reason is the same one the image arm has carried
-// since W6a: this function LOCATES a single part per modality, so the seam's
-// declared ceiling is what it can actually build. A second part of either kind
-// is refused at STEP 0 rather than silently dropped.
+// UNTIL W8a THIS FUNCTION LOCATED ONE PART PER MODALITY and refused everything
+// else at STEP 0, which was the honest ceiling while the two expanders could
+// not be chained. It now collects EVERY part, prepares each one, and places
+// them all in one pass, so the declared ceiling is upstream's own 512 / 128.
 MultiModalChatFn MakeDots3NoteChatFn(
     std::shared_ptr<const multimodal::Dots3NoteImageProcessor> proc,
     std::shared_ptr<const multimodal::Dots3NoteAudioProcessor> audio_proc,
@@ -293,45 +444,35 @@ MultiModalChatFn MakeDots3NoteChatFn(
     // (`chat_utils.py:662` validates as it tracks, for the same reason).
     ValidateChatMmLimits(*info, messages);
 
-    const ChatContentPart* image_part = nullptr;
-    const ChatContentPart* audio_part = nullptr;
+    // EVERY media part, in message and part order. Grouping by modality here
+    // is upstream's own shape — `_get_prompt_updates` builds one rule per
+    // modality carrying one item each (`common/processor.py:725-812` @
+    // `9035151d6`) — and the STREAM order is recovered by the one-pass applier
+    // in `RouteDots3NoteMultiModal`, never by this loop.
+    std::vector<const ChatContentPart*> image_parts;
+    std::vector<const ChatContentPart*> audio_parts;
     for (const ChatMessage& m : messages) {
       if (!m.content_parts.has_value()) continue;
       for (const ChatContentPart& part : *m.content_parts) {
-        if (part.type == "image_url" && image_part == nullptr) {
-          image_part = &part;
-        } else if ((part.type == "input_audio" || part.type == "audio_url") &&
-                   audio_part == nullptr) {
-          audio_part = &part;
+        if (part.type == "image_url") {
+          image_parts.push_back(&part);
+        } else if (part.type == "input_audio" || part.type == "audio_url") {
+          audio_parts.push_back(&part);
         }
       }
     }
     // The text path, untouched and byte-identical.
-    if (image_part == nullptr && audio_part == nullptr) return std::nullopt;
+    if (image_parts.empty() && audio_parts.empty()) return std::nullopt;
 
-    // ONE MODALITY PER REQUEST, refused BY NAME rather than served half. A
-    // prompt carrying both would need TWO `mm_features` entries whose
-    // placeholder spans are expanded in ONE pass over the same id stream, and
-    // `ExpandImagePlaceholders` and `ExpandAudioPlaceholders` are separate
-    // functions over separate ids that each rebuild the whole vector — so
-    // running them in sequence would leave the second one's offsets measured
-    // against the first one's un-expanded input. Upstream applies all of its
-    // `PromptReplacement`s in one pass (`common/processor.py:749-783` @
-    // `9035151d6`); this port does not have that machinery yet, and a mixed
-    // request is owed to W8 with the rest of the front end.
-    if (image_part != nullptr && audio_part != nullptr) {
-      // A client error, so HTTP 400 rather than 500 — see the container
-      // refusal's note in `RouteDots3NoteAudioWav`.
-      throw vllm::v1::InputValidationError(
-          "dots3-note multimodal chat seam: this request carries BOTH an image "
-          "and an audio part. Each is served on its own (W6a-W6c and W7a); "
-          "serving them together needs the single-pass placeholder expansion "
-          "upstream applies to all modalities at once "
-          "(common/processor.py:749-783 @ 9035151d6), and that is owed to W8. "
-          "Refused by name rather than expanding one and dropping the other. "
-          "See .agents/specs/dots3-note.md §4.14.5 and issue #2703.");
-    }
-    if (audio_part != nullptr && audio_proc == nullptr) {
+    // NO MIXED-REQUEST REFUSAL ANY MORE (W8a, #2860). It used to throw
+    // `InputValidationError` here naming "BOTH an image and an audio part",
+    // because the two expanders each rebuilt the whole id vector and running
+    // them in sequence would have measured the second one's offsets against
+    // the first one's un-expanded input. `ApplyPromptReplacements` below is
+    // upstream's own one pass over every modality at once
+    // (`processing/processor.py:944-957` @ `9035151d6`), so the request is
+    // SERVED and the two spans are disjoint by construction.
+    if (!audio_parts.empty() && audio_proc == nullptr) {
       // Unreachable while the limit map and this pointer agree; kept because
       // reaching it would otherwise be a null dereference rather than an
       // answer.
@@ -354,23 +495,33 @@ MultiModalChatFn MakeDots3NoteChatFn(
         prompt_fn(rendered, /*add_generation_prompt=*/true, {},
                   nlohmann::ordered_json::object());
 
-    // 2. Tokenize WITH special tokens: the single `<|imgpad|>` or
-    //    `<|audio_comp_pad|>` becomes ONE id (added tokens match
-    //    leftmost-longest).
+    // 2. Tokenize WITH special tokens: each injected `<|img|><|imgpad|>
+    //    <|endofimg|>` or `<|audio_comp_start|><|audio_comp_pad|>
+    //    <|audio_comp_end|>` becomes exactly THREE ids (added tokens match
+    //    leftmost-longest), which is the TARGET each rule below matches.
     const std::vector<int32_t> prompt_ids =
         tokenizer.EncodeWithSpecialTokens(prompt);
 
-    // 3. Decode + route: expand that id to N and build the mm_features.
-    if (audio_part != nullptr) {
-      const DecodedMedia media = audio_part->type == "input_audio"
-                                     ? DecodeInputAudioPart(*audio_part)
-                                     : DecodeDataUri(audio_part->url);
-      return RouteDots3NoteAudioWav(*audio_proc, media, prompt_ids);
+    // 3. Decode and PREPARE every item, then place them all in ONE pass.
+    std::vector<PreparedImage> images;
+    images.reserve(image_parts.size());
+    for (const ChatContentPart* part : image_parts) {
+      const DecodedMedia media = DecodeImageUrlPart(*part);
+      const DecodedImageRgb img = codec(media);
+      images.push_back(PrepareDots3NoteImage(*proc, img.rgb.data(), img.height,
+                                             img.width));
     }
-    const DecodedMedia media = DecodeImageUrlPart(*image_part);
-    const DecodedImageRgb img = codec(media);
-    return RouteDots3NoteImageRgb(*proc, img.rgb.data(), img.height, img.width,
-                                  prompt_ids);
+    std::vector<PreparedAudio> audios;
+    audios.reserve(audio_parts.size());
+    for (const ChatContentPart* part : audio_parts) {
+      const DecodedMedia media = part->type == "input_audio"
+                                     ? DecodeInputAudioPart(*part)
+                                     : DecodeDataUri(part->url);
+      audios.push_back(PrepareDots3NoteAudio(*audio_proc, media));
+    }
+    return RouteDots3NoteMultiModal(
+        proc->config(), audio_proc != nullptr ? &audio_proc->config() : nullptr,
+        std::move(images), std::move(audios), prompt_ids);
   };
 }
 

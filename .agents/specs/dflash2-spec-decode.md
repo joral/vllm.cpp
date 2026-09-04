@@ -3067,7 +3067,19 @@ list items.
   retraction, and it IS needed before anybody claims the forward JIT is free.
 
 - **O-W12a — [#2088](https://github.com/mudler/vllm.cpp/issues/2088): a
-  non-causal SWA draft layer runs with NO sliding window.** Found while reading
+  non-causal SWA draft layer runs with NO sliding window. DISCHARGED by
+  [dflash2-noncausal-swa-window.md](dflash2-noncausal-swa-window.md)
+  ([#2784](https://github.com/mudler/vllm.cpp/issues/2784)).** The read this
+  entry made a precondition — the campaign draft's own `config.json` — came back
+  the LIVE way: five `sliding_attention` layers, `sliding_window: 2048`,
+  `is_causal: false`, so the window was dropped on every draft layer of the
+  campaign subject rather than only on the MiMo and Gemma-4 drafts. #2784
+  measured the cost: acceptance 0.77 at 2,307 prompt tokens and 0.06 at 8,159,
+  with speculation landing 23% BELOW the no-draft baseline. The eleven kernel
+  guards and the paged seam's mask map now share one bound
+  (`include/vt/dflash_attn_mask.h`). The entry as filed follows.
+
+  Found while reading
   the `P > 1` propose route for W12
   ([dflash2-batch-propose.md](dflash2-batch-propose.md)), not fixed there.
   Upstream resolves `(sliding_window, causal)` independently and passes

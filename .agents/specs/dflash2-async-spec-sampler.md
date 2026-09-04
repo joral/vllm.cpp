@@ -439,15 +439,27 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   either passes a length and refuses on it device-side as the host does, or
   sizes the buffer by `num_req_states` rather than by `num_reqs`. Owner: row
   `SPEC-DFLASH2`, issue #2644.
-- **The `VT_CHECK(step.num_draft_tokens == 0, ...)` refusals at the async
-  input-combine call sites have ZERO test coverage.** Neutralizing them leaves
-  every runner suite green. That is expected while the wave is unreached — the
-  refusal cannot be reached without the route it refuses — and a fresh review
-  traced the refusal predicate against the route predicate and found they cannot
-  disagree in either direction. Recorded rather than covered, because a test
-  that reached an unreached refusal would have to fake the route it is asserting
-  about. A2-2 and A2-3 make the route real and own the coverage with it. Owner:
-  row `SPEC-DFLASH2`, issue #2644.
+- **The async input-combine refusal has ZERO test coverage.** THE FORM THIS
+  ENTRY DESCRIBED NO LONGER EXISTS: A2-2 replaced the per-site
+  `VT_CHECK(step.num_draft_tokens == 0, ...)` refusals with ONE site, in the
+  async input-combine block of
+  `src/vllm/v1/worker/gpu/runner.cpp::execute_model`, written as a
+  `VT_CHECK(step.num_draft_tokens >= 0, ...)` guard followed by a
+  `VT_CHECK(!StepRoutesToVerify(step.num_draft_tokens), ...)` refusal, so the
+  refusal and the route now share one predicate. `grep -rn "num_draft_tokens ==
+  0" src/ include/` returns only comments and upstream citations. A2-2 made this
+  record stale and this correction rides in the change that did, per AGENTS.md
+  §Records.
+
+  The GAP is unchanged. Neutralizing the refusal leaves every runner suite green,
+  which is expected while the wave is unreached: the refusal cannot be reached
+  without the route it refuses. A fresh review traced the refusal predicate
+  against the route predicate and found they cannot disagree in either direction
+  for a non-negative count, and the `>= 0` guard is what keeps the negative case
+  refused rather than admitted. Recorded rather than covered, because a test that
+  reached an unreached refusal would have to fake the route it is asserting
+  about. A2-3 makes the route real and owns the coverage with it. Owner: row
+  `SPEC-DFLASH2`, issue #2644.
 - **`assert()` is a no-op in this build, so the `num_new_sampled_tokens in
   (0, 1)` mirror at `src/vllm/v1/worker/gpu/prepare_inputs.cpp:330` checks
   nothing.** The Release build is `-O3 -DNDEBUG`, which compiles the assertion
@@ -549,7 +561,28 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   never frees the block it replaces, because freeing a block a queued copy still
   writes is the same defect one level up. On CPU `AllocPinned` forwards to
   `Alloc`, so the CPU tier gates the tokens and nothing else; whether the copy
-  actually overlaps is G3/G4 at A2-5 and needs a GPU. Owner: row `SPEC-DFLASH2`,
+  actually overlaps is G3/G4 at A2-5 and needs a GPU.
+
+  WHAT IT RETAINS, stated precisely because page-locked memory is the scarce
+  kind. One block per distinct LARGER step shape — the ask is
+  `rows * width + rows` — so a serving ramp that adds one request at a time
+  retains one block per request added, not "a handful over a process lifetime" as
+  the first version of this record and the header comment both said. The total is
+  still bounded: the sizes are strictly increasing and the shape is bounded by
+  the batch, so the sum is on the order of N^2/2 int32 for a batch of N. It is
+  not a leak and it is not a defect; the imprecise claim was, and the header now
+  says the bounded thing.
+
+  THE RETAIN RULE'S MUTATION HAS NO STABLE FAILING-ASSERTION COUNT, and the
+  landing commit body's "four assertions" should not be read as one. Making `Get`
+  free the previous block before allocating reds the two `live_blocks()`
+  assertions DETERMINISTICALLY (`test_runner.cpp:3414` `CHECK( 1 == 2 )` and
+  `:3423` `CHECK( 1 == 3 )`). The other two assertions in that case read the
+  RETAINED block, so under the mutation they read freed memory and fail only when
+  the allocator has reused the bytes: this repair measured 4 failing assertions
+  (`:3418` `CHECK( 1003444615 == 100 )` and `:3419` `CHECK( -1902570769 == 103 )`
+  both fired) and the fresh review measured 3 from the same mutation. Quote the
+  two `live_blocks()` lines, which are the gate. Owner: row `SPEC-DFLASH2`,
   issue #2802.
 - **`propose_after_verify` DIVERGES from upstream for a row that both carries
   drafts and is chunked-prefilling, and A2-2 doubled that divergence's reach.**
@@ -574,16 +607,85 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   the split routes drive a row that carries drafts and is prefilling); the runner
   half has no test, and `grep propose_after_verify tests/` returns nothing.
   Owner: row `SPEC-DFLASH2`, issue #2802.
-- **The event choreography rests on a CPU-tier well-formedness test and on
-  inspection, never on an observed overlap.** `test_rejection_sampler.cpp` now
-  drives the runner's exact sequence — fork event recorded on the main queue,
-  a SECOND queue made to wait it, both D2H copies issued there, ready event
-  recorded on the copy queue, host blocked on that event alone — and asserts the
-  result is token-identical to `forward`. On the CPU backend every one of those
-  events is a null-handle no-op and `Copy` is a memcpy, so what the test gates is
-  that the sequence is well formed and loses nothing, NOT that anything overlaps.
-  Whether the copy runs concurrently with the compute stream is G3/G4 at A2-5 and
-  needs a GPU. Owner: row `SPEC-DFLASH2`, issue #2802.
+- **The event choreography is gated for WELL-FORMEDNESS ONLY, and the CPU tier
+  cannot gate its structure at all.** `test_rejection_sampler.cpp` issues the
+  runner's five calls in the runner's order — fork event recorded on one queue,
+  a second queue made to wait it, both D2H copies issued there, ready event
+  recorded on that queue, host blocked on that event alone — and asserts the
+  result is token-identical to `forward`. That is what it gates: the calls
+  compile against the real signatures, are well formed against the real buffers,
+  and lose no tokens.
+
+  A SECOND REVIEW FOUND THE STRONGER CLAIM THIS ENTRY USED TO MAKE FALSE, and it
+  is corrected rather than softened. `CpuBackend::CreateQueue`
+  (`src/vt/cpu/cpu_backend.cpp`) returns `Queue{Device{kCPU, 0}, nullptr}`, which
+  is byte-identical to the queue the test builds by hand apart from the `id`
+  field no backend call reads. So on this tier there is no second queue: `copy_q`
+  and `main_q` are the same device and the same null handle, every event op is
+  the `vt::Backend` base no-op, and `Copy` is a memcpy. The reviewer swapped the
+  copy onto the main queue and the case stayed green — 17 cases, 275 assertions,
+  exit 0. "The main queue is never synchronized" is therefore NOT a property this
+  test holds, and it no longer says it does; the case now asserts the identity of
+  the two queues so the limit is executable rather than prose. The two-queue
+  structure, and any overlap it buys, is G3/G4 at A2-5 and needs a GPU. Owner:
+  row `SPEC-DFLASH2`, issue #2802.
+- **THE DESTRUCTOR'S TIMING IS NOW PART OF THE INVARIANT, AND A2-4 MUST STILL
+  DESTROY THE OBJECT AFTER ITS WAIT.** A second review found the per-buffer
+  invariant on `RejectionSamplerDeviceOutput` said WHICH buffers it owns and
+  never said WHEN it may free them: `Release` called `Free` on all three device
+  buffers with no `Synchronize` and no event wait, which is the `g_reject_argmax`
+  defect relocated from the backend into the object's own scope.
+
+  The failure is concrete and it is A2-4's. On the copy-queue route `dev_out` is
+  a BLOCK-SCOPED LOCAL destroyed at the close of the `else` in
+  `GPUModelRunner::sample_tokens_async`. A2-4's stated job is to move
+  `SynchronizeEvent(verify_ready_event_)` past `propose_drafts`. Move it past
+  that closing brace and the destructor frees `sampled_`, `num_sampled_` and
+  `target_argmax_` while the D2H copy is still writing them: a garbage accept
+  prefix, wrong emitted ids, nothing raised, and — because the verify is lossless
+  — invisible to every token gate in this tree (#1366). That is the `logits`
+  entry's sibling, and it was booked nowhere.
+
+  FIXED, not documented, and the choice is deliberate. `Release` now drains
+  before it frees: it synchronizes the queue `verify` was given, and the queue of
+  the last `CopyToHost` when that is a different one, and only then frees.
+  Documentation would have left A2-4 one editing mistake away from a wrong answer
+  that no gate here can see. The drain turns that same mistake into a stall,
+  which the G4 `nsys` read A2-5 must take anyway would show. Trading an
+  unobservable wrong answer for an observable slow one is the right direction in
+  a tree whose recurring failure is reason A's class.
+
+  IT IS A NET AND NOT A LICENCE. A2-4 still has to destroy the object AFTER the
+  wait it moves, or it pays a full drain in the destructor and gets no overlap
+  from the wave at all. The net makes the mistake slow; it does not make it
+  correct. It also creates one new and much cheaper obligation, written on the
+  type: the two queues are borrowed, so they must outlive the object. Both are
+  runner members today, and a queue destroyed before the work on it is undefined
+  on CUDA regardless of this type. Gated on the CPU tier by two cases in
+  `tests/vllm/v1/spec_decode/test_rejection_sampler.cpp` that swap in a
+  forwarding `vt::Backend` and assert the CALL ORDER — both queue drains before
+  the first `Free`, and no drain after it. Red-before, by deleting the two
+  `Synchronize` calls: 2 cases and 3 assertions failed, `CHECK( free ==
+  sync:38 )`, `CHECK( free == sync:39 )` and `CHECK( free == sync:40 )`, exit 1,
+  with every token case in the file still green. Owner: row `SPEC-DFLASH2`,
+  issue #2802.
+- **`src/vt/cuda/cuda_sample.cu` STILL CARRIES TWO of the grow-only scratches
+  this wave deleted the third of, and they are on the ORDINARY decode path.**
+  `g_argmax_scratch` and `g_sample_scratch` (`:187-188`) are file-scope, grown by
+  `EnsureArgScratch` (`:174`, called at `:230` and `:350`) with a `cudaFree` plus
+  a larger `cudaMalloc`, and read by `GreedyArgmaxCuda` (`:233-236`) and
+  `RandomSampleCuda` (`:354-357`),
+  both of which return with their two kernels still queued. F1's argument applies
+  verbatim: a later call with more rows frees the buffer an earlier call's queued
+  `ArgmaxFinalKernel` reads, the loud outcome is an illegal access, the quiet one
+  is a wrong token id with nothing raised, and the grow's `cudaFree` is a
+  device-wide synchronize inside a function that advertises waiting on nothing.
+  PRE-EXISTING and UNTOUCHED by A2-2, which is why it is filed rather than fixed
+  here — but the repair deleted one instance of a pattern and would otherwise
+  have left two identical ones unnamed in the same file. Closing it needs a GPU:
+  the class is invisible on the CPU tier and on any unified-memory backend,
+  where the kernels have already finished. Owner: no row yet; tracked by issue
+  [#2916](https://github.com/mudler/vllm.cpp/issues/2916).
 - **The `nsys` read (G4).** Needs `dgx:gpu0` under an `rc` lease. Not taken
   here; the task that produced this spec was explicitly denied a device.
 

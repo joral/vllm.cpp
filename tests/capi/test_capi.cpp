@@ -1622,8 +1622,9 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // (vllm_speech_* / vllm_synthesize) is ABI v20; the speech device selector is
   // v21; `vllm_model_params.mmproj_path` (issue #821) is v22; the render phase
   // table (vllm_video_last_phase_log, issue #1010) is v23;
-  // `vllm_model_params.kv_cache_dtype` (fork issue #7) is v24.
-  CHECK(vllm_abi_version() >= 24);
+  // `vllm_model_params.kv_cache_dtype` (fork issue #7) is v24; the speculative
+  // acceptance readout (vllm_engine_spec_acceptance, issue #2832) is v25.
+  CHECK(vllm_abi_version() >= 25);
   // And the symbol is LINKED, not merely declared: a NULL handle answers NULL
   // rather than crashing, which is the contract every other handle query here
   // holds to.
@@ -1672,6 +1673,39 @@ TEST_CASE("capi: v24 kv_cache_dtype reaches the engine load") {
     CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
     CHECK(eng == nullptr);
   }
+}
+
+// ─── ABI v25: speculative acceptance readout (issue #2832) ───────────────────
+// The DFlash2 speed gate drives `examples/cli`, a pure client of `vllm.h`, and
+// the acceptance both reference engines publish had no route out of ours. These
+// cases hold the accessor's CONTRACT; the harness suite
+// (`tests/tools/test_dflash2_speed_harness.py`) links the production CLI against
+// a stub libvllm and holds what it PRINTS.
+//
+// WHAT THESE CASES DO NOT HOLD, said plainly because a fresh review found the
+// gap by mutation: both of them return at the NULL guard, so neither ever
+// reaches the counter mapping, and swapping `drafts_proposed` with
+// `drafts_accepted` leaves this file green. That mapping lives in
+// `src/capi/spec_acceptance.h` for exactly that reason and is pinned by
+// `SpecAcceptanceMappingTest` in the harness suite, which compiles and runs it
+// with no library. Do not read a green here as a check on the values.
+TEST_CASE("capi: v25 vllm_engine_spec_acceptance refuses NULL and zeroes *out") {
+  vllm_spec_acceptance got{};
+  // A NULL out has nowhere to write, so it is the one argument that cannot be
+  // zeroed first.
+  CHECK(vllm_engine_spec_acceptance(nullptr, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+
+  // A NULL engine DOES zero *out, so a caller that ignores the status reads
+  // zeroes rather than whatever was on its stack. That matters here more than
+  // usual: the value is a benchmark datum, and stack garbage read as an
+  // acceptance count is a plausible-looking measurement.
+  got.drafts_proposed = 111;
+  got.drafts_accepted = 222;
+  got.drafted_request_steps = 333;
+  CHECK(vllm_engine_spec_acceptance(nullptr, &got) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(got.drafts_proposed == 0);
+  CHECK(got.drafts_accepted == 0);
+  CHECK(got.drafted_request_steps == 0);
 }
 
 // ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────

@@ -109,6 +109,45 @@ ForwardLogits ForwardLagunaForCausalLM(LoadedModel& model,
   std::vector<int32_t> device_ids;
   const std::vector<int32_t>& ids =
       ResolveHostTokenIds(input, &device_ids, "LagunaForCausalLM");
+  // #2618 -- THE RESIDENT-QUANT ARM, and it is FIRST for the reason
+  // `deepseek_v4_registry.cpp` puts its own paged arm first:
+  // `ModelForwardInput::gather_logits` defaults to TRUE and the runner leaves it
+  // true on every default step, so a branch placed after the `gather_logits`
+  // test below is unreachable on a default configuration. Placing this one after
+  // it would land it dead.
+  //
+  // Below this line is `LagunaModel::Forward`, the unit-gated f32 REFERENCE, and
+  // it cannot serve either checkpoint this tree's loaders produce.
+  // `LoadLagunaForCausalLMWeights` fills `moe.experts_*_fp4` and leaves
+  // `moe.experts_*` EMPTY (`laguna_weights.cpp:443-450`), so the reference
+  // sliced `exp_g.begin() + id*gu_stride` out of an empty vector and a registry
+  // step SIGSEGV'd inside `memcpy`. `LoadLagunaFromGgufShards` DOES fill
+  // `moe.experts_*` (`:807-809`), with Q4_K/Q5_K blocks `ReadF32`
+  // (`laguna.cpp:172-190`) refuses by name -- a throw, not a crash, and it fires
+  // at the first Q8_0 attention GEMM before the MoE block is reached. Two arms,
+  // two different failures, one cause: the reference is not the forward either
+  // arm needs.
+  //
+  // The route predicate is `LagunaForwardGguf`'s OWN precondition, quoted from
+  // its `VT_CHECK` at `laguna.cpp:1667`, so the route and the refusal are the
+  // same predicate rather than two copies that can drift apart.
+  //
+  // The fallthrough stays the reference, exactly as ds4 falls through to
+  // `DeepseekV4Model::Forward`. A `LagunaWeights` with neither flag can only come
+  // from a hand-built synthetic tower, which is what the reference exists to
+  // serve; every production loader sets one flag, so every production step takes
+  // this arm.
+  //
+  // This arm is a STATELESS whole-sequence recompute and ignores `attn_kv`. So
+  // does the reference (`laguna.cpp:1429-1430` voids both `attn_meta` and
+  // `attn_kv`), so the cache contract is unchanged by this route. The
+  // incremental arm (`LagunaForwardGgufCached`) is owed on this row's spec.
+  if (weights.has_gguf_weights || weights.has_nvfp4_weights) {
+    return HostLogits(
+        LagunaForwardGguf(weights, input.queue, ids, input.positions,
+                          input.logits_indices),
+        weights.params.vocab_size);
+  }
   if (input.gather_logits) {
     return LagunaModel::ForwardDevice(ids, input.positions,
                                       input.attn_meta, input.attn_kv, weights,

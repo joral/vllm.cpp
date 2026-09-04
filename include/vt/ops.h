@@ -1313,6 +1313,25 @@ struct Mamba2Args {
   int64_t tp_world_size = 1;
 };
 
+// KERNEL-GDN-CHUNKED-MIRROR (.agents/specs/gdn-chunked-mirror.md D0/D3).
+// THE algorithm predicate for GDN prefill, shared by every backend so that a
+// `--device cpu` run and a `--device cuda` run cannot end up on different
+// algorithms because only one of them read the flag.
+//
+// `GdnChunkedPrefillEnabled()` is the raw `VT_GDN_CHUNKED` read, lifted
+// verbatim out of cuda_gdn.cu (the bespoke `e == nullptr || e[0] != '0'` parse
+// is KEPT as-is rather than rewritten to EnvOnOr: the off-value spelling is
+// recorded in four evidence files and six spec lines, so changing the accepted
+// spellings would be a semantic change wearing a cleanup).
+//
+// `GdnUseChunkedPrefill(dtype)` adds D0's dtype term. vLLM's chunked kernels
+// REFUSE f32 — the Triton wrapper asserts (`chunk.py:213-215`) and the CPU
+// kernel type-checks (`csrc/cpu/sgl-kernels/fla.cpp:2205-2207`, bf16 only) — so
+// at f32 the sequential recurrence IS the mirror, because it is the only gated
+// delta rule upstream will execute at that dtype.
+bool GdnChunkedPrefillEnabled();
+bool GdnUseChunkedPrefill(DType q_dtype);
+
 struct GdnArgs {
   // q scale, applied to q only after l2norm; upstream default Dk^-0.5
   // (gdn-semantics.md §1). Must be set explicitly (> 0).

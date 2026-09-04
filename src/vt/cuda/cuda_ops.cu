@@ -20,6 +20,7 @@
 #include "vt/cuda/rmsnorm_decode_fast.h"
 #include "vt/ops.h"
 #include "vt/dflash_attn_grid.h"
+#include "vt/dflash_attn_mask.h"
 
 namespace vt::cuda {
 
@@ -1729,9 +1730,12 @@ __global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Ti
   const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
   const int64_t qs = sp.ks, qe = sp.ke;
   const int64_t ii = sp.ic;                        // combined intra-block offset
-  const int64_t jhi = causal ? ii : (qe - qs - 1);  // last visible intra-block key
-  int64_t jlo = 0;
-  if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h). A NON-CAUSAL layer
+  // carrying a window attends SYMMETRICALLY within it; it used to attend over
+  // the whole block.
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+  const int64_t jhi = span.hi;  // last visible intra-block key
+  const int64_t jlo = span.lo;
   const int64_t qoff = (i * hq + h) * d;
 
   extern __shared__ float smem[];
@@ -1868,11 +1872,10 @@ __global__ void DFlashAttnQBlockKernel(Tout* out, const Tin* query, const Tin* k
     const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
     const int64_t qs = sp.ks, qe = sp.ke;
     const int64_t ii = sp.ic;
-    const int64_t rel_hi = causal ? ii : (qe - qs - 1);
-    int64_t rel_lo = 0;
-    if (causal && window > 0) rel_lo = (ii - (window - 1) > 0) ? ii - (window - 1) : 0;
-    jlo[u] = qs + rel_lo;
-    jhi[u] = qs + rel_hi;
+    // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+    const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+    jlo[u] = qs + span.lo;
+    jhi[u] = qs + span.hi;
     lo = min(lo, jlo[u]);
     hi = max(hi, jhi[u]);
     const int64_t qoff = (i * hq + h) * d;
@@ -1942,9 +1945,10 @@ __global__ void DFlashBlockAttentionWarpKernel(Tout* out, const Tin* query, cons
   const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
   const int64_t qs = sp.ks, qe = sp.ke;
   const int64_t ii = sp.ic;
-  const int64_t jhi = causal ? ii : (qe - qs - 1);
-  int64_t jlo = 0;
-  if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+  const int64_t jhi = span.hi;
+  const int64_t jlo = span.lo;
   const int64_t qoff = (i * hq + h) * d;
 
   // Q and the accumulator in registers: lane L holds elements L, L+32, L+64, ...
@@ -2105,9 +2109,10 @@ __global__ void DFlashAttnKeyLaneKernel(Tout* out, const Tin* query, const Tin* 
   const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
   const int64_t qs = sp.ks, qe = sp.ke;
   const int64_t ii = sp.ic;
-  const int64_t jhi = qs + (causal ? ii : (qe - qs - 1));  // last visible GLOBAL key
-  int64_t jlo = qs;
-  if (causal && window > 0) jlo = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+  const int64_t jhi = qs + span.hi;  // last visible GLOBAL key
+  const int64_t jlo = qs + span.lo;
 
   const int64_t qoff = (i * hq + h) * kD;
   for (int e = lane; e < kD; e += 32) qsh[e] = Load(query, qoff + e);
@@ -2383,9 +2388,10 @@ __global__ void DFlashAttnChunkKernel(Tout* out, const Tin* query, const Tin* ke
   const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
   const int64_t qs = sp.ks, qe = sp.ke;
   const int64_t ii = sp.ic;
-  const int64_t jhi = qs + (causal ? ii : (qe - qs - 1));  // last visible GLOBAL key
-  int64_t jlo = qs;
-  if (causal && window > 0) jlo = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+  const int64_t jhi = qs + span.hi;  // last visible GLOBAL key
+  const int64_t jlo = qs + span.lo;
 
   const int64_t qoff = (i * hq + h) * kD;
   float qreg[kPerLane], acc[kPerLane];
@@ -2551,12 +2557,16 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
   const int64_t qrs = qcu[rq], qre = qcu[rq + 1];
   const int64_t rs = cu[rq], re = cu[rq + 1];
   const int64_t off = (re - rs) - (qre - qrs);  // bottom-right anchor
-  const int64_t khi = causal ? (rs + off + (qend - 1 - qrs)) : (re - 1);
-  int64_t klo = rs;
-  if (causal && window > 0) {
-    const int64_t ii = off + (qblk - qrs);
-    klo = rs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
-  }
+  // #2784: the block's STAGING range is the union of its rows' masks. Both
+  // bounds of `vt::DFlashMaskSpanOf` are non-decreasing in the query row
+  // (asserted in tests/vt/test_dflash_attn_mask.cpp), so the union is the FIRST
+  // row's `lo` and the LAST row's `hi` — no third formula to keep in step.
+  const vt::DFlashMaskSpan sfirst =
+      vt::DFlashMaskSpanOf(off + (qblk - qrs), re - rs, causal, window);
+  const vt::DFlashMaskSpan slast =
+      vt::DFlashMaskSpanOf(off + (qend - 1 - qrs), re - rs, causal, window);
+  const int64_t khi = rs + slast.hi;
+  const int64_t klo = rs + sfirst.lo;
   if (khi < klo) return;  // block-uniform
 
   // --- this lane's TWO query rows and their per-row mask bounds -------------
@@ -2575,9 +2585,10 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
     const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, ic);
     const int64_t qs = sp.ks, qe = sp.ke;
     const int64_t ii = sp.ic;
-    rhi[u] = qs + (causal ? ii : (qe - qs - 1));
-    rlo[u] = qs;
-    if (causal && window > 0) rlo[u] = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+    // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+    const vt::DFlashMaskSpan rspan = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+    rhi[u] = qs + rspan.hi;
+    rlo[u] = qs + rspan.lo;
   }
 
   // --- Q A-fragments, read ONCE straight from global into registers ---------
@@ -3013,9 +3024,10 @@ __global__ void DFlashPagedBlockAttentionKernel(
   const int64_t C = slen[req];
   const int64_t N = C + blen;  // combined key length
   const int64_t ii_comb = C + (i - qs);
-  const int64_t jhi = causal ? ii_comb : (N - 1);
-  int64_t jlo = 0;
-  if (causal && window > 0) jlo = ii_comb - (window - 1) > 0 ? ii_comb - (window - 1) : 0;
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii_comb, N, causal, window);
+  const int64_t jhi = span.hi;
+  const int64_t jlo = span.lo;
   const int64_t qoff = (i * hq + h) * d;
 
   extern __shared__ float smem[];
@@ -3119,9 +3131,10 @@ __global__ void DFlashPagedBlockAttentionWarpKernel(
   const int64_t C = slen[req];
   const int64_t N = C + blen;  // combined key length
   const int64_t ii_comb = C + (i - qs);
-  const int64_t jhi = causal ? ii_comb : (N - 1);
-  int64_t jlo = 0;
-  if (causal && window > 0) jlo = ii_comb - (window - 1) > 0 ? ii_comb - (window - 1) : 0;
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii_comb, N, causal, window);
+  const int64_t jhi = span.hi;
+  const int64_t jlo = span.lo;
   const int64_t qoff = (i * hq + h) * d;
   const int npl = static_cast<int>((d + 31) / 32);
   float qreg[kMaxPerLane];

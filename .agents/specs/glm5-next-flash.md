@@ -3247,6 +3247,41 @@ here because a two-token leg contains exactly one decode step, so a leg C whose
 stdout matches leg D byte-for-byte has measured it, and a leg C that emits
 ` Paris` followed by the wrong second token has found it.
 
+#### O54 -- RUN 3 CLOSES IT: the DEFAULT arm now emits the operand's bytes
+
+`devids2544`, `dgx:gpu0`, finished 2026-09-03T18:38:56Z, 9499 s, on the same
+101.2535 GiB `UD-Q2_K_XL` artifact (total bytes re-asserted at 108720071427).
+Built with FlashAttention-2 CONFIRMED PRESENT by two independent assertions --
+`VLLM_CPP_FLASH_ATTN:BOOL=ON` in the cache AND 1296 translation units carrying
+`-DVLLM_CPP_FLASH_ATTN` in `compile_commands.json` -- because the option defaults
+ON and silently degrades when CUTLASS headers or `VT_FA2_ARCHS` are absent, and a
+non-FA2 build throws in the first MLA forward in a way that reads as a model
+defect (#2571, #2614).
+
+| leg | env beyond the device-expert flag | rc | bytes | stdout |
+|---|---|---|---|---|
+| F1 | **none** | 0 | 8 | `20 50 61 72 69 73 2e 0a` = ` Paris.` |
+| F2 | `VT_ASYNC_DEVICE_MIRROR=0` | 0 | 8 | identical, same sha256 `81188d9b690e591f...` |
+
+**O52 IS CLOSED AND O53's FAILING CLAUSE IS DISCHARGED.** Run 2's leg C emitted
+` Paris Paris` (13 bytes) on the default arm against ` Paris.` (8 bytes) on the
+CPU operand; the fix for #2544 landed at `8401a435e`, and the default arm now
+emits the operand's bytes with NO mirror variable set. F1 and F2 are byte-for-byte
+identical and hash identically, which is the stronger statement: the variable no
+longer changes the answer, rather than merely one arm having become correct.
+
+**PRECISION ON "DEFAULT".** `VT_GLM5_NEXT_DEVICE_EXPERTS=1` is still set on both
+legs. This is default WITH RESPECT TO THE ASYNC MIRROR, the variable that caused
+the divergence. It is not a claim that a stock configuration with nothing set
+serves this model; the routed-expert device arm remains a separate opt-in.
+
+**No speed number is admissible or offered.** `wall=2473 s` (F1) and `2260 s`
+(F2) are DURATIONS of which roughly 85% is GGUF load off CIFS.
+
+The job computed its own verdicts as expressions over bytes read back off disk
+rather than printing a label, after a sibling job printed `3 runs all rc=0,
+21/21, zero THREW` directly beneath its own `rc=1 / 18 passed / 3 failed`.
+
 #### O53 -- RUN 2 IS TAKEN, and the criterion FAILED ON A CLAUSE I MIS-SPECIFIED
 
 `glm53-kvres/submit2.log`, `dgx:gpu0`, finished 2026-09-01T21:56:05Z, 12068 s

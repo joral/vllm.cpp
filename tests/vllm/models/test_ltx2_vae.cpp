@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <stdexcept>
@@ -31,6 +32,11 @@
 // VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads the geometry it claims
 // rather than assuming it (src/vt/cpu/cpu_conv1d_block.h), same reach as above.
 #include "vt/cpu/cpu_conv1d_block.h"
+// A24 wave 3 fresh re-review (#2786): the non-CPU dtype refusal is reached by
+// registering a fake accelerator, which needs the backend and platform registries.
+#include "vt/backend.h"
+#include "vt/device.h"
+#include "vllm/platforms/interface.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
@@ -40,6 +46,11 @@
 // entry point rather than through Ltx2ConvVideoDecode (issue #1008).
 #include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+// A24 wave 3 (#2786): the PixelNorm epsilon case reaches the kLtx2Vae CPU arm
+// directly, because the constant's WIDTH is only separable at a row scale the
+// decoder fixture does not produce.
+#include "vllm/model_executor/models/ltx2_video_vae_kernels.h"
+#include "vt/dtype.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 // vocoder1d::kSnakeEps: the Snake/SnakeBeta stabilizer is SHARED with MiniMax-H3's
 // BigVGAN, so the constant this suite pins lives in that header.
@@ -160,6 +171,22 @@ struct ParamBag {
     weights.tensors[name] = std::move(values);
   }
 };
+
+// The SAME bag, narrowed once -- which is exactly what `Ltx2LoadVaeWeights` at
+// `kBF16` does to a checkpoint and what `module.to(torch.bfloat16)` does to an
+// f32 state dict in the generator. Both sides therefore round the same f32 values
+// at the same single point, so a mismatch is the ARITHMETIC and never the
+// fixture (A24 wave 3, #2786).
+vllm::Ltx2VaeWeights NarrowToBf16(const vllm::Ltx2VaeWeights& f32) {
+  vllm::Ltx2VaeWeights out;
+  out.dtype = vt::DType::kBF16;
+  for (const auto& kv : f32.tensors) {
+    std::vector<uint16_t> narrow(kv.second.size());
+    for (size_t i = 0; i < kv.second.size(); ++i) narrow[i] = vt::F32ToBF16(kv.second[i]);
+    out.bf16[kv.first] = std::move(narrow);
+  }
+  return out;
+}
 
 void CheckManifest(const ParamBag& bag, const char* const* want_names, const int64_t* want_counts,
                    size_t want_size) {
@@ -1146,6 +1173,684 @@ TEST_CASE("ltx2 vae: the Conv video decoder matches upstream ltx_core") {
                                 std::size(vllm_test::kLtx2VideoDecGolden));
   INFO("Conv video decoder max|diff| = " << err);
   CHECK(err <= kLtx2GoldenTol);
+}
+
+TEST_CASE("ltx2 vae: the Conv video decoder's BF16 arm matches upstream ltx_core") {
+  // A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16, issue #2786.
+  //
+  // THE ARM UPSTREAM ACTUALLY RUNS. `distilled.py:109` resolves ONE pipeline
+  // dtype and `:148` hands it to `VideoDecoder`, so the f32 case above is the
+  // parity REFERENCE and this is the shipping arithmetic. It exists because
+  // nothing else can gate it: `ltx2_video_vae.cpp` records that the f32 oracle
+  // makes a dtype comparison "vacuous by construction", and the engine-level
+  // `vae_decode_not_bf16` counter proves the WIDTH and says nothing about the
+  // VALUES.
+  //
+  // SIX ROUNDING RULES RIDE ON THIS ONE GOLDEN, and each of them was measured
+  // against the pinned modules before it was written:
+  //   * `PixelNorm` is a fully bf16 chain -- the square, the mean, the epsilon
+  //     add, the sqrt and the divide each round (0 of 4800 against upstream at
+  //     two scales, where four alternatives are 1244-1434).
+  //   * `nn.GroupNorm`'s AFFINE narrows and its statistics do not (0 of 24576 at
+  //     C=128 with the affine narrowed, 6664 with it left in f32).
+  //   * `per_channel_statistics.un_normalize` narrows both registered buffers
+  //     before the multiply (0 of 4096, against 1294 with f32 statistics).
+  //   * `_RMSNorm2D` forms `sqrt(C) * gamma` FIRST and multiplies once.
+  //   * both ada-LN sites round three times (0 of 512, against 198 and 162).
+  //   * `_feed_spatial_noise` rounds its product before its add (0 of 144,
+  //     against 8).
+  //
+  // THE _RMSNorm2D ORDERING IS SEPARABLE ON THIS FIXTURE, AND ONLY BECAUSE OF ITS
+  // WIDTH. At a channel count whose square root is a power of two every ordering
+  // of that product agrees -- 0 of 4800 for all three at C=64. This decoder's
+  // `attn` block sits at 32 channels and `sqrt(32)` is not representable in
+  // bfloat16, so the rule is first-order here. A later fixture change that moved
+  // the attn block to 64 channels would silently mute it.
+  const vllm::Ltx2ConvVideoDecoderConfig cfg = ReducedVideoDecoderConfig();
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoDecBf16ParamNames,
+                vllm_test::kLtx2VideoDecBf16ParamCounts,
+                std::size(vllm_test::kLtx2VideoDecBf16ParamNames));
+  const vllm::Ltx2VaeWeights bf16 = NarrowToBf16(bag.weights);
+  // THE BAG IS HALF THE BYTES, measured on the same input rather than quoted.
+  // This is the storage half of the row: an arm that computed in bf16 and kept
+  // f32 parameters would pass every value check below and move twice the bytes.
+  CHECK(bf16.Bytes() * 2 == bag.weights.Bytes());
+  CHECK(bf16.tensors.empty());
+
+  const int64_t lc = vllm_test::kLtx2VideoDecLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecLatentW;
+  const std::vector<float> latent = Ltx2Input("ltx2.videodec.input", lc * lt * lh * lw, 1.0);
+
+  GoldenNoise noise;
+  const vllm::Ltx2VideoFrames frames =
+      vllm::Ltx2ConvVideoDecode(cfg, bf16, latent, lc, lt, lh, lw, &noise);
+  CHECK(frames.channels == vllm_test::kLtx2VideoDecBf16OutC);
+  CHECK(frames.frames == vllm_test::kLtx2VideoDecBf16OutT);
+  CHECK(frames.height == vllm_test::kLtx2VideoDecBf16OutH);
+  CHECK(frames.width == vllm_test::kLtx2VideoDecBf16OutW);
+  REQUIRE(static_cast<int64_t>(noise.counts().size()) ==
+          vllm_test::kLtx2VideoDecBf16NoiseDraws);
+
+  // EVERY RETURNED VALUE SURVIVES A bf16 ROUND TRIP, which is the property the
+  // values alone cannot carry: a decode that computed in f32 and rounded once at
+  // the exit would clear the band below while moving twice the bytes the whole
+  // way. The f32 arm on this same fixture fails this on most of the stream, and
+  // the case above is what shows that.
+  int64_t wider = 0;
+  for (const float v : frames.data) {
+    if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++wider;
+  }
+  INFO("bf16 decode values wider than bf16: " << wider << " of " << frames.data.size());
+  REQUIRE(!frames.data.empty());
+  CHECK(wider == 0);
+
+  // ── THE BOUND IS THE CHAIN'S OWN ONE-ULP RESPONSE, MEASURED ───────────────
+  //
+  // This arm is NOT bit-exact and the reason is upstream's convolution rather
+  // than a rule this port gets wrong. `cpu_conv3d`'s contract is torch's -- an
+  // f32 accumulator seeded with the bias, one rounding on store -- but torch
+  // BLOCKS its reduction, and at this fixture's own convolution shapes the two
+  // association orders disagree on 3 to 5 outputs of 8192 to 24576. Thirteen
+  // convolutions deep, those residues compound.
+  //
+  // SO THE BOUND IS A PROPERTY OF THE CHAIN AND NOT OF THE RESULT.
+  // `kLtx2VideoDecBf16UlpSensitivity` is what the generator measured by
+  // perturbing ONE `conv_in` weight by ONE bf16 ulp and re-running upstream: it
+  // is how far this decode moves when a single last bit of the SHIPPING FORMAT
+  // changes, which is exactly the size of the difference the port cannot avoid.
+  // Nothing about the port's own distance went into choosing it.
+  //
+  // AND IT IS PROVEN TO SEPARATE, which is the half wave 2 had to delete its own
+  // bound for. The generator replaced each rejected rule in upstream and re-ran
+  // end to end, and the two that reach this fixture's output both exceed the
+  // bound. The third does not reach it at all -- at ANY bound -- which is why the
+  // per-kernel cases exist rather than being a convenience.
+  //
+  // The SHALLOW bf16 arm two cases below runs the same rules through TWO
+  // convolutions instead of thirteen and is held BIT-EXACT, so the rules this
+  // bound cannot resolve are resolved there.
+  const double err = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecBf16Golden,
+                                std::size(vllm_test::kLtx2VideoDecBf16Golden));
+  INFO("BF16 conv video decoder max|diff| = "
+       << err << " against a one-ulp sensitivity of "
+       << vllm_test::kLtx2VideoDecBf16UlpSensitivity << "; the two upstream arms are "
+       << vllm_test::kLtx2VideoDecBf16ArmGap << " apart; defect distances: f32 statistics "
+       << vllm_test::kLtx2VideoDecBf16DefectStats << ", _RMSNorm2D order "
+       << vllm_test::kLtx2VideoDecBf16DefectRmsOrder << ", f32 GroupNorm affine "
+       << vllm_test::kLtx2VideoDecBf16DefectGroupNormAffine);
+  CHECK(err <= vllm_test::kLtx2VideoDecBf16UlpSensitivity);
+
+  // 1. The chain really does have an irreducible term, so the bound is a
+  //    measurement and not a shrug.
+  CHECK(vllm_test::kLtx2VideoDecBf16UlpSensitivity > 0.0);
+  // 2. AND THE BOUND SEPARATES REAL DEFECTS. Without these two lines it is a
+  //    number that happens to admit the port. Wave 2 measured that its own
+  //    planned bound would have admitted three of five defect mutations and
+  //    deleted it; these say that this one does not.
+  CHECK(vllm_test::kLtx2VideoDecBf16DefectStats > vllm_test::kLtx2VideoDecBf16UlpSensitivity);
+  CHECK(vllm_test::kLtx2VideoDecBf16DefectRmsOrder > vllm_test::kLtx2VideoDecBf16UlpSensitivity);
+  // 3. One of the three defects does not reach this fixture's output AT ALL, so
+  //    no bound here could ever see it. That is the statement that makes the
+  //    per-kernel GroupNorm case load-bearing rather than duplicative.
+  CHECK(vllm_test::kLtx2VideoDecBf16DefectGroupNormAffine == 0.0);
+  // 4. The two upstream arms are far apart on this fixture and the bound is well
+  //    inside that gap, so "the port quietly ran the f32 path" is a red rather
+  //    than a hypothetical.
+  CHECK(vllm_test::kLtx2VideoDecBf16ArmGap > 2 * vllm_test::kLtx2VideoDecBf16UlpSensitivity);
+  // 5. The golden was taken under `SDPBackend.MATH`. On this fixture that is the
+  //    same tensor the module produces as constructed -- the attn block's
+  //    sequence is short enough that the dispatcher does not reach FLASH -- so
+  //    the pin costs nothing HERE and is recorded as zero rather than assumed.
+  //    At the shipped widths it does not: FLASH serves the bare call and is
+  //    37-38% of words away from MATH, which the row's spec carries as a risk.
+  CHECK(vllm_test::kLtx2VideoDecBf16BackendGap == 0.0);
+}
+
+namespace {
+
+// Narrow an f32 golden input to the bf16 words the kernel is fed, so both sides
+// start from the SAME rounded values and a mismatch is the arithmetic.
+std::vector<uint16_t> Bf16Words(const float* src, size_t n) {
+  std::vector<uint16_t> out(n);
+  for (size_t i = 0; i < n; ++i) out[i] = vt::F32ToBF16(src[i]);
+  return out;
+}
+std::vector<float> WidenWords(const std::vector<uint16_t>& w) {
+  std::vector<float> out(w.size());
+  for (size_t i = 0; i < w.size(); ++i) out[i] = vt::BF16ToF32(w[i]);
+  return out;
+}
+
+// ─── A FAKE ACCELERATOR, SO A NON-CPU REFUSAL IS REACHABLE WITHOUT A GPU ─────
+//
+// `Ltx2ConvVideoDecode` refuses a bf16 bag on a non-CPU queue, but reaching that
+// refusal needs a device type with a REGISTERED PLATFORM (ltx2_video_vae.cpp:177)
+// and a REGISTERED BACKEND (`VaeWeightCache`'s constructor, `:489-495`). Neither
+// needs hardware: both registries are plain public tables, and thirteen other
+// test files in this CPU-only build already call them
+// (`grep -rln 'platforms::RegisterPlatform' tests/`) —
+// `tests/vllm/multimodal/test_ltx2_video_device_forward.cpp:190-192` is the one
+// this is shaped after.
+//
+// `kXPU` ONLY, deliberately: `CurrentPlatform()` walks {kCUDA, kROCM, kXPU, ...}
+// and returns the first REGISTERED entry (src/vllm/platforms/platform.cpp:91-98),
+// so registering into the CUDA slot as well — which the device-forward file does,
+// because it needs `CurrentPlatform()` to resolve to the fake — would change what
+// every other case in this binary resolves. Nothing here asks `CurrentPlatform()`;
+// the refusal under test asks `HasPlatform(kXPU)`. Measured: the suite reads the
+// same case and assertion count with this registration as without it.
+//
+// Its memory is host memory and it is honest about that. Nothing below allocates
+// on it — the refusal fires before the first allocation — so `Alloc` exists only
+// to satisfy the interface.
+class FakeXpuBackend final : public vt::Backend {
+ public:
+  void* Alloc(size_t bytes) override { return std::malloc(bytes == 0 ? 1 : bytes); }
+  void Free(void* ptr) override { std::free(ptr); }
+  void Memset(vt::Queue&, void* ptr, int value, size_t bytes) override {
+    std::memset(ptr, value, bytes);
+  }
+  void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
+    std::memcpy(dst, src, bytes);
+  }
+  vt::Queue CreateQueue() override { return vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr}; }
+  bool UnifiedMemory() const override { return true; }
+  bool DeviceMemoryIsHostAddressable() const override { return true; }
+};
+
+class FakeXpuPlatform final : public vllm::platforms::Platform {
+ public:
+  explicit FakeXpuPlatform(FakeXpuBackend& backend) : backend_(backend) {}
+  vt::DeviceType device_type() const override { return vt::DeviceType::kXPU; }
+  vt::Backend& backend() const override { return backend_; }
+  vllm::platforms::DeviceCapability get_device_capability() const override { return {}; }
+  std::vector<vt::DType> supported_dtypes() const override { return {vt::DType::kBF16}; }
+  vllm::platforms::ResidencyPolicy residency_policy() const override { return {}; }
+  bool supports_model_architecture(std::string_view) const override { return true; }
+
+ private:
+  FakeXpuBackend& backend_;
+};
+
+// Idempotent, so a case can call it without ordering itself against the others.
+void RegisterFakeXpuAccelerator() {
+  static FakeXpuBackend backend;
+  static FakeXpuPlatform platform(backend);
+  vt::RegisterBackend(vt::DeviceType::kXPU, &backend);
+  vllm::platforms::RegisterPlatform(vt::DeviceType::kXPU, &platform);
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 vae: each kLtx2Vae kernel's BF16 rule is the one upstream applies") {
+  // A24 wave 3 (#2786). Section 5e holds the whole decode against upstream's own
+  // bf16 output and is the gate that matters; this case holds ONE rounding rule
+  // per kernel, so a red says WHICH rule moved rather than only that the clip
+  // did. Each arm asserts bit-exactness against upstream AND a non-zero distance
+  // to the hypothesis the generator rejected, because a golden carrying only
+  // upstream's answer shows agreement and never that the two are separable.
+  //
+  // EVERY ARM IS BATCH 1 AND CHANNEL-MAJOR. These kernels take a [C, spatial]
+  // volume and torch puts a batch axis OUTSIDE the channel axis, so a batch-2
+  // fixture flattens to a volume the kernel reads as something else entirely.
+  // The first form of the PixelNorm probe below had batch 2 and reported the port
+  // 0.44 away from upstream, which was the layout and not the arithmetic.
+  const vllm::ltx2_vae::Ltx2VaeDeviceKernels* k =
+      vllm::ltx2_vae::Ltx2VaeDevice(vt::DeviceType::kCPU);
+  REQUIRE(k != nullptr);
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  SUBCASE("group_norm narrows the AFFINE and keeps its statistics wide") {
+    // `nn.GroupNorm` at bf16 differs from the f32 module rounded once, and the
+    // whole difference is that `weight` and `bias` are bf16. The statistics' own
+    // width does not separate at all -- f32 and f64 agree everywhere -- so this
+    // kernel keeps the f64 accumulators every committed golden was taken through
+    // and gets its narrowing from the weights BAG.
+    const int64_t c = vllm_test::kLtx2Bf16GnChannels;
+    const int64_t sp = vllm_test::kLtx2Bf16GnSpatial;
+    const size_t n = static_cast<size_t>(c * sp);
+    REQUIRE(vllm_test::kLtx2Bf16GnSeparating > 0);
+    std::vector<uint16_t> x = Bf16Words(vllm_test::kLtx2Bf16GnInput, n);
+    const std::vector<uint16_t> w =
+        Bf16Words(vllm_test::kLtx2Bf16GnWeight, static_cast<size_t>(c));
+    const std::vector<uint16_t> b =
+        Bf16Words(vllm_test::kLtx2Bf16GnBias, static_cast<size_t>(c));
+    vllm::Ltx2ConvVideoDecoderConfig cfg;
+    k->group_norm(q, x.data(), c, sp, vllm_test::kLtx2Bf16GnGroups, w.data(), b.data(),
+                  cfg.norm_eps, vt::DType::kBF16);
+    const std::vector<float> got = WidenWords(x);
+    const double err = MaxAbsDiff(got, vllm_test::kLtx2Bf16GnGolden, n);
+    INFO("group_norm bf16 max|diff| = " << err);
+    CHECK(err == 0.0);
+    const double rej = MaxAbsDiff(got, vllm_test::kLtx2Bf16GnRejectedF32Affine, n);
+    INFO("distance to the f32-affine answer = " << rej);
+    CHECK(rej > 0.0);
+  }
+
+  SUBCASE("ada_ln rounds THREE times") {
+    // `hidden * (1 + scale) + shift` is three eager ops on bf16 tensors, so
+    // `1 + scale` materializes, the multiply materializes and the add
+    // materializes. The rejected arm is the same expression fused in f32.
+    const int64_t c = vllm_test::kLtx2Bf16AdaChannels;
+    const int64_t sp = vllm_test::kLtx2Bf16AdaSpatial;
+    const size_t n = static_cast<size_t>(c * sp);
+    REQUIRE(vllm_test::kLtx2Bf16AdaSeparating > 0);
+    std::vector<uint16_t> x = Bf16Words(vllm_test::kLtx2Bf16AdaInput, n);
+    const std::vector<uint16_t> table =
+        Bf16Words(vllm_test::kLtx2Bf16AdaTable, static_cast<size_t>(4 * c));
+    const std::vector<uint16_t> embed =
+        Bf16Words(vllm_test::kLtx2Bf16AdaEmbed, static_cast<size_t>(4 * c));
+    k->ada_ln(q, x.data(), table.data(), embed.data(), c, sp, 4, 0, 1, vt::DType::kBF16);
+    const std::vector<float> got = WidenWords(x);
+    const double err = MaxAbsDiff(got, vllm_test::kLtx2Bf16AdaGolden, n);
+    INFO("ada_ln bf16 max|diff| = " << err);
+    CHECK(err == 0.0);
+    const double rej = MaxAbsDiff(got, vllm_test::kLtx2Bf16AdaRejectedOneRounding, n);
+    INFO("distance to the one-rounding answer = " << rej);
+    CHECK(rej > 0.0);
+  }
+
+  SUBCASE("spatial_noise rounds the PRODUCT, then the ADD") {
+    // `_feed_spatial_noise` forms `spatial_noise * per_channel_scale` as its own
+    // tensor and adds it (resnet.py:114-117): two eager ops, not one fused
+    // expression.
+    const int64_t c = vllm_test::kLtx2Bf16NoiseChannels;
+    const int64_t t = vllm_test::kLtx2Bf16NoiseT;
+    const int64_t h = vllm_test::kLtx2Bf16NoiseH;
+    const int64_t w = vllm_test::kLtx2Bf16NoiseW;
+    const size_t n = static_cast<size_t>(c * t * h * w);
+    REQUIRE(vllm_test::kLtx2Bf16NoiseSeparating > 0);
+    std::vector<uint16_t> x = Bf16Words(vllm_test::kLtx2Bf16NoiseInput, n);
+    const std::vector<uint16_t> plane =
+        Bf16Words(vllm_test::kLtx2Bf16NoisePlane, static_cast<size_t>(h * w));
+    const std::vector<uint16_t> scale =
+        Bf16Words(vllm_test::kLtx2Bf16NoiseScale, static_cast<size_t>(c));
+    k->spatial_noise(q, x.data(), plane.data(), scale.data(), c, t, h, w, vt::DType::kBF16);
+    const std::vector<float> got = WidenWords(x);
+    const double err = MaxAbsDiff(got, vllm_test::kLtx2Bf16NoiseGolden, n);
+    INFO("spatial_noise bf16 max|diff| = " << err);
+    CHECK(err == 0.0);
+    const double rej = MaxAbsDiff(got, vllm_test::kLtx2Bf16NoiseRejectedFused, n);
+    INFO("distance to the fused answer = " << rej);
+    CHECK(rej > 0.0);
+  }
+
+  SUBCASE("linear_cn seeds its accumulator with the BIAS") {
+    // A 1x1x1 `nn.Conv3d` (make_linear_nd, convolution.py:84-85). The reduction
+    // is wider than the storage and there is one rounding on store, and the bias
+    // is INSIDE that accumulator: adding it after the store rounding is the
+    // rejected arm.
+    const int64_t cin = vllm_test::kLtx2Bf16LinIn;
+    const int64_t cout = vllm_test::kLtx2Bf16LinOut;
+    const int64_t n = vllm_test::kLtx2Bf16LinN;
+    const size_t outn = static_cast<size_t>(cout * n);
+    REQUIRE(vllm_test::kLtx2Bf16LinSeparating > 0);
+    const std::vector<uint16_t> x =
+        Bf16Words(vllm_test::kLtx2Bf16LinInput, static_cast<size_t>(cin * n));
+    const std::vector<uint16_t> w =
+        Bf16Words(vllm_test::kLtx2Bf16LinWeight, static_cast<size_t>(cout * cin));
+    const std::vector<uint16_t> b =
+        Bf16Words(vllm_test::kLtx2Bf16LinBias, static_cast<size_t>(cout));
+    std::vector<uint16_t> outw(outn, 0);
+    k->linear_cn(q, outw.data(), x.data(), w.data(), b.data(), cout, cin, n, vt::DType::kBF16);
+    const std::vector<float> got = WidenWords(outw);
+    const double err = MaxAbsDiff(got, vllm_test::kLtx2Bf16LinGolden, outn);
+    INFO("linear_cn bf16 max|diff| = " << err);
+    CHECK(err == 0.0);
+    const double rej = MaxAbsDiff(got, vllm_test::kLtx2Bf16LinRejectedBiasAfter, outn);
+    INFO("distance to the bias-after-rounding answer = " << rej);
+    CHECK(rej > 0.0);
+  }
+}
+
+TEST_CASE("ltx2 vae: the SHALLOW bf16 arm holds the three rules the deep one cannot") {
+  // A24 wave 3 (#2786). The whole-decode bf16 case above carries no value bound,
+  // because thirteen convolutions of torch's blocked reduction give it an
+  // irreducible term of the same size as a real defect. That is a property of
+  // DEPTH, and this arm removes it: TWO convolutions -- `conv_in` and `conv_out`
+  // -- with an `attn` block between them and timestep conditioning on.
+  //
+  // It is therefore where three rules become gateable that neither the kernel
+  // table nor the deep arm owns:
+  //   * `_RMSNorm2D` forms `sqrt(C) * gamma` FIRST and multiplies once
+  //     (attention.py:23);
+  //   * `per_channel_statistics.un_normalize` rounds its multiply and its add
+  //     separately, on statistics narrowed by `.to(x)` (ops.py:76-79);
+  //   * the PixArt timestep embedding is computed AT the activation dtype
+  //     (`hidden_dtype=sample.dtype`, conv_video_decoder.py:331-334), not in f32
+  //     and rounded once.
+  //
+  // `sqrt(8)` IS NOT A POWER OF TWO, and that is why the block sits at
+  // `base_channels * 1 = 8` channels. At C=64 every ordering of
+  // `F.normalize(x) * (sqrt(C) * gamma)` agrees on 4800 of 4800 values, so a
+  // probe built on a power-of-two width would gate nothing at all.
+  vllm::Ltx2ConvVideoDecoderConfig cfg = ReducedVideoDecoderConfig();
+  cfg.prefix = "ltx2.videodecshallow.";
+  cfg.decoder_blocks = {{"attn", 1, 0, false, false}};
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoDecShallowParamNames,
+                vllm_test::kLtx2VideoDecShallowParamCounts,
+                std::size(vllm_test::kLtx2VideoDecShallowParamNames));
+  const vllm::Ltx2VaeWeights bf16 = NarrowToBf16(bag.weights);
+
+  const int64_t lc = vllm_test::kLtx2VideoDecLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecLatentW;
+  const std::vector<float> latent =
+      Ltx2Input("ltx2.videodecshallow.input", lc * lt * lh * lw, 1.0);
+
+  GoldenNoise noise("ltx2.videodecshallow.");
+  const vllm::Ltx2VideoFrames frames =
+      vllm::Ltx2ConvVideoDecode(cfg, bf16, latent, lc, lt, lh, lw, &noise);
+  CHECK(frames.channels == vllm_test::kLtx2VideoDecShallowOutC);
+  CHECK(frames.frames == vllm_test::kLtx2VideoDecShallowOutT);
+  CHECK(frames.height == vllm_test::kLtx2VideoDecShallowOutH);
+  CHECK(frames.width == vllm_test::kLtx2VideoDecShallowOutW);
+  REQUIRE(static_cast<int64_t>(noise.counts().size()) ==
+          vllm_test::kLtx2VideoDecShallowNoiseDraws);
+
+  // THE THREE REJECTED ANSWERS SEPARATE, asserted before the comparison that
+  // depends on them. Each is upstream re-run end to end with one rounding rule
+  // replaced by the hypothesis this row rejected, and a zero here would mean the
+  // bit-exact check below is satisfied by any of them.
+  INFO("rejected distances: _RMSNorm2D order "
+       << vllm_test::kLtx2VideoDecShallowRejectRmsOrder << ", un_normalize fused "
+       << vllm_test::kLtx2VideoDecShallowRejectUnNormalize << ", f32 timestep embedding "
+       << vllm_test::kLtx2VideoDecShallowRejectTimestepF32);
+  CHECK(vllm_test::kLtx2VideoDecShallowRejectRmsOrder > 0.0);
+  CHECK(vllm_test::kLtx2VideoDecShallowRejectUnNormalize > 0.0);
+  CHECK(vllm_test::kLtx2VideoDecShallowRejectTimestepF32 > 0.0);
+
+  const double err = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecShallowGolden,
+                                std::size(vllm_test::kLtx2VideoDecShallowGolden));
+  // EACH REJECTED ANSWER IS EMITTED AS A TENSOR, not only as a distance, so a
+  // failing port can be told WHICH hypothesis it landed on. That is what turned a
+  // 0.0078 red here into the finding it was: the port matched none of the three,
+  // which pointed at a fourth rule -- the noise blend's Python-float scalars,
+  // which this port was narrowing to bf16 and torch is not.
+  MESSAGE("shallow bf16 arm: vs upstream " << err
+          << " vs rms-order " << MaxAbsDiff(frames.data,
+               vllm_test::kLtx2VideoDecShallowRejectedRmsOrderGolden,
+               std::size(vllm_test::kLtx2VideoDecShallowRejectedRmsOrderGolden))
+          << " vs un_normalize-fused " << MaxAbsDiff(frames.data,
+               vllm_test::kLtx2VideoDecShallowRejectedUnNormalizeGolden,
+               std::size(vllm_test::kLtx2VideoDecShallowRejectedUnNormalizeGolden))
+          << " vs f32-timestep " << MaxAbsDiff(frames.data,
+               vllm_test::kLtx2VideoDecShallowRejectedTimestepF32Golden,
+               std::size(vllm_test::kLtx2VideoDecShallowRejectedTimestepF32Golden)));
+  INFO("shallow bf16 arm max|diff| = " << err);
+  // BIT-EXACT, not within a band. Two convolutions leave no room for the blocked
+  // reduction to compound, so anything but zero is a rule that does not match --
+  // and every one of the rejected answers above is further away than zero.
+  CHECK(err == 0.0);
+}
+
+TEST_CASE("ltx2 vae: the scaled timestep NARROWS BOTH OPERANDS and rounds the product") {
+  // A24 wave 3 fresh review (#2786). `Ltx2ConvVideoDecode` forms
+  //   Round(Round(timestep) * Round(timestep_scale_multiplier))
+  // to mirror `timestep * self.timestep_scale_multiplier.to(sample)`
+  // (conv_video_decoder.py:313), where `timestep` is built at `sample.dtype`
+  // (`:304-305`) and `.to(sample)` narrows the parameter. The case above CANNOT
+  // gate that: reverting the port to its pre-row f64 product left all 52 cases
+  // and 3480 assertions of this file green, because the shared stream draws this
+  // fixture's multiplier as 0.0675802556968955 and the entire difference between
+  // the two rules is then a relative 1.5e-7 in a 3.4e-3 angle -- under a quarter
+  // of a bf16 ulp at every one of the 256 projection entries.
+  //
+  // So this case is the SAME arm with ONE parameter changed, on both sides. The
+  // multiplier was SWEPT rather than chosen: 3.7, 7.3, 23.7, 41.3, 499.7 and the
+  // SHIPPED 1000 all separate nothing, and the generator's section 5i records
+  // the whole table. 113.7 separates 119 of the 144 outputs and is still small
+  // enough that this arm measures the product's rounding rather than the f64
+  // frequency table `TimestepEmbedding` documents as its one wide exception.
+  vllm::Ltx2ConvVideoDecoderConfig cfg = ReducedVideoDecoderConfig();
+  cfg.prefix = "ltx2.videodecshallow.";
+  cfg.decoder_blocks = {{"attn", 1, 0, false, false}};
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+  // The manifest is section 5h's, unchanged -- the arms differ by a VALUE and
+  // not by a parameter, which is what makes the comparison below about the rule.
+  CheckManifest(bag, vllm_test::kLtx2VideoDecShallowParamNames,
+                vllm_test::kLtx2VideoDecShallowParamCounts,
+                std::size(vllm_test::kLtx2VideoDecShallowParamNames));
+  bag.weights.tensors[cfg.prefix + "timestep_scale_multiplier"] = {
+      static_cast<float>(vllm_test::kLtx2VideoDecTsScaleMultiplier)};
+  const vllm::Ltx2VaeWeights bf16 = NarrowToBf16(bag.weights);
+
+  // THE TWO SCALARS, asserted before the tensors, so a failure says whether the
+  // arm stopped separating or the port stopped mirroring. `kLtx2VideoDecTsScale*`
+  // are upstream's own values at this multiplier.
+  const float t_bf = vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(
+      vllm_test::kLtx2VideoDecTsScaleTimestep)));
+  const float m_bf = vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(
+      vllm_test::kLtx2VideoDecTsScaleMultiplier)));
+  const double rule = static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(t_bf * m_bf)));
+  const double wide = vllm_test::kLtx2VideoDecTsScaleTimestep * static_cast<double>(m_bf);
+  INFO("scaled timestep: rule " << rule << " vs wide product " << wide);
+  CHECK(rule == vllm_test::kLtx2VideoDecTsScaleRuleValue);
+  CHECK(wide == vllm_test::kLtx2VideoDecTsScaleWideValue);
+  CHECK(rule != wide);
+
+  const int64_t lc = vllm_test::kLtx2VideoDecLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecLatentW;
+  const std::vector<float> latent =
+      Ltx2Input("ltx2.videodecshallow.input", lc * lt * lh * lw, 1.0);
+
+  GoldenNoise noise("ltx2.videodecshallow.");
+  const vllm::Ltx2VideoFrames frames =
+      vllm::Ltx2ConvVideoDecode(cfg, bf16, latent, lc, lt, lh, lw, &noise);
+
+  // THE REJECTED ANSWER SEPARATES, asserted before the comparison that depends
+  // on it. It is upstream re-run with a WIDE `timestep` tensor, which is exactly
+  // the pre-row hypothesis and nothing else -- 0.01171875 apart, three bf16 ulps
+  // at this output's scale.
+  INFO("wide-product rejected distance: " << vllm_test::kLtx2VideoDecTsScaleRejectWideProduct);
+  CHECK(vllm_test::kLtx2VideoDecTsScaleRejectWideProduct > 0.0);
+
+  const double err = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecTsScaleGolden,
+                                std::size(vllm_test::kLtx2VideoDecTsScaleGolden));
+  const double rej = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecTsScaleRejectedWideProductGolden,
+                                std::size(vllm_test::kLtx2VideoDecTsScaleRejectedWideProductGolden));
+  MESSAGE("scaled-timestep arm: vs upstream " << err << " vs wide-product " << rej);
+  INFO("scaled-timestep arm max|diff| = " << err);
+  // Bit-exact against upstream, and NOT on the rejected answer. A port that kept
+  // the f64 product would land on the second number, not the first.
+  CHECK(err == 0.0);
+  CHECK(rej == vllm_test::kLtx2VideoDecTsScaleRejectWideProduct);
+}
+
+TEST_CASE("ltx2 vae: the dtype refusals this arm adds are REACHED, not merely written") {
+  // A24 wave 3 fresh review (#2786). The row adds three refusals and gated none
+  // of them; `grep -rn "the decode serves f32" tests/` returned nothing, while
+  // `vt::Conv3d`'s equivalent has been gated since tests/vt/test_ops_conv3d.cpp:738.
+  // A refusal nothing executes is a comment.
+  vllm::Ltx2ConvVideoDecoderConfig cfg = ReducedVideoDecoderConfig();
+  cfg.prefix = "ltx2.videodecshallow.";
+  cfg.decoder_blocks = {{"attn", 1, 0, false, false}};
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+
+  const int64_t lc = vllm_test::kLtx2VideoDecLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecLatentW;
+  const std::vector<float> latent =
+      Ltx2Input("ltx2.videodecshallow.input", lc * lt * lh * lw, 1.0);
+
+  SUBCASE("a third storage width is refused by name") {
+    // `RequireVaeDType`. FP8 and NVFP4 are A22; the point is that a bag carrying
+    // one arrives at a message naming this decode and the dtype, not at a
+    // kernel-level surprise three headers away.
+    //
+    // THIS GATES THE PREDICATE, NOT THE ENTRY-POINT CALL SITE, and the difference
+    // is MEASURED rather than assumed. `RequireVaeDType` is called from three
+    // places with ONE message -- the decode entry (ltx2_video_vae.cpp:1465),
+    // `VaeStore::Alloc` (`:250`) and `VaeScratch` (`:546`). Deleting the
+    // entry-point call alone compiles and leaves this whole case GREEN, 1 of 1
+    // and 3 of 3 assertions: the store refuses the same bag with the same words a
+    // few lines later. That is the shape
+    // `RequirePooledDevice`'s own comment at `:167-175` names, "a guard with a
+    // spare copy is a guard whose deletion no test can see", and here the spare
+    // copies are deliberate: the entry call is a fail-fast that refuses BEFORE
+    // the first allocation, and the two deep ones are the refusal proper.
+    // Forking the text so this case could gate `:1465` specifically would give
+    // one refusal three messages, which is exactly what `:212-213` says the
+    // single function exists to prevent. What is asserted here is that a third
+    // storage width cannot reach the decode; WHICH of the three sites answers is
+    // not.
+    vllm::Ltx2VaeWeights wrong = bag.weights;
+    wrong.dtype = vt::DType::kF16;
+    GoldenNoise noise("ltx2.videodecshallow.");
+    CHECK_THROWS_WITH_AS(
+        vllm::Ltx2ConvVideoDecode(cfg, wrong, latent, lc, lt, lh, lw, &noise),
+        doctest::Contains("the decode serves f32"), std::runtime_error);
+  }
+
+  SUBCASE("a bf16 bag on a NON-CPU queue is refused by name, on this CPU-only build") {
+    // THE SHADOWING IS REAL ONLY IN THE CONTROL CONDITION, and that is the whole
+    // finding. `Ltx2ConvVideoDecode` refuses a bf16 bag on a non-CPU queue
+    // (ltx2_video_vae.cpp:1473-1481), and an EARLIER check at `:1441` refuses any
+    // queue whose device type has no registered platform (`:177`). With no
+    // platform registered the second message is the one that arrives, which is
+    // what an earlier revision of this file recorded as "cannot be gated on this
+    // build, it needs a CUDA build and a lease". That was FALSE.
+    // `vllm::platforms::RegisterPlatform` and `vt::RegisterBackend` are public
+    // APIs, thirteen other test files in this tree already call them on CPU-only
+    // builds, and registering one here reaches the dtype refusal with no GPU
+    // anywhere in the loop.
+    //
+    // Both arms measured, same tree, one call apart:
+    //   registration called     -> "only the CPU arm serves it"          (`:1473`)
+    //   registration NOT called -> "for which no platform is registered" (`:177`)
+    //
+    // The bag can be the fixture's own: the refusal fires before the first
+    // `wcache.Get` and before the first allocation, so no weight is read and
+    // nothing is staged onto the fake device.
+    RegisterFakeXpuAccelerator();
+    vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+    vllm::Ltx2VaeWeights bf16 = bag.weights;
+    bf16.dtype = vt::DType::kBF16;
+    GoldenNoise noise("ltx2.videodecshallow.");
+    CHECK_THROWS_WITH_AS(
+        vllm::Ltx2ConvVideoDecode(cfg, bf16, latent, lc, lt, lh, lw, &noise, nullptr, &q),
+        doctest::Contains("only the CPU arm serves it"), std::runtime_error);
+  }
+
+  SUBCASE("the ENCODER refuses a THIRD storage width by name, at its own entry") {
+    // WAVE 3'S REFUSAL HERE IS GONE, AND THAT IS THIS ROW'S DELIVERABLE.
+    // This subcase used to assert "the encoder is still the f32 port". A24 wave 4
+    // (row LTX25-A24-LEAVES-BF16, #2850) landed the arm that refusal stood in
+    // for, so asserting it now would gate the absence of the feature. What
+    // survives -- and what wave 3's fresh review actually asked for, that a
+    // refusal nothing executes is a comment -- is that a width NEITHER arm serves
+    // still stops here, by name, at the entry rather than several hundred lines
+    // downstream on a `weights.Get` reporting a missing parameter.
+    //
+    // FP8 and NVFP4 are A22. THE ASSERTED TOKEN IS THE ENTRY'S OWN, and it has
+    // to be: the encoder also shares `RequireVaeDType` with the decode through
+    // `VaeStore::Alloc`, 60-odd lines downstream where the staging buffer is
+    // allocated, so asserting the SHARED decode message passes with the entry
+    // check deleted and measures that later site instead. "the encoder was
+    // handed" is emitted at the entry and nowhere else, so deleting the entry
+    // check goes red here.
+    vllm::Ltx2ConvVideoEncoderConfig enc;
+    enc.prefix = "ltx2.videoenc.";
+    enc.in_channels = 3;
+    enc.out_channels = 4;
+    enc.patch_size = 2;
+    const std::vector<float> frames(static_cast<size_t>(enc.in_channels * 1 * 8 * 8), 0.0f);
+    vllm::Ltx2VaeWeights wrong;
+    wrong.dtype = vt::DType::kF16;
+    CHECK_THROWS_WITH_AS(
+        vllm::Ltx2ConvVideoEncode(enc, wrong, frames, enc.in_channels, 1, 8, 8, nullptr),
+        doctest::Contains("the encoder was handed"), std::runtime_error);
+  }
+}
+
+TEST_CASE("ltx2 vae: the PixelNorm epsilon is the BF16 one, at the scale where that BINDS") {
+  // A24 wave 3 (#2786), and the reason it is a separate case from the decoder
+  // golden above is the whole lesson of A24 wave 1.
+  //
+  // `PixelNorm.forward` adds `self.eps` to a bf16 `mean_sq`
+  // (model/common/normalization.py:37-40), so torch promotes the Python float to
+  // the TENSOR's dtype and what reaches the add is
+  // `bf16(1e-8) = 1.0011717677116394e-08`, not `1e-8`. Holding the rest of the
+  // chain fixed and varying ONLY that width separates on 0 of 144 values at
+  // ordinary magnitude and on 25 of 144 at a row scale of 2^-14. A probe taken at
+  // the shipped fixture's scale would gate the width at ZERO -- the mute switch
+  // wave 1 shipped, whose claimed mutation stayed green at 4313 of 4313.
+  //
+  // "IS IT READ" AND "AT WHAT WIDTH" ARE DIFFERENT QUESTIONS and this case asks
+  // both. Removing the epsilon entirely separates from 2^-10 (144 of 144), where
+  // the width still does not. The generator emits the separating count for each
+  // scale and REFUSES to emit an arm that separates nothing, so the numbers
+  // asserted below are the oracle's own and not this file's.
+  const vllm::ltx2_vae::Ltx2VaeDeviceKernels* k =
+      vllm::ltx2_vae::Ltx2VaeDevice(vt::DeviceType::kCPU);
+  REQUIRE(k != nullptr);
+  const int64_t c = vllm_test::kLtx2PixelNormEpsChannels;
+  const int64_t sp = vllm_test::kLtx2PixelNormEpsSpatial;
+  const size_t n = static_cast<size_t>(c * sp);
+  const size_t arms = std::size(vllm_test::kLtx2PixelNormEpsScales);
+  REQUIRE(std::size(vllm_test::kLtx2PixelNormEpsGolden) == n * arms);
+
+  // THE PROBE SEPARATES SOMEWHERE, asserted rather than hoped. Without this the
+  // three comparisons below are satisfied by any epsilon at all.
+  int64_t width_sep = 0, read_sep = 0;
+  for (size_t a = 0; a < arms; ++a) {
+    width_sep += vllm_test::kLtx2PixelNormEpsWidthSeparating[a];
+    read_sep += vllm_test::kLtx2PixelNormEpsReadSeparating[a];
+  }
+  INFO("separating: width " << width_sep << ", read " << read_sep);
+  CHECK(width_sep > 0);
+  CHECK(read_sep > 0);
+  // ...and the ORDINARY-magnitude arm separates NOTHING on the width question,
+  // which is the statement that makes the low-magnitude arms necessary rather
+  // than decorative. It is asserted so that a fixture change which accidentally
+  // made it separate is reported instead of quietly widening the case.
+  CHECK(vllm_test::kLtx2PixelNormEpsWidthSeparating[0] == 0);
+
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  for (size_t a = 0; a < arms; ++a) {
+    // The kernel is fed the bf16 words the generator's tensor holds, so both
+    // sides start from the same narrowed input.
+    std::vector<uint16_t> x(n);
+    for (size_t i = 0; i < n; ++i) {
+      x[i] = vt::F32ToBF16(vllm_test::kLtx2PixelNormEpsInput[a * n + i]);
+    }
+    vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    k->pixel_norm(q, x.data(), c, sp, static_cast<float>(cfg.pixel_norm_eps), vt::DType::kBF16);
+    std::vector<float> got(n);
+    for (size_t i = 0; i < n; ++i) got[i] = vt::BF16ToF32(x[i]);
+
+    const double err = MaxAbsDiff(got, &vllm_test::kLtx2PixelNormEpsGolden[a * n], n);
+    INFO("PixelNorm bf16 arm 2^" << vllm_test::kLtx2PixelNormEpsScales[a]
+                                 << " max|diff| = " << err);
+    // BIT-EXACT, not within a band. Every rounding point of this chain is
+    // reproduced explicitly, so anything but zero is a rule that does not match.
+    CHECK(err == 0.0);
+
+    // AND THE REJECTED ANSWERS ARE EMITTED BESIDE IT. A golden that only carries
+    // upstream's answer proves the port agrees with upstream; it does not show
+    // that the two hypotheses are distinguishable at all. Where the generator
+    // measured a separation, the port must NOT match the rejected arm.
+    if (vllm_test::kLtx2PixelNormEpsWidthSeparating[a] > 0) {
+      const double f32_eps_err =
+          MaxAbsDiff(got, &vllm_test::kLtx2PixelNormEpsRejectedF32Eps[a * n], n);
+      INFO("distance to the f32-epsilon answer = " << f32_eps_err);
+      CHECK(f32_eps_err > 0.0);
+    }
+    if (vllm_test::kLtx2PixelNormEpsReadSeparating[a] > 0) {
+      const double no_eps_err =
+          MaxAbsDiff(got, &vllm_test::kLtx2PixelNormEpsRejectedNoEps[a * n], n);
+      INFO("distance to the epsilon-removed answer = " << no_eps_err);
+      CHECK(no_eps_err > 0.0);
+    }
+  }
 }
 
 TEST_CASE("ltx2 vae: the NON-causal Conv video decoder matches upstream ltx_core") {
@@ -2216,6 +2921,39 @@ vllm::Ltx2ConvVideoEncoderConfig ReducedVideoEncoderConfigB() {
   return cfg;
 }
 
+// The reduced VideoEncoder arm the BF16 golden was taken on (A24 wave 4, #2850,
+// generator section 6e).
+//
+// IT IS NOT ARM A, AND THE DIFFERENCE IS THE WHOLE POINT.
+// `SpaceToDepthDownsample`'s skip is a group mean over
+// `group_size = in_channels * prod(stride) / out_channels`, and a TWO-element
+// mean is exact in any order -- so at `group_size == 2` the rounding rule this
+// row measured is gated at zero. Arm A's two `*_res` blocks both land on 2.
+// `compress_all_res` with multiplier 2 gives `8 * 8 / 16 = 4`, which is where the
+// rule is first-order. The generator asserts the reached group size and refuses
+// to emit otherwise.
+//
+// NO `attn` BLOCK, DELIBERATELY. At bf16 the VAE attention is served by FLASH and
+// is 37-38% of words from MATH, which wave 3 recorded as an open question; a
+// block here would drag it into a case about three unrelated rules.
+// `AttnBlock3d` is SHARED with the decoder and is gated by the decoder's own
+// bf16 case.
+vllm::Ltx2ConvVideoEncoderConfig ReducedVideoEncoderConfigBf16() {
+  vllm::Ltx2ConvVideoEncoderConfig cfg;
+  cfg.in_channels = 3;
+  cfg.out_channels = 8;
+  cfg.patch_size = 2;
+  cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  cfg.latent_log_var = vllm::Ltx2LogVarianceType::kUniform;
+  cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kZeros;
+  cfg.encoder_blocks = {
+      {"res_x", 1, 0},
+      {"compress_all_res", 1, 2},
+  };
+  cfg.prefix = "ltx2.videoencbf16.";
+  return cfg;
+}
+
 // Build the VideoEncoder's parameters in upstream state_dict ORDER
 // (video_vae.py:194-262): per_channel_statistics, conv_in, the FORWARD block
 // walk, conv_norm_out (GroupNorm arm only), conv_out. PixelNorm carries no
@@ -2411,6 +3149,130 @@ ParamBag BuildAudioEncoderParams(const vllm::Ltx2AudioEncoderConfig& cfg) {
 }
 
 }  // namespace
+
+TEST_CASE("ltx2 vae: the video ENCODER's BF16 arm matches upstream ltx_core") {
+  // A24 wave 4, row LTX25-A24-LEAVES-BF16, issue #2850.
+  //
+  // THE ARM UPSTREAM ACTUALLY RUNS. `distilled.py:109` resolves ONE pipeline
+  // dtype and `:120-125` hands it to `ImageConditioner`, which builds this
+  // encoder with it (utils/blocks.py:985-986). The f32 cases below are the parity
+  // REFERENCE and this is the shipping arithmetic. It exists because nothing else
+  // can gate the VALUES: the generator casts every upstream parameter to f32, so
+  // the f32 oracle makes a dtype comparison vacuous by construction, and the
+  // engine-level `vae_encode_not_bf16` counter proves the WIDTH and says nothing
+  // about what was computed.
+  //
+  // THREE RULES RIDE ON THIS GOLDEN and each was EXECUTED against the pinned
+  // modules with its rejected hypothesis emitted beside upstream's answer:
+  //   * the `SpaceToDepthDownsample` group mean widens internally and rounds only
+  //     the OUTPUT (0 of 256 for an f32 and an f64 accumulator, 72-145 of 256 for
+  //     a sequential bf16 one at group_size 4 and 8);
+  //   * that rounding must happen BEFORE the skip add -- carrying the mean in f32
+  //     across it is 45-61 of 256, while the add's own width separates NOTHING at
+  //     2^0, 2^-7 or 2^-14;
+  //   * `per_channel_statistics.normalize` narrows BOTH registered buffers before
+  //     the subtract and the divide (129-136 of 288 at C=16 and 889-931 of 2304
+  //     at C=128 with them kept f32, which is what this port had).
+  const vllm::Ltx2ConvVideoEncoderConfig cfg = ReducedVideoEncoderConfigBf16();
+  ParamBag bag = BuildVideoEncoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoEncBf16ParamNames,
+                vllm_test::kLtx2VideoEncBf16ParamCounts,
+                std::size(vllm_test::kLtx2VideoEncBf16ParamNames));
+  const vllm::Ltx2VaeWeights bf16 = NarrowToBf16(bag.weights);
+  // THE BAG IS HALF THE BYTES, measured on the same input rather than quoted.
+  // This is the storage half: an arm that computed in bf16 and kept f32
+  // parameters would pass every value check below and move twice the bytes.
+  CHECK(bf16.Bytes() * 2 == bag.weights.Bytes());
+  CHECK(bf16.tensors.empty());
+
+  const int64_t c = vllm_test::kLtx2VideoEncBf16InC;
+  const int64_t t = vllm_test::kLtx2VideoEncBf16InT;
+  const int64_t h = vllm_test::kLtx2VideoEncBf16InH;
+  const int64_t w = vllm_test::kLtx2VideoEncBf16InW;
+  const std::vector<float> frames = Ltx2Input("ltx2.videoencbf16.input", c * t * h * w, 1.0);
+
+  int64_t cropped = -1;
+  const vllm::Ltx2LatentVolume latent =
+      vllm::Ltx2ConvVideoEncode(cfg, bf16, frames, c, t, h, w, &cropped);
+  CHECK(cropped == 0);
+  CHECK(latent.channels == vllm_test::kLtx2VideoEncBf16OutC);
+  CHECK(latent.frames == vllm_test::kLtx2VideoEncBf16OutT);
+  CHECK(latent.height == vllm_test::kLtx2VideoEncBf16OutH);
+  CHECK(latent.width == vllm_test::kLtx2VideoEncBf16OutW);
+  // The fixture reaches the group size the rule needs, and THIS LINE READS THE
+  // GENERATOR'S EMITTED CONSTANT, not the C++ blocks above -- it is
+  // constant-vs-constant and cannot be more. What it does buy is the
+  // GENERATOR-side half: an edit to the generator's block list that dropped every
+  // group size below 4 would mute the rule, and this reds on it (its own
+  // `assert max(group_sizes) >= 4` is the same guard, one repository away from a
+  // reader of this file). The C++-side half is covered elsewhere: an edit to the
+  // block list above changes the fixture, which the manifest and the bit-exact
+  // golden below both refuse.
+  CHECK(vllm_test::kLtx2VideoEncBf16GroupSize >= 4);
+
+  // EVERY RETURNED VALUE SURVIVES A bf16 ROUND TRIP. The latent is a
+  // `std::vector<float>` on either arm, so this is the only thing in this case
+  // that can see the WIDTH; the f32 arm on this same fixture fails it on most of
+  // the stream.
+  int64_t wider = 0;
+  for (const float v : latent.data) {
+    if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++wider;
+  }
+  INFO("bf16 encode values wider than bf16: " << wider << " of " << latent.data.size());
+  REQUIRE(!latent.data.empty());
+  CHECK(wider == 0);
+
+  // ── AND THE VALUES ARE HELD BIT-EXACT, WHICH IS NOT THE DECODER'S SHAPE ────
+  //
+  // Wave 3's deep decoder case is held to a BAND, because thirteen convolutions
+  // compound `cpu_conv3d`'s disagreement with torch's blocked reduction order and
+  // the band is the chain's own one-ulp response. THAT SHAPE DOES NOT WORK HERE
+  // AND THE MEASUREMENT SAYS SO: on this fixture the one-ulp sensitivity is
+  // `kLtx2VideoEncBf16UlpSensitivity` and BOTH defect distances are BELOW it, so
+  // a band wide enough to admit an honest port would admit both defects too --
+  // a floor below the real count is a mute switch.
+  //
+  // So this case is held BIT-EXACT instead, which is available because the
+  // fixture is three convolutions deep rather than thirteen. Bit-exactness
+  // separates any defect that moves any word, which is what the two `> 0`
+  // assertions below then make a statement rather than a hope.
+  REQUIRE(latent.data.size() == std::size(vllm_test::kLtx2VideoEncBf16Golden));
+  int64_t differing = 0;
+  double err = 0.0;
+  for (size_t i = 0; i < latent.data.size(); ++i) {
+    const float want = vllm_test::kLtx2VideoEncBf16Golden[i];
+    if (latent.data[i] != want) ++differing;
+    err = std::max(err, std::abs(static_cast<double>(latent.data[i]) - want));
+  }
+  INFO("BF16 video encoder: " << differing << " of " << latent.data.size()
+                              << " words differ, max|diff| = " << err
+                              << "; one-ulp sensitivity "
+                              << vllm_test::kLtx2VideoEncBf16UlpSensitivity
+                              << "; the two upstream arms are "
+                              << vllm_test::kLtx2VideoEncBf16ArmGap
+                              << " apart; defect distances: f32 statistics "
+                              << vllm_test::kLtx2VideoEncBf16DefectStats
+                              << ", unrounded group mean "
+                              << vllm_test::kLtx2VideoEncBf16DefectGroupMean);
+  CHECK(differing == 0);
+
+  // 1. BOTH DEFECTS REACH THIS FIXTURE'S OUTPUT, so bit-exactness separates them
+  //    rather than merely being satisfiable. The generator asserts the same two
+  //    against upstream and refuses to emit a zero.
+  CHECK(vllm_test::kLtx2VideoEncBf16DefectStats > 0.0);
+  CHECK(vllm_test::kLtx2VideoEncBf16DefectGroupMean > 0.0);
+  // 2. AND A BAND COULD NOT HAVE SEEN EITHER. This is the measurement that
+  //    justifies the bit-exact shape above instead of wave 3's band, and it is
+  //    asserted rather than described so it cannot quietly stop being true.
+  CHECK(vllm_test::kLtx2VideoEncBf16DefectStats <
+        vllm_test::kLtx2VideoEncBf16UlpSensitivity);
+  CHECK(vllm_test::kLtx2VideoEncBf16DefectGroupMean <
+        vllm_test::kLtx2VideoEncBf16UlpSensitivity);
+  // 3. The two upstream arms are far apart on this fixture, so "the port quietly
+  //    ran the f32 path" is a red rather than a hypothetical.
+  CHECK(vllm_test::kLtx2VideoEncBf16ArmGap >
+        vllm_test::kLtx2VideoEncBf16UlpSensitivity);
+}
 
 TEST_CASE("ltx2 vae: the video ENCODER (*_res family) matches upstream ltx_core") {
   const vllm::Ltx2ConvVideoEncoderConfig cfg = ReducedVideoEncoderConfigA();

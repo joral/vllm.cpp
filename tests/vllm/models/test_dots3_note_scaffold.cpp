@@ -1779,15 +1779,33 @@ TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
   }
 
   SUBCASE("GGUF k-quants are OWED (W9), never silently dequantized") {
-    // llama.cpp has no `dots3_note` architecture, so the converter is ours to
-    // write and there is no quant-matched llama.cpp bar for this row.
+    // W9a (#2882) moved this text into `Dots3NoteGgufRefusal`, ONE owner shared
+    // with the entrypoint's GGUF architecture dispatch — which is the door a
+    // real `dots3note` file actually arrives at, strictly earlier than this
+    // guard. This case still holds THIS guard, for a direct `Kind::kGguf`
+    // caller, and it asserts the SAME string so the two cannot drift.
+    //
+    // The comment that used to sit here said llama.cpp has no `dots3_note`
+    // architecture, so the converter was ours to write and no quant-matched
+    // llama.cpp bar existed for this row. That was FALSE (spec §4.19.2):
+    // `LLM_ARCH_DOTS3NOTE -> "dots3note"` merged into `ggml-org/llama.cpp` on
+    // 2026-08-21 with a converter, and the bar is reachable behind a pin
+    // advance rather than absent.
     const vllm::ModelSource source = vllm::ModelSource::FromSafetensors({});
     vllm::ModelSource gguf = source;
     gguf.kind = vllm::ModelSource::Kind::kGguf;
     gguf.safetensors = nullptr;
     CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, config, gguf),
-                         doctest::Contains("GGUF k-quants are not ported"),
+                         doctest::Contains("the GGUF k-quant arm is OWED to W9"),
                          std::runtime_error);
+    // The two doors print the SAME bytes, which is the point of one owner.
+    std::string thrown;
+    try {
+      (void)reg.factory->load_weights(reg, config, gguf);
+    } catch (const std::runtime_error& e) {
+      thrown = e.what();
+    }
+    CHECK(thrown == vllm::Dots3NoteGgufRefusal());
   }
 }
 

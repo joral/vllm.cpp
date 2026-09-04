@@ -826,18 +826,29 @@ std::vector<Ltx2VaeKeyRule> Ltx2VideoVaeDecoderKeyRules();
 std::vector<Ltx2VaeKeyRule> Ltx2AudioVaeDecoderKeyRules();
 std::vector<Ltx2VaeKeyRule> Ltx2VocoderKeyRules();
 
-// Every tensor a rule set keeps, widened to f32 and keyed by the REWRITTEN name,
-// which is `Ltx2VaeWeights`' whole contract (ltx2_audio_vae.h:60-70). BF16 and
-// F32 are the only dtypes these files carry; anything else throws by name rather
-// than being reinterpreted. An empty rule set keeps every name unchanged.
+// Every tensor a rule set keeps, keyed by the REWRITTEN name at `compute_dtype`,
+// which is `Ltx2VaeWeights`' whole contract (ltx2_audio_vae.h). BF16 and F32 are
+// the only dtypes these files carry; anything else throws by name rather than
+// being reinterpreted. An empty rule set keeps every name unchanged.
 //
-// f32 here is NOT a widening of a production path: `Ltx2VaeWeights` is declared
-// f32 by phases L4/L5 because f32 is their parity dtype, and this materializes
-// onto that declared contract. The VAEs together are ~1.8 GB bf16, so the
-// widened copy is ~3.7 GB — small next to the DiT, and the reason the DiT does
-// NOT take this path.
+// `compute_dtype` DEFAULTS TO f32 and FIVE call sites now ask for bf16: the video
+// decoder (row LTX25-A24-VIDEO-VAE-BF16, #2786), the video encoder
+// (LTX25-A24-LEAVES-BF16, #2850) and both latent upsamplers
+// (LTX25-A24-UPSAMPLER-BF16, #2857). The default is not a preference: the audio
+// decoder, the vocoder and the audio encoder are still f32 ports, and a default
+// of `kBF16` would hand each of them a bag whose `Get` refuses. The audio VAE's
+// f32 is ARGUED rather than owed (`ltx2_audio_vae.cpp:7-12` ->
+// `vocoder.py:575-580`), so what remains here is argued and not debt.
+//
+// At `kBF16` a BF16 tensor is moved word for word instead of being expanded
+// through `Bf16ToF32`, which is the whole point: upstream constructs the decoder
+// in the pipeline's one dtype (`distilled.py:146-149`) and never materializes an
+// f32 copy of it. A checkpoint that stores F32 under a bf16 request is narrowed
+// once here, which is what `.to(dtype)` does to a module built from an f32 state
+// dict. The VAEs together are ~1.8 GB bf16, so the f32 arm's copy is ~3.7 GB.
 Ltx2VaeWeights Ltx2LoadVaeWeights(const SafetensorsFile& file,
-                                  const std::vector<Ltx2VaeKeyRule>& rules = {});
+                                  const std::vector<Ltx2VaeKeyRule>& rules = {},
+                                  vt::DType compute_dtype = vt::DType::kF32);
 
 // `_build_conv_video_decoder` (video_vae/model_configurator.py:81-94) applied to
 // `config["vae"]`, plus `_vae_class_name_from_metadata` (:21-24) recovered into

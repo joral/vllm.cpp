@@ -1057,9 +1057,15 @@ bool TryDevicePagedFusedUpdateBatch(ttnn::Tensor& k_dev, ttnn::Tensor& v_dev, Me
   (void)nkv; (void)d;  // suppress unused-param warnings
 }
 
-// Prefer fill for longer sequential prefills; otherwise batched update.
-// Threshold keeps short decode/smoke on the height-sharded update path.
-constexpr uint32_t kPagedFillMinTokens = 16;
+// Sequential prefills always take paged_fill_cache, at any chunk length. The
+// batched update is per token: one batch user per token over a synthetic
+// one-entry page-table stick, so a short chunk sends several users at the SAME
+// physical block, and paged_update_cache's page-granular concurrent
+// read-modify-write turns that into last-writer-wins — the block keeps the
+// previous occupant's rows while the push publishes the shadow as current
+// (#2669). Decode pushes never satisfy the eligibility predicate (their first
+// offset is mid-block), so they stay on the height-sharded update path.
+constexpr uint32_t kPagedFillMinTokens = 1;
 
 bool TryDevicePagedPush(ttnn::Tensor& cache_dev, MeshDevice& device,
                         const std::vector<uint32_t>& blocks, const std::vector<uint32_t>& offsets,

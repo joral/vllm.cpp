@@ -534,6 +534,20 @@ not a process-global `GraphCapturesCounter`. Tracked on
   `test_qwen3_paged_engine.cpp`. Found during the #1488 re-adjudication after
   the garbled value had been misread as golden-buffer corruption. Fixed by
   [#1508](https://github.com/mudler/vllm.cpp/issues/1508).
+- **Device-PA decode consumes the KV shadow on `device_current` alone
+  ([#2670](https://github.com/mudler/vllm.cpp/issues/2670)).** Latent after
+  #2669's repair removes the one known trigger: the reader-side contract
+  has no proof besides the flag, so any future publisher over a partially
+  correct device block corrupts decode with no error path. Repair
+  direction: a per-block coverage stamp the push records and the reader
+  checks before it skips the upload; mirror upload stays the fallback.
+- **`VT_DUMP_IDS=1` turns the anchor REQUIRE off and the verdict line does
+  not say so ([#2671](https://github.com/mudler/vllm.cpp/issues/2671)).** A
+  dump-mode run prints `16/16 prompts PASS` from the committed goldens
+  alone, which is how a build that reds 14 of 16 prompts outside dump mode
+  looked green on 2026-09-02. Repair direction: mark the verdict
+  `RE-CAPTURE MODE` and report skipped anchors; keep the
+  `qwen3-neartie-gap.py` refresh path working.
 
 The operator must still rerun the 80-token no-hang gate and
 `test_qwen3_paged_engine` on a Blackhole P150. An implementer run is an
@@ -543,6 +557,108 @@ input, not a gate result.
 
 `ACTIVE`. R1-R3b and the R2 on-device `cur_pos` / `update_idxs` advance are
 implemented on this branch, env-gated by `VT_TT_HOST_FREE_DECODE`.
+
+### Repair (2026-09-03): short-chunk device KV push clobber (#2669)
+
+The captured multi-request battery reds at the first cross-request KV block
+boundary. The boundary decode step emits deterministic punctuation garbage
+(the 11/13/264 family) while eager host-free stays green; #1625 carries the
+symptom. Root cause, probed on the P150 with scratch instrumentation that
+never landed:
+
+- `TryDevicePagedPushPair` routes a prefill chunk shorter than
+  `kPagedFillMinTokens` (16) to `TryDevicePagedUpdateBatch`. The batched op
+  treats each chunk token as a separate batch user over a synthetic
+  one-entry page-table stick. All users of one chunk resolve to the same
+  physical block, tt-metal `paged_update_cache` is a page-granular
+  concurrent read-modify-write, so the users clobber each other and the
+  last writer wins. The device block keeps the previous request's rows
+  0..3, patches only the final row, and leaves the rest stale, while the
+  push site publishes `device_current = true`.
+- The boundary decode step reads `sk.device_current` and consumes the
+  device shadow without a re-upload, so device-PA attends the dead
+  request's KV rows. Request 0 is always clean: its prefill push declines
+  (`can_update` is false with no shadow yet), so the mirror re-uploads.
+
+Evidence: the device-vs-mirror diff at the boundary shows K maxdiff 54-342
+with rows 0..3 byte-identical to the dead request's values and rows 5-6
+stale nonzero against a zeroed mirror; the virgin-step control diff is
+0.000000. The flag history shows five mirror patches then `prefillpush OK
+B=5` per layer on the second request's prefill. The fix probe (fill at any
+T, threshold 16 to 1) moves the failure from prompt[1] tok=1 hard garbage
+to tok=14 deterministic near-tie.
+
+Re-measured at tip `4d10c8acc` (2026-09-03, uninstrumented): the DEFAULT
+eager arm stays anchor-exact — the SACRED battery is 16/16 PASS with the
+committed goldens, so the pair stays valid and no default-arm refresh rides
+this repair. The CAPTURED arm reds the anchor REQUIRE at prompt[1] tok=1
+(engine 30, committed 572); which wrong token appears moves run to run
+(374 in the probe session, 30 here), which is the race, not a different
+defect. The trigger is capture-only: the eager arm never consumes the
+stale shadow.
+
+Plan, in order, one pull request: (1) commit this spec; (2) a red-first
+focused gate over prompts 0 and 1 that keeps the anchor-exact REQUIRE and
+runs under `VT_TT_DECODE_CAPTURE=1` — it reds at prompt[1] tok=1 before the
+repair; (3) the repair: route a sequential fill-eligible chunk to
+`TryDevicePagedFill` at any T, or refuse the batched-update path when two
+chunk users share one physical block; (4) the full gate on the P150: the
+focused gate, the SACRED default-arm battery, and the captured battery;
+(5) pin the captured arm with its own committed golden pair
+(`our_ids_tenstorrent_capture.npy` / `neartie_gap_mnats_tenstorrent_capture.npy`),
+dumped from the repaired tree and teacher-forced with the #1488 method
+(`qwen3-neartie-gap-transformers.py`, transformers 4.57.1 CPU) — the same
+method that refreshed the default pair at #1630. Post-repair the captured
+sequence resolves one near-tie differently from the eager anchor (probe:
+tok=14), so the captured arm cannot share the eager pair. (6) the records:
+#2669 closes on merge, #2670 and #2671 ride as Owed. #1625's
+capture-default flip stays blocked on this repair.
+
+LANDED 2026-09-03 (commit `7ee345ef5`, repair = threshold 16 to 1 in
+`TryDevicePagedPushPair`/`TryDevicePagedPush`; #2669 closes on merge).
+Post-repair the captured arm's first divergences from the eager anchor sit
+at p1 t14, p2 t1, p6 t12, p7 t2, p9 t2, p10 t11, p12 t13 and p13 t7, each
+followed by that prompt's own continuation; the boundary cells themselves
+(p1 t0..t4) match eager exactly, so the clobber is gone, and the residual
+is the captured-vs-eager near-tie class #1476 recorded. The captured pair
+was dumped from the repaired tree byte-identical across two runs with a
+card reset between, then teacher-forced: 18 of 256 cells carry any gap, max
+500 mnats, zero cells outside top-K, 238 of 256 cells the teacher's exact
+argmax on our prefix. Teacher environment drifted from the #1488 record:
+transformers 5.16.1, torch 2.13.0+cu130 on CPU (the 4.57.1 environment no
+longer exists on this host); the oracle registry's sub-ULP caveat cannot
+reach this pair because the instrument's quantization error sits two orders
+below every certified gap. Green on the P150, one card reset per run: eager
+battery 16/16 anchor-exact unchanged (max 0.375 nats, rc 0), captured
+battery 16/16 against the new pair (max 0.5 nats, rc 0), focused capture
+gate 2/2 (rc 0), `VT_TT_RECAPTURE_EVERY=8` captured battery 16/16 (rc 0,
+the re-capture lane tolerates the fill path), `test_tenstorrent_backend`
+52/52 cases 5983/5983 assertions. A fresh reviewer returned PASS on the
+review range `77224426e..7ee345ef5`: reverting the threshold to 16 reds the
+focused capture gate at prompt[1] tok=1 (engine 11 against the committed
+572; the wrong token differs from the spec's 30/374, consistent with the
+race), corrupting a captured-pair cell reds it again naming the corrupt
+value, the eager SACRED battery stays 16/16 green (max 0.375 nats), and the
+reachability mutation, `can_update=false` in `NotePagedKvRacWrites` so both
+device push call sites die, greens as expected, which pins the M1 red to
+the production push site. Statically both push functions have exactly one
+caller each, both in `NotePagedKvRacWrites`
+(tenstorrent_ops.cpp:1175,1187), whose only caller is the production
+kReshapeAndCache path (tenstorrent_ops.cpp:3105); no test-only path exists.
+Mutation logs live in `/tmp/review-2669-logs/` on the gate host.
+
+The #2566 rate figure survives the repair, re-taken on this head
+(2026-09-03, P150, the #2566 recipe: order-alternated triples,
+`--repeat 5` with leg 1 discarded, warm medians over 12 legs, one flock
+per batch, card reset first, harness `~/hf-r2672-gate3.sh`, raw logs
+`~/hf-r2672-t{1,2,3}{A,B,C}.{out,err}`): captured 28.61 tok/s against the
+27.47 pre-repair record, default 12.21 against 12.90, opt-out 15.61
+against 17.80 - that arm's band is the unclosed inversion residual the
+#2566 entry already records, and the R5-era 5.34 figure bounced to 17.80
+before it. Capture over default 2.34x, over opt-out 1.83x. Zero fatals,
+zero hangs, 470 replays on every capture leg. The repair costs the
+captured arm nothing, and the payoff figure the capture-default flip
+stands on is measured on the repaired tree.
 
 The operator gate (2026-08-20, P150, `206afb63`) found
 [#1476](https://github.com/mudler/vllm.cpp/issues/1476): captured replay went

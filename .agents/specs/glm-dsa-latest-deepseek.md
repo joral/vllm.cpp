@@ -3686,3 +3686,38 @@ and its reads came off CIFS. `## Gates` binds: correctness first.
    lane's numbers are not entangled with 33 host layers.
 3. **A second slot budget**, since 8192 never exhausted and 4096 exhausted on a
    third of its misses at one token: the floor between them is unmeasured.
+
+## §3.14 -- the #2596 fix is DRIVEN ON THE ARTIFACT, and the default arm is correct
+
+`devids2544`, `dgx:gpu0`, finished 2026-09-03T18:38:56Z, on the real 201.83 GiB
+`UD-IQ1_S` artifact (six shards, shard 1 sha256 `b3e9838651a5c279...`).
+
+**This is the validation §3.13 recorded as OWED.** The `device_token_ids` repair
+landed at `d8683402b` but the lease that found the defect deliberately built base
+`main` to keep its two legs a discriminator, so "the default arm now emits leg E's
+bytes unaided" was an INFERENCE from a CPU gate. It is now measured.
+
+| leg | env | rc | bytes | stdout |
+|---|---|---|---|---|
+| D1 | **no mirror variable** | 0 | 17 | `20 50 61 72 69 73 2c 20 77 68 69 63 68 20 69 73 0a` = ` Paris, which is` |
+| D2 | `VT_ASYNC_DEVICE_MIRROR=0` | 0 | 17 | identical |
+
+D1 and D2 agree byte-for-byte, so the mirror variable no longer changes the
+answer for this model. That is the close, not D1 alone.
+
+**EXPERT STREAMING WAS LIVE WHILE IT RAN, and the counters say so rather than the
+configuration:** `steps=4 hits=2688 misses=9105 evictions=913 fills=9105
+bytes=31334006784 exhausted=0`. Climbing `hits` at `exhausted=0` is slot REUSE;
+`VT_MOE_EXPERT_STREAM_SLOTS=8192`, stats every step. Configuration alone cannot
+distinguish a streamed run from a fallback (#2505), which is why the counters and
+not the env are quoted here.
+
+**Not claimed.** No speed number: `wall=1549 s` (D1) and `1487 s` (D2) are
+DURATIONS, ~85% GGUF load off CIFS. This says nothing about the pure streamed arm
+either -- the engine's own `--fit` places layers on the host, so these legs remain
+a HYBRID, exactly as §3.13 records.
+
+The FA2 build requirement was asserted twice before any leg ran
+(`VLLM_CPP_FLASH_ATTN:BOOL=ON` plus 1296 TUs carrying the define), because this
+model is MLA and a silently non-FA2 build throws in the first forward in a way
+that reads as a model defect.

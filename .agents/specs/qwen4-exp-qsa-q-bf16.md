@@ -122,6 +122,17 @@ device runs them, and `## Evidence` says which arms actually ran.
 5. **The CPU behavioural control.** The released UD-IQ1_S artifact's CPU
    sequence `11751 13 15767 411 2029 11 1092 369` must not move.
 
+   **RECONCILED 2026-09-03 by `KERNEL-GDN-CHUNKED-MIRROR`**
+   ([#2612](https://github.com/mudler/vllm.cpp/issues/2612),
+   [gdn-chunked-mirror.md](gdn-chunked-mirror.md)). That row moved the CPU GDN
+   prefill default from the sequential recurrence to vLLM's chunked
+   decomposition, so this control's PREMISE is gone: the ids are expected to
+   move, and this row's gate does not own that change. The control still holds
+   as written **with `VT_GDN_CHUNKED=0`**, which selects the arm it was measured
+   on, and that is how to run it. The ids the new default emits have not been
+   re-measured (it needs the 67.564 GiB artifact and a lease) and are owed by
+   the mirror row, not by this one.
+
 ## Gates
 
 ```sh

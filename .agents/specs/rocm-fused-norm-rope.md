@@ -243,3 +243,63 @@ whole cross-device suite runs 28 cases / 13 assertions green.
   `.agents/specs/rocm-glm53-dsa.md` W1.5 as a campaign this wave does not open.
 - Repair 3 of #2564 — a block-quantized row slice for the split path — for a
   backend that registers neither `kFusedNormRope` nor a native alternative.
+
+## RETRACTION — the tier is WITHDRAWN on gfx1151, so the remaining ops REFUSE
+
+**Measured on `strix:gpu0`, 2026-09-03**, by a case that asks the predicate rather
+than assuming an answer (`tests/vt/test_backend_cross_device.cpp`, landed with
+#2843):
+
+```
+ROCm reference tier: UnifiedMemory=0 DeviceMemoryIsHostAddressable=0
+                     ReferenceTierEligible=0
+VERDICT: the tier is WITHDRAWN here — the missing MLA ops are a REFUSAL,
+         so W2/W3 block GENERATION and not only measurement
+```
+
+**This falsifies the framing of this spec and of the `FEATURES.md` row landed at
+`fbdbe663d`.** Both said the remaining MLA/DSA ops make GLM-5.3 *slow* on this
+board. They do not. They **refuse**, so GLM-5.3 non-flash does **not generate text
+on `gfx1151` at current `main`.**
+
+**The earlier result was not wrong; it was true of a different tree.** The run that
+emitted ` Paris, which is` (n=2, reproduced on a separately rebuilt binary) is real
+and is recorded. It ran on a tree that did not contain
+[`6b97a6800`](https://github.com/mudler/vllm.cpp/commit/6b97a6800) (#2511), which
+narrowed managed allocation to `PageableMemoryAccess == 1`.
+`git merge-base --is-ancestor 6b97a6800 9f3e6e223` returns **false**, and
+`6b97a6800` **is** an ancestor of `main`. `gfx1151` reports 0, and
+`docs/ROCM.md:83-85` already states that such a part gets plain `hipMalloc` and no
+reference tier.
+
+**What still holds, and what does not.** The `kFusedNormRope` port is unaffected —
+it is a real native ROCm kernel and remains registered. Four more ops landed at
+`928d89a9b` (#2715). What is falsified is the claim that the REMAINING ops are a
+performance concern.
+
+**CORRECTED, and the first version of this entry got it wrong twice.** It is
+**FOUR** ops, not three — `kMlaPrefillAttention`, `kMlaDecodeAttention`,
+`kDsaIndexerLogits` and `kDsaTopkSelect` each have **zero** registrations under
+`src/vt/rocm/` at `main`, verified by count. The narrower set of **three**
+that `rocm_ops.hip:283` calls "gating" is the *consulted-before-the-call* set, and
+that distinction only means anything on a board where the tier exists — which this
+one is not. And `ReferenceTierEligible` gates on `DeviceMemoryIsHostAddressable()`,
+not on `UnifiedMemory()` (`op_provider.cpp:203-205`); the probe prints both, which
+is what made the mis-attribution easy.
+
+**One more precision, because the retraction overstated what it was retracting.**
+The prior record did not say these ops make GLM-5.3 *slow*. It said they disqualify
+a speed *number*, which was correct for a board whose tier was eligible. What
+changed is that the premise is gone — a stronger correction than the one first
+written here, and stated so rather than left flattering.
+
+**The lesson worth encoding, because this is the second instance in one day.** A
+commit that lands AFTER a measurement can invalidate that measurement's premise,
+and no gate in this tree notices. The first instance was a merge falsifying a PR's
+own prose; this one is a correctness fix silently withdrawing a capability another
+row had just measured. Filed as [#2848](https://github.com/mudler/vllm.cpp/issues/2848).
+**A recorded result is only true of the tree it ran on, and the tree must be named
+beside it.**
+
+**Owed:** the three remaining ops, which are now generation-blocking rather than
+speed-blocking on `gfx1151` — #2715's successor waves W2 and W3.

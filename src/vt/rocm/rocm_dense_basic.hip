@@ -655,7 +655,7 @@ void RopeNeoxKernelRocm(Queue& q, Tensor& qs, Tensor& ks, const Tensor& pos,
 // ---------------- RopeFromCache --------------------------------------------
 template <typename T, typename Tid>
 __global__ void RopeFromCacheK(T* qs, T* ks, const Tid* positions, const T* cache,
-                               int64_t cache_rows, int64_t tokens, int64_t hq, int64_t hk,
+                               int64_t cache_rows, int64_t hq, int64_t hk,
                                int64_t q_tok_stride, int64_t q_head_stride, int64_t k_tok_stride,
                                int64_t k_head_stride, int rotary_dim, int64_t half,
                                bool is_neox_style, int64_t n) {
@@ -699,7 +699,7 @@ void RopeFromCacheKernelRocm(Queue& q, Tensor& qs, Tensor* ks, const Tensor& pos
     using Tid = decltype(id_tag);
     RopeFromCacheK<T, Tid><<<GridFor(n), kBlock, 0, st>>>(
         qs.Ptr<T>(), ks == nullptr ? nullptr : ks->Ptr<T>(), positions.Ptr<Tid>(),
-        cache.Ptr<T>(), cache.shape[0], tokens, hq, hk, qs.stride[0], qs.stride[1],
+        cache.Ptr<T>(), cache.shape[0], hq, hk, qs.stride[0], qs.stride[1],
         ks == nullptr ? 0 : ks->stride[0], ks == nullptr ? 0 : ks->stride[1], args.rotary_dim,
         half, args.is_neox_style, n);
   };

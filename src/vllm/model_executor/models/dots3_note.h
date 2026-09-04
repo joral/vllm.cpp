@@ -551,6 +551,49 @@ struct Dots3NoteWeights {
 // `KV-DSV4-MULTICACHE`'s (#1925).
 std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& params);
 
+// ─── THE GGUF SIDE OF THIS ARCHITECTURE (W9a, #2882) ─────────────────────────
+// The architecture string llama.cpp writes into `general.architecture` for this
+// model: `LLM_ARCH_DOTS3NOTE -> "dots3note"`, `ggml-org/llama.cpp`
+// `src/llama-arch.cpp:114` at `master`. It arrived in that tree on 2026-08-21
+// (`5a32f7b66ef6cfb3e60deea26e3454cc6ad3438c`, "model: add dots3-note", #27060,
+// with the converter at `conversion/dots3.py`), and its vision+audio half on
+// 2026-08-22 (`54ee5ee643f29abba6852903ddfdb688c2361b5b`, "mtmd: support
+// dots3-note vision+audio", #27524). This header owns the key, not the
+// entrypoint — exactly as `nemotron_h.h` owns `kNemotronHGgufArch`.
+//
+// It is the LLAMA.CPP spelling and not ours, deliberately: what this constant
+// has to match is the byte string in a file a user passes, and nothing else
+// produces one.
+inline constexpr const char* kDots3NoteGgufArch = "dots3note";
+
+// True when this file's `general.architecture` is dots3-note's.
+//
+// WHY THIS EXISTS AT ALL. The registry factory has refused `Kind::kGguf` by
+// name since W1, and no real artifact could ever reach it:
+// `src/vllm/entrypoints/model_loader.cpp::FromModelDir` resolves a GGUF's
+// config through `src/vllm/entrypoints/model_loader.cpp::HfConfigFromGgufDispatch`
+// long before the same function builds a `ModelSource` through
+// `ModelSource::FromGguf`, so a `dots3note` file died at the build-level
+// default naming neither this model, nor the row, nor the brick.
+//
+// Those two citations are SYMBOLS and not lines on purpose, and the first draft
+// of this comment got it wrong in the way #1143 describes: it wrote
+// `model_loader.cpp:2668` and `:3069`, and the four lines this very slice
+// inserts at `:1289` pushed both call sites down to 2672 and 3073, so the
+// anchors were stale at their own merge commit and landed a reader in an
+// unrelated row's prose. `scripts/check-symbol-anchors.py` could not have
+// caught it -- its own docstring says it does not verify LINE citations.
+// This predicate is what the dispatch tests to route it to the message below,
+// and it is `IsNemotronHGguf`'s shape for the same reason (#809, #2882).
+bool IsDots3NoteGguf(const GgufFile& gguf);
+
+// The ONE owner of the W9 GGUF refusal text. Both doors a GGUF can arrive at —
+// the entrypoint's architecture dispatch and `LoadDots3NoteForCausalLM`'s
+// source-kind guard — throw THIS string, so whichever one a user reaches, the
+// message names this model, this arm, this row and the spec section that owes
+// it. A second spelling of the same refusal is how the two drift.
+std::string Dots3NoteGgufRefusal();
+
 // The longest sequence for which DENSE attention IS upstream's answer, i.e.
 // `index_topk`. Upstream's full layers are SPARSE: the lightning indexer picks
 // `index_topk` keys per query (model.py:171 -> deepseek_v2.py::Indexer), and at

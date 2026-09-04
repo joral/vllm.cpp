@@ -67,7 +67,39 @@ The fleet, read from `rc devices` and `rc describe` on 2026-08-17:
 |---|---|---|
 | `dgx:gpu0` | `gpu_model=GB10`, `class=train`, `k8s=true`, driver 580.173.02, `cpus=20`, 128 GB | the house NAS |
 | `thor:gpu0` | `gpu_model=NVIDIA-Thor`, `class=train`, `k8s=true`, driver 595.78, `cpus=14`, 132 GB | the house NAS, the SAME folder as `dgx` |
-| `orin:gpu0` | `gpu_model=AGX-Orin`, `class=train`, `k8s=true`, `cpus=12`, 32 GB, and NO detected GPU labels because Jetson carries no `nvidia-smi` | LOCAL disk, invisible from `dgx` and `thor` |
+| `orin:gpu0` | `gpu_model=AGX-Orin`, `class=train`, `k8s=true`, `cpus=12`, 32 GB, L4T R36.4.7 (JetPack 6), and NO detected GPU labels because Jetson carries no `nvidia-smi` | the house NAS, the SAME folder as `dgx` and `thor` |
+
+### `orin:gpu0` needs L4T CUDA 12.6, and the DGX recipe breaks it
+
+**Do not install `cuda-toolkit-13-*` from the generic `sbsa` repo on `orin`.** That
+is the correct recipe for `dgx` and `thor` and it is wrong for a Jetson. Measured
+inside a lease on 2026-09-03:
+
+| | |
+|---|---|
+| L4T release | `R36 (release), REVISION: 4.7` — JetPack 6 |
+| driver CUDA API | `cuDriverGetVersion` = **12060**, i.e. CUDA **12.6** |
+| device visible | `cuInit` rc 0, `cuDeviceGetCount` rc 0, **count 1** |
+| what a job had left at `/usr/local/cuda` | `cuda-13.3` |
+
+The board is healthy and the driver sees the GPU. A CUDA **runtime** of version N
+requires a driver API of at least N, so a 13.3 toolkit against a 12.6 driver makes
+`cudaGetDeviceCount` return **35** (`CUDA_ERROR_INSUFFICIENT_DRIVER`). That 35 is
+correct behaviour reporting a packaging mistake, not a broken board, and it is why
+`orin` has read as "cannot run CUDA".
+
+The OS image is not at fault and needs no change. `kairos-init` already pins CUDA
+**12.6** for `nvidia-jetson-agx-orin` from the L4T repo
+(`repo.download.nvidia.com/jetson/{common,t234}` at `r36.4`) and moves it to
+`/opt/cuda-12.6`; no Dockerfile in the `dockerfiles` repo installs a toolkit at
+all. The 13.x came from a JOB, and the worker container is long-lived, so one
+job's global install is still there for the next one.
+
+**What to do in a job on `orin`:** use the CUDA already on the board, or install
+`cuda-*-12-6` from the jetson repo. Never `developer.download.nvidia.com/.../sbsa`
+and never `cuda-toolkit-13-*`. **Compilation is unaffected** — `nvcc` needs no
+matching driver, so a 13.3 toolchain builds this tree for `sm_87` cleanly; only
+running does.
 
 **Select on `class` or `gpu_model`, never on `vram`.** `rc describe` reports
 `vram=[N/A]M` and `vram_free=[N/A]M` on this fleet. That is a probe reporting
@@ -131,8 +163,8 @@ history and take the toolchain from
 - `/workspace` is the house NAS, measured as `//192.168.68.102/Data 7.3T total,
   4.0T available, 46% used`, writable from the job, mounted on the dgx host at
   `/usr/local/nas_share/rc` (SMB, NodePort 31516, subfolder `rc/`). It is the
-  SAME folder from `dgx` and from `thor`, and it is the one surface both ends
-  can see. It is NOT shared with `orin`.
+  SAME folder from `dgx`, from `thor` AND from `orin`, and it is the one surface
+  every end can see.
 
 **The consequence, and it is now narrower than a blocker.** The pinned oracle
 venv lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx HOST, and a leased
@@ -981,7 +1013,7 @@ environment:
     | `nvcc` | **NOT part of the image. Install it.** Both of this lane's jobs happened to find `/usr/local/cuda-13.0` and nvcc 13.0.88 already there, and that was another job's leftover — see below |
     | ABSENT | **`shellcheck`**, **`cuobjdump`**, **`nsys`**, `sudo`, `docker` — and `cuobjdump` stays absent after the `PATH` prepend, which matters below |
     | `nvidia-smi` | plain, no `sudo`, **exit 0 with ZERO bytes on stderr**, reporting `NVIDIA Thor`, driver 595.78, `compute_cap 11.0` |
-    | `/workspace` | `//192.168.68.102/Data`, 7.3 T, CIFS `file_mode=0664 nounix` — the SAME folder `dgx` sees, and `/mnt/nas_share/rc` on the devbox. NOT shared with `orin`. `rc` copies nothing for you |
+    | `/workspace` | `//192.168.68.102/Data`, 7.3 T, CIFS `file_mode=0664 nounix` — the SAME folder `dgx` and `orin` see, and `/mnt/nas_share/rc` on the devbox. `rc` copies nothing for you |
     | `/tmp` | the worker's own overlay, 918 G — but it was **94% used with 58 G free** on 2026-08-22. Read "Disk is shared" below before you build |
     | swap | **30.7 G of `zram`** (`/dev/zram0`, PRIO 100), with `vm.overcommit_memory=1`. Compressed RAM, not a backing store — see the reboot warning below |
     | reuse | **the container is REUSED between jobs**, so `/tmp` carries other jobs' trees and your own from last week |

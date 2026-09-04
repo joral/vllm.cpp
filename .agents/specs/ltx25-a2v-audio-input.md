@@ -72,8 +72,10 @@ reads as a continuation of the LAST file named — here `minimax_h3.h`, not
 the layout `Ltx2WaveformToLogMel` takes, and it refuses a sample-rate mismatch
 rather than resampling (`minimax_h3_wav.cpp:128-131`) — the same policy
 `Ltx2WaveformToLogMel` already declares (`ltx2_audio_vae_encoder.h:171-177`).
-The other two WAV readers in the tree are mono-only
-(`audio_processor.cpp:67`, `speech_api.cpp:41-79`) and cannot serve the shipped
+The other two WAV readers in the tree still hand back ONE channel
+(`audio_processor.cpp:103-131` and its multi-channel sibling at `:183-209`,
+which W7c-1 added and which REDUCES to mono by upstream's mean rather than
+preserving channels; `speech_api.cpp:41-79`), so neither can serve the shipped
 encoder's `in_channels = 2`.
 
 **Missing:**

@@ -8,8 +8,22 @@ Guide: [`../upstream-sync.md`](../upstream-sync.md) §"The sync cycle".
 
 ## Now
 
-The pin has **not** advanced and does not advance in this wave. The active parity
-pin remains `5559679229bc961848b121ccdeaa8fa5d79bec98`.
+**The pin has advanced**, to `e126687a9a828d513c01a07cd69f025f27d63280`, on
+2026-09-03, by wave PINADVANCE
+([#2817](https://github.com/mudler/vllm.cpp/issues/2817),
+[`upstream-pin-advance-e126687.md`](upstream-pin-advance-e126687.md),
+[`../sync/2026-09-03-e126687-advance.md`](../sync/2026-09-03-e126687-advance.md)).
+The order was inverted by a developer ruling: step 6 now runs against the new pin
+and is owed by [#2818](https://github.com/mudler/vllm.cpp/issues/2818), where a
+red requires REVERTING the pin. Also still owed at the new pin: the declared
+token-exact gate ([#2794](https://github.com/mudler/vllm.cpp/issues/2794)), a
+reading on `dgx:gpu0` and the 290-entry PORT-NOW queue
+([#2611](https://github.com/mudler/vllm.cpp/issues/2611)), and `qwen4_exp` still
+does not run on this fleet
+([#2626](https://github.com/mudler/vllm.cpp/issues/2626)).
+
+This wave (HEADPIN) did **not** advance it; §1 below is its own scope and stop
+condition, unchanged.
 
 ## 1. Scope
 

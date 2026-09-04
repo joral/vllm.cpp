@@ -1228,20 +1228,27 @@ __global__ __launch_bounds__(kBaseThreads* TILESIZE_K / 16) void exl3_gemm_kerne
 // relative RMS) rather than reusing tier 3's 1.0e-3, which a correct kernel
 // here could not meet.
 //
-// NARROWED to bits == 3, over codebooks 1 (mcg) and 2 (mul1), which is NOT the
-// regular kernel's set: that one is seven pairs wide. Upstream's own GEMV list
-// is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)`, so cb 0 at 3 bpw is excluded
-// there too and its envelope refuses it before any kernel is chosen. Upstream
-// instantiates 2/3/4 bpw over three codebooks; every other width DECLINES this
-// arm and falls through to the shape table, which is upstream's own failure
-// mode (`exl3_gemv_select_kernel` returns nullptr and `exl3_gemv_try_launch`
-// returns false) and not an unimplemented refusal.
+// NARROWED to bits 3 and 4, over codebooks 1 (mcg) and 2 (mul1), which is NOT
+// the regular kernel's set: that one is seven pairs wide. Upstream's own GEMV
+// list is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)`, so cb 0 at 3 bpw is
+// excluded there too and its envelope refuses it before any kernel is chosen.
+// Upstream instantiates 2/3/4 bpw over three codebooks; every other width
+// DECLINES this arm and falls through to the shape table, which is upstream's
+// own failure mode (`exl3_gemv_select_kernel` returns nullptr and
+// `exl3_gemv_try_launch` returns false) and not an unimplemented refusal.
 //
-// THE WIDTH IS SPECIALIZED, THE CODEBOOK IS NOT. `bits` is fixed at 3 by the
-// static_assert below and widening it is a kernel port; `cb` is a free template
-// argument that reaches exactly one call, `dq8_regs_3bits<cb>`. That asymmetry
-// is why `(3, 2)` cost one template argument (QUANT-EXL3-PERF, #2570) and
-// `(4, 2)` is still owed.
+// THE WIDTH IS SPECIALIZED, THE CODEBOOK IS NOT, AND THE TWO COST DIFFERENT
+// WORK. `cb` is a free template argument that reaches exactly one call, the
+// `dq8_regs_*bits<cb>` extractor, so `(3, 2)` cost one template argument
+// (QUANT-EXL3-PERF slice A, #2570). `bits` is a geometry argument: `LSTRIDE`,
+// the uint32 stride per warp load, is `bits == 3 ? 24 : 32`
+// (`exl3_gemv_kernel.cuh:153`), the 24-lane load guard applies to bits 3 alone
+// (`:228-231`), and the bit-window extraction is a different function per width
+// (`dq8_regs_3bits` vs `dq8_regs_4bits`, `:87`, `:121`). Slice B ports the
+// bits-4 half of all three (QUANT-EXL3-PERF slice B, #2570). 2 bpw stays
+// unported: no 2-bit EXL3 artifact has reached this tree, and its `LOADS`
+// halving and two-tiles-per-word shuffle (`:104-117`, `:302-310`) are a third
+// geometry with nothing to gate it against.
 
 // mma.m16n8k16 with the A operand as two FragB halves, FP16 accumulate
 // (exl3_gemv_kernel.cuh:37-52).
@@ -1277,7 +1284,65 @@ __device__ inline void dq8_regs_3bits(uint32_t a, uint32_t b, int s2, FragB& f0,
   f1[1] = decode_3inst_2<cb>(w6 & 0xffff, w7 & 0xffff);
 }
 
-// exl3_gemv_kernel.cuh:138-402, narrowed to bits == 3. CFG 0 is the "narrow"
+// The two immediate-operand PTX forms `dq8_regs_4bits` is written around
+// (`ptx.cuh:314-315`). They are macros rather than functions because the shift
+// amount and the field offset are ASSEMBLER IMMEDIATES: `shf.r.wrap.b32` and
+// `bfe.u32` take them in the instruction text, so a runtime argument cannot
+// reach them and a template non-type argument cannot be stringified into the
+// `asm` literal without one. `#undef`d immediately below, so neither name
+// escapes this arm.
+//
+// `VT_EXL3_FSHF_IMM(d, lo, hi, i)` is `fshift(lo, hi, i)` with `i` fixed, and
+// `VT_EXL3_BFE16_IMM(d, s, i)` is `(s >> i) & 0xffff`. Spelled as upstream
+// spells them so the ported sequence below reads line for line against
+// `exl3_gemv_kernel.cuh:87-100`.
+#define VT_EXL3_FSHF_IMM(dst, lo, hi, imm) \
+  asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
+#define VT_EXL3_BFE16_IMM(dst, src, imm) \
+  asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
+
+// The register form of `dq8_aligned_4bits` (exl3_gemv_kernel.cuh:86-100), which
+// is itself `exl3_dq.cuh:163-184` reading from shared memory. Same eight
+// codewords, from two already-loaded words.
+//
+// WHY THE 4-BIT WINDOW READ IS A DIFFERENT FUNCTION AND NOT A PARAMETER. At
+// bits 3 the eight codewords do NOT align to the uint32 grid: a tile is 24
+// words for 256 three-bit codewords, so the window start moves by 3 bits per
+// codeword and every window needs its own funnel shift off a LANE-COMPUTED word
+// pair (`x_src_a`, `x_src_b`, `x_s2`). At bits 4 a tile is exactly 32 words,
+// one per lane, four codewords sit in each word aligned to the nibble grid, and
+// the pair is always `(lane + 31) & 31` and `lane`. So the two extractors take
+// different arguments and do different work; only the trailing decode is
+// shared. That is why `(4, 2)` was a KERNEL PORT and `(3, 2)` was one template
+// argument.
+template <int cb>
+__device__ inline void dq8_regs_4bits(uint32_t a, uint32_t b, FragB& f0, FragB& f1) {
+  uint32_t s, w0, w1, w2, w3, w4, w5, w6, w7;
+  VT_EXL3_FSHF_IMM(s, b, a, 20);
+  w7 = b & 0xffff;
+  VT_EXL3_BFE16_IMM(w6, b, 4);
+  VT_EXL3_BFE16_IMM(w5, b, 8);
+  VT_EXL3_BFE16_IMM(w4, b, 12);
+  VT_EXL3_BFE16_IMM(w3, b, 16);
+  w2 = s & 0xffff;
+  VT_EXL3_BFE16_IMM(w1, s, 4);
+  VT_EXL3_BFE16_IMM(w0, s, 8);
+  // Upstream routes cb 2 through `decode_pair_cb2_dp4a_` and everything else
+  // through `decode_3inst_2<cb>` (`exl3_gemv_kernel.cuh:65-83`). This tree's
+  // `decode_3inst_2<2>` IS that dp4a form -- it multiplies by `0x83DCD12D` and
+  // calls `decode_mul1_product_2`, which is the same `__dp4a` byte sum with the
+  // same `0x6400` accumulator and the same two fp16 constants -- so the split is
+  // already inside one function here and the arms stay bit-identical.
+  f0[0] = decode_3inst_2<cb>(w0, w1);
+  f0[1] = decode_3inst_2<cb>(w2, w3);
+  f1[0] = decode_3inst_2<cb>(w4, w5);
+  f1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
+#undef VT_EXL3_BFE16_IMM
+#undef VT_EXL3_FSHF_IMM
+
+// exl3_gemv_kernel.cuh:138-402, narrowed to bits 3 and 4. CFG 0 is the "narrow"
 // config (512 threads, 2 n-tiles per warp, 16 k-splits) and CFG 1 the "wide" one
 // (256 threads, 4 n-tiles, 8 k-splits). MMODE 0 is the m == 1 fast path and
 // MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
@@ -1286,15 +1351,23 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void exl3_gemv_kernel(
     const half* __restrict__ A, const uint16_t* __restrict__ B, void* __restrict__ C,
     const int size_m, const int size_k, const int size_n, int* __restrict__ locks,
     const half* __restrict__ suh, half* __restrict__ A_had, const half* __restrict__ svh) {
-  // The GEMV stays 3-bit. Unlike the regular kernel this one is SPECIALIZED to
-  // the width rather than merely asserted on it: `LSTRIDE` below is the uint32
-  // stride per warp load and is hardcoded to 24 for `bits == 3` (== `TWORDS`),
-  // and the prefetch ring, fold cadence and load count are tuned around it.
-  // Widening it is a kernel port, not an instantiation, so `bits == 6` DECLINES
-  // the GEMV and falls through to the regular shape table -- which is upstream's
-  // own arrangement for a declined GEMV (`exl3_gemm.cu:220-236`) and costs the
-  // 6-bit lm_head its m<=8 fast path, not its device arm (QUANT-EXL3, #2181).
-  static_assert(bits == 3, "exl3: the GEMV kernel is specialized to the 3 bpw arm");
+  // The GEMV is SPECIALIZED to its widths rather than merely asserted on them,
+  // which is why widening it is a kernel port and not an instantiation. Three
+  // things below are per-width: `LSTRIDE`, the uint32 stride per warp load
+  // (`exl3_gemv_kernel.cuh:153`); the 24-lane load and store guards, which exist
+  // because a bits-3 tile is 24 words and eight lanes of the warp have nothing
+  // to carry (`:228-231`, `:270`); and the bit-window extractor. Upstream also
+  // carries a 2 bpw arm with a fourth geometry -- `LOADS` halved and two tiles
+  // per loaded word (`:152`, `:302-310`) -- which is NOT ported, because no
+  // 2-bit EXL3 artifact has reached this tree to gate it against.
+  //
+  // Every other width DECLINES the GEMV and falls through to the regular shape
+  // table, which is upstream's own arrangement for a declined GEMV
+  // (`exl3_gemm.cu:220-236`) and matches its `if (K < 2 || K > 4) return false;`
+  // (`exl3_gemv.cu:110-111`). So the 6-bit lm_head loses its m<=8 fast path and
+  // not its device arm (QUANT-EXL3, #2181).
+  static_assert(bits == 3 || bits == 4,
+                "exl3: the GEMV kernel is specialized to the 3 and 4 bpw arms");
   constexpr int WK = CFG == 0 ? 16 : 8;    // k-split (warps per block)
   constexpr int WNT = CFG == 0 ? 2 : 4;    // adjacent n-tiles per warp
   constexpr int PF = CFG == 0 ? 4 : 2;     // prefetch ring depth
@@ -1304,7 +1377,12 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void exl3_gemv_kernel(
   constexpr int COLS = WNT * 16;
   constexpr int TWORDS = 8 * bits;   // uint32 per 16x16 tile
   constexpr int LOADS = WNT;         // warp loads per k-slice (bits != 2)
-  constexpr int LSTRIDE = 24;        // uint32 per load, bits == 3
+  // exl3_gemv_kernel.cuh:153. It equals TWORDS at both ported widths, which is
+  // what lets one warp load cover one whole 16x16 tile and what makes the
+  // `t * TWORDS` shared-memory tile base below agree with the `l * LSTRIDE`
+  // store stride.
+  constexpr int LSTRIDE = bits == 3 ? 24 : 32;  // uint32 per load
+  static_assert(LSTRIDE == TWORDS, "exl3 gemv: one warp load must cover one tile");
 
   int* barrier_cs = locks + kBarrierLocksOffset;
   const int blocks = static_cast<int>(gridDim.x);
@@ -1339,15 +1417,23 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void exl3_gemv_kernel(
   const size_t a_row0 = static_cast<size_t>(r0) * (size_k / 2);
   const bool r0_ok = MMODE == 0 ? lane < 4 : r0 < size_m;
 
-  // Per-lane extraction constants, the bits == 3 arm of :199-209.
-  const int t_offset = lane << 3;
-  const int b1 = (t_offset + 257) * 3;
-  const int b2 = b1 + 21;
-  const int i0 = (b1 - 16) / 32;
-  const int i2 = (b2 - 1) / 32;
-  const int x_s2 = (i2 + 1) * 32 - b2;
-  const int x_src_a = i0 % 24;
-  const int x_src_b = i2 % 24;
+  // Per-lane extraction constants, the bits == 3 arm of :199-216. At bits 4 the
+  // window pair is `(lane + 31) & 31` and `lane` with no funnel offset, so these
+  // three have no bits-4 meaning and upstream leaves them at zero and
+  // `[[maybe_unused]]` (`:199`). Reproduced here rather than hoisted into the
+  // dispatch, because reading them under `if constexpr (bits == 4)` would be a
+  // silent wrong answer instead of a compile error.
+  [[maybe_unused]] int x_s2 = 0, x_src_a = 0, x_src_b = 0;
+  if constexpr (bits == 3) {
+    const int t_offset = lane << 3;
+    const int b1 = (t_offset + 257) * 3;
+    const int b2 = b1 + 21;
+    const int i0 = (b1 - 16) / 32;
+    const int i2 = (b2 - 1) / 32;
+    x_s2 = (i2 + 1) * 32 - b2;
+    x_src_a = i0 % 24;
+    x_src_b = i2 % 24;
+  }
 
   __shared__ float sh_red[WK][ROWS][COLS];
   // `[[maybe_unused]]` is upstream's own annotation (exl3_gemv_kernel.cuh:214):
@@ -1359,8 +1445,14 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void exl3_gemv_kernel(
   for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
     const uint32_t* bp = B32 + static_cast<size_t>(ks0) * slice_stride + group * WNT * TWORDS +
                          lane;
+    // exl3_gemv_kernel.cuh:226-232. The 24-lane guard is the BITS-3 arm only: a
+    // bits-3 tile is 24 uint32 and lanes 24..31 have nothing to load, while a
+    // bits-4 tile is exactly 32 and every lane carries one word.
     auto ld_b = [&](int i, int l) -> uint32_t {
-      return lane < 24 ? __ldcs(bp + static_cast<size_t>(i) * slice_stride + l * LSTRIDE) : 0u;
+      if constexpr (bits == 3)
+        return lane < 24 ? __ldcs(bp + static_cast<size_t>(i) * slice_stride + l * LSTRIDE) : 0u;
+      else
+        return __ldcs(bp + static_cast<size_t>(i) * slice_stride + l * LSTRIDE);
     };
 
     uint32_t pf[PF][LOADS];
@@ -1389,7 +1481,7 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void exl3_gemv_kernel(
           __syncwarp();
 #pragma unroll
           for (int l = 0; l < LOADS; ++l)
-            if (lane < 24) sh_stage[warp][l * LSTRIDE + lane] = bw[l];
+            if (bits != 3 || lane < 24) sh_stage[warp][l * LSTRIDE + lane] = bw[l];
           __syncwarp();
         }
         const size_t a_col = static_cast<size_t>(ks0 + i) * 8 + (lane & 3);
@@ -1401,9 +1493,18 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void exl3_gemv_kernel(
 #pragma unroll
         for (int t = 0; t < WNT; ++t) {
           FragB f0, f1;
+          // exl3_gemv_kernel.cuh:287-316. The window pair is per-width: bits 3
+          // takes two LANE-COMPUTED words and a funnel offset, bits 4 takes the
+          // lane's own word and its left neighbour with no offset.
           if constexpr (SMEM_STAGE) {
             const uint32_t* tp = &sh_stage[warp][t * TWORDS];
-            dq8_regs_3bits<cb>(tp[x_src_a], tp[x_src_b], x_s2, f0, f1);
+            if constexpr (bits == 4)
+              dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
+            else
+              dq8_regs_3bits<cb>(tp[x_src_a], tp[x_src_b], x_s2, f0, f1);
+          } else if constexpr (bits == 4) {
+            const uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
+            dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
           } else {
             const uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
             const uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
@@ -2078,7 +2179,7 @@ const void* GemvKernelForArm(bool c_fp32, int mmode, int cfg, bool smem) {
 }
 
 
-// THE GEMV ARM SET IS `(3, 1)` AND `(3, 2)`, AND CODEBOOK 0 IS EXCLUDED ON PURPOSE
+// THE GEMV ARM SET IS `(3, 1)`, `(3, 2)` AND `(4, 2)`, AND CODEBOOK 0 IS EXCLUDED ON PURPOSE
 // rather than as an oversight. Upstream's own envelope refuses it:
 // `exl3_gemv.cu`'s try-launch carries `if (K != 4 && cb == 0) return false;`,
 // which `Exl3GemvHardEligible` transcribes at `exl3_policy.cpp:148`, and
@@ -2105,37 +2206,58 @@ const void* GemvKernelForArm(bool c_fp32, int mmode, int cfg, bool smem) {
 //     `if (K < 2 || K > 4) return false;` (`exl3_gemv.cu:107-121`) and its
 //     `SEL_GRID` list is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)`. Falling
 //     to the regular shape table at these widths is upstream's arrangement.
-//   bits 4, cb 2 -- upstream DOES have it, and this tree does not. That is a
-//     KERNEL PORT rather than an instantiation, and the shape of the work is
-//     known: `LSTRIDE` is `bits == 3 ? 24 : 32` and `LOADS` is `WNT`
-//     (`exl3_gemv_kernel.cuh:150-153`), the extraction becomes a single
-//     `(lane + 31) & 31` shuffle into a `dq8_regs_4bits` this tree does not
-//     have (`:296-300`, `:87`), and the `exl3_gemv_cfg` envelope was measured
-//     for K in {2,3,4} so it needs no new arm. It is owed, not refused as
-//     impossible. It is 270 of the 409 trellis modules of the #2495 artifact
-//     and it is the LARGEST remaining population (QUANT-EXL3-PERF, #2570).
+//   bits 2, any cb -- upstream HAS it and this tree does not. `LOADS` halves to
+//     `WNT / 2` and one loaded word carries TWO tiles (`:152`, `:302-310`),
+//     which is a third geometry, and no 2-bit EXL3 artifact has reached this
+//     tree to gate it against. Owed, and named so it is not rediscovered.
 //
-// BUT bits 3, cb 2 IS AN INSTANTIATION, and it is now here (QUANT-EXL3-PERF,
-// #2570). It is 137 of those 409 modules -- every MLP projection quantized at
-// the low end of that artifact's 3.5 bpw average -- and until this line the
-// GEMV's ONLY arm was `(3, 1)`, of which that checkpoint contains ZERO tensors.
-// The fast path was unreachable on the whole model the benchmark is about, one
-// module at a time and silently, because a declined GEMV falls through instead
-// of refusing. Nothing about the kernel's geometry depends on `cb`: `LSTRIDE`,
-// `TWORDS`, `FOLD`, `PF` and `LOADS` are functions of `bits`, `CFG` and `MMODE`
-// alone, and the single decode site is `dq8_regs_3bits<cb>`, which has carried
-// all three codebooks since QUANT-EXL3-MUL1 slice A.
+// bits 3, cb 2 IS AN INSTANTIATION, and it landed with slice A of
+// QUANT-EXL3-PERF (#2570). It is 137 of those 409 modules -- every MLP
+// projection quantized at the low end of that artifact's 3.5 bpw average -- and
+// until that line the GEMV's ONLY arm was `(3, 1)`, of which that checkpoint
+// contains ZERO tensors. The fast path was unreachable on the whole model the
+// benchmark is about, one module at a time and silently, because a declined
+// GEMV falls through instead of refusing. Nothing about the kernel's geometry
+// depends on `cb`: `LSTRIDE`, `TWORDS`, `FOLD`, `PF` and `LOADS` are functions
+// of `bits`, `CFG` and `MMODE` alone, and the single decode site is
+// `dq8_regs_3bits<cb>`, which has carried all three codebooks since
+// QUANT-EXL3-MUL1 slice A.
+//
+// bits 4, cb 2 WAS A KERNEL PORT, and it is now here (QUANT-EXL3-PERF slice B,
+// #2570). It is 270 of the 409 modules, the LARGEST single population in that
+// artifact and the one #2570 leads with. What it cost, against upstream: a
+// per-width `LSTRIDE` (`exl3_gemv_kernel.cuh:153`), the 24-lane load and store
+// guards narrowed to bits 3 (`:228-231`, `:270`), the per-lane funnel constants
+// made bits-3-only (`:199-216`), and `dq8_regs_4bits` (`:86-100`), which is a
+// different extractor and not a parameter of the 3-bit one.
+//
+// (4, 0) and (4, 1) are NOT instantiated even though `Exl3GemvHardEligible`
+// admits `(4, 0)` -- upstream's `K != 4 && cb == 0` refusal exempts this width
+// alone -- and even though nothing in the kernel above depends on `cb`, so it
+// SHOULD compile for both. Nothing builds either, so that last clause is an
+// inference and is written as one. They are 16 kernels each
+// in a translation unit the fat build compiles for ten architectures, and no
+// artifact in this tree carries a 4-bit tensor at either codebook: the #2495
+// checkpoint's 270 are all `mul1`. Adding them would repeat the `(3, 0)`
+// mistake this comment block already records. Owed with the artifact that needs
+// them.
 //
 // AN INSTANTIATION IS NECESSARY AND IT IS NOT SUFFICIENT, which is the part
 // that is easy to bank and wrong. `Exl3GemvSelectConfig` returns -1 to DECLINE,
-// and on Blackwell the only branch that can admit a bits-3 shape is
-// `size_n / 32 <= narrow_coresident` -- an OCCUPANCY QUERY -- before
-// `if (K == 3) return -1;` closes the door. At this artifact's two bits-3
-// shapes that needs `narrow_coresident >= 544` (k 5120, n 17408) and `>= 160`
-// (k 17408, n 5120). `tests/vt/test_exl3_gemv.cpp` pins both thresholds, so
-// whether the arm actually RUNS on a given device is a lookup and not a guess,
-// and a zero end-to-end effect with the arm declined stays distinguishable from
-// a zero with the arm taken.
+// and on Blackwell the only branch that can admit ANY of this checkpoint's
+// shapes -- at either width -- is `size_n / 32 <= narrow_coresident`, an
+// OCCUPANCY QUERY. For bits 3, `if (K == 3) return -1;` closes the door right
+// after it. For bits 4 the door stays open one line longer, and it leads
+// nowhere here: `size_n >= 8192 && size_k <= 4096` is the wide-config band and
+// this artifact's smallest 4-bit `k` is 5120. So the widths differ in what the
+// envelope SAYS and not in what it DOES on this checkpoint, and both rest on
+// the same occupancy term. What bits 4 does buy is lower thresholds:
+// `narrow_coresident >= 32` admits 34 modules, `>= 160` a further 85 and
+// `>= 192` a further 48, where the bits-3 shapes need 160 and 544.
+// `tests/vt/test_exl3_gemv.cpp` pins every one of those thresholds, so whether
+// an arm actually RUNS on a given device is a lookup and not a guess, and a
+// zero end-to-end effect with the arm declined stays distinguishable from a
+// zero with the arm taken.
 //
 // The cost of declining is NOT asserted here: it is the `m <= 8` fast path
 // only, and quantifying it needs the checkpoint on a device. `## Owed` of
@@ -2144,12 +2266,13 @@ const void* GemvKernelForArm(bool c_fp32, int mmode, int cfg, bool smem) {
 // A null here is a DECLINE, and `TryGemv` turns it into a fall-through rather
 // than a failure.
 constexpr bool Exl3GemvArmInstantiated(int bits, int cb) {
-  return bits == 3 && (cb == 1 || cb == 2);
+  return (bits == 3 && (cb == 1 || cb == 2)) || (bits == 4 && cb == 2);
 }
 
 const void* GemvKernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem) {
   if (bits == 3 && cb == 1) return GemvKernelForArm<3, 1>(c_fp32, mmode, cfg, smem);
   if (bits == 3 && cb == 2) return GemvKernelForArm<3, 2>(c_fp32, mmode, cfg, smem);
+  if (bits == 4 && cb == 2) return GemvKernelForArm<4, 2>(c_fp32, mmode, cfg, smem);
   return nullptr;
 }
 
@@ -2306,6 +2429,95 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   Check(cudaGetLastError(), "exl3_gemm launch");
 }
 
+// THE INSTANTIATED FUSED-MoE ARMS, which are NOT the GEMM's arms above.
+//
+// Upstream's table is `exl3_moe_kernel_instances[]` (`exl3_moe.cu:22-33`),
+// indexed at `:226` as `[4 * K + 2 * cb_idx + N_off]` with K in 0..8, cb_idx in
+// {0, 1} and N_off in {0, 1}. TWO of upstream's own bounds are load-bearing here
+// and the old refusal message stated neither:
+//
+//   CODEBOOK 0 IS NOT A MoE ARM UPSTREAM EITHER. `exl3_moe.cu:184` is
+//   `TORCH_CHECK(gate_mcg != gate_mul1, "MoE kernel: Only mcg and mul1 codebooks
+//   are supported")` and `:185` derives `cb_idx = gate_mul1 ? 1 : 0`. A 3INST
+//   checkpoint is refused before the table is indexed. So the MoE's reachable
+//   codebook set is at most {1, 2} -- it is NOT the GEMM's {0, 1, 2}, and a
+//   message implying otherwise is wrong about upstream rather than merely terse.
+//
+//   K == 0 IS UPSTREAM'S RUNTIME-WIDTH INSTANCE, for a tower whose gate/up/down
+//   widths differ (`exl3_moe_kernel.cuh:139-149`). This port takes K_gate, K_up
+//   and K_down as kernel arguments and discards them (`(void)K;` in
+//   `exl3_moe_kernel`'s `gemm_band`), so it serves only Kg == Ku == Kd. That is
+//   owed separately from the width set. NOTHING ELSE CATCHES IT: the only width
+//   check above this one is `deepseek_v4.cpp`'s, and it compares each projection
+//   ACROSS EXPERTS (`xe.w1.bits == e0.w1.bits` and its two siblings) rather than
+//   the three projections against each other, so a tower whose gate and down
+//   widths differ passes it. The launcher refuses that below.
+//
+// WIDTHS 3..6 AND CODEBOOK 1, and each half of that has its own reason.
+//
+// The WIDTHS are four and not eight because `dq_dispatch` above static_asserts
+// `bits == 3 || 4 || 5 || 6`, and that bound is arithmetic: the eight-window span
+// `16 + bits*7` leaves the 64-bit funnel once the start shift is added at bits 5.
+// Widths 1, 2, 7 and 8 are a DECODER question this file's GEMM shares, not a MoE
+// question, and widening them is not this arm's slice.
+//
+// The CODEBOOK is one and not two because a cb-2 MoE kernel would be DEAD CODE.
+// `vt::Exl3MoeMlp` has two production callers, both in `Exl3FusedMoePass`
+// (`deepseek_v4.cpp`), and FIVE sites pin the codebook to 1 before the kernel is
+// ever chosen: the loader refuses any marker but `mcg`, three separate
+// `args.codebook = 1` assignments, and `ops.cpp`'s own
+// `VT_CHECK(args.codebook == 1, ...)` in the SHARED seam -- which refuses for
+// every backend, the CPU reference included. Widening here alone would
+// instantiate a kernel nothing can reach.
+// QUANT-EXL3-MUL1 slice G records it as owed, as a LOADER slice that ends in a
+// kernel (#2756).
+//
+// THE WIDTHS, BY CONTRAST, ARE REACHABLE TODAY AND REFUSED. `deepseek_v4.cpp`
+// reads the bit width per projection off the checkpoint (`e0.w1.bits` and its
+// siblings) and assigns it into `Exl3MoeArgs` unchanged; nothing between the
+// loader and this launcher clamps it. Before this arm set, an expert tower
+// quantized at 4, 5 or 6 bits reached here with that width and was REFUSED, with
+// no second path: `MoeBlock` calls `Exl3FusedMoePass` unguarded so the exception
+// leaves the forward, this arm is default-ON, and the `VT_DSV4_EXL3_FUSED_MOE=0`
+// rollback lands on `Exl3ArmInstantiated`, which has no `(4, 1)`, `(5, 1)` or
+// `(6, 1)` either. Such a tower could not run on a CUDA queue by ANY path.
+//
+// SHARED MEMORY ADMITS EVERY ONE OF THEM, and the guard is the one already in
+// `exl3_gemm_kernel_inner` rather than a new check. At the MoE shape
+// (TILESIZE_M 16, TILESIZE_K 32, SH_STAGES 3) its `static_assert` resolves to
+// `kSmemMax >= 3*(2*512 + 2*512*bits) + 4*4096` for MOE_TILESIZE_N 256, which is
+// 28672 bytes at bits 3 and 37888 at bits 6 against a kSmemMax of 92160; the 128
+// form is smaller. A width that did not fit would fail to COMPILE there rather
+// than mis-stage silently.
+constexpr bool Exl3MoeArmInstantiated(int bits, int cb) {
+  return cb == 1 && (bits == 3 || bits == 4 || bits == 5 || bits == 6);
+}
+
+// Upstream's `[4 * K + 2 * cb_idx + N_off]` lookup, written as a switch because
+// this table is sparse where upstream's is dense. A pair the predicate admits
+// and this returns `nullptr` for is a BUG rather than a refusal, and the caller
+// treats it as one: the two can never disagree silently.
+template <int MOE_TILESIZE_N>
+const void* MoeKernelN(int bits, int cb) {
+  if (cb != 1) return nullptr;
+  switch (bits) {
+    case 3:
+      return reinterpret_cast<const void*>(&exl3_moe_kernel<3, MOE_TILESIZE_N, 1>);
+    case 4:
+      return reinterpret_cast<const void*>(&exl3_moe_kernel<4, MOE_TILESIZE_N, 1>);
+    case 5:
+      return reinterpret_cast<const void*>(&exl3_moe_kernel<5, MOE_TILESIZE_N, 1>);
+    case 6:
+      return reinterpret_cast<const void*>(&exl3_moe_kernel<6, MOE_TILESIZE_N, 1>);
+    default:
+      return nullptr;
+  }
+}
+
+const void* MoeKernel(int bits, int cb, bool n256) {
+  return n256 ? MoeKernelN<256>(bits, cb) : MoeKernelN<128>(bits, cb);
+}
+
 // ── the fused MoE launcher (exl3_moe.cu:99-301) ──────────────────────────────
 //
 // Every validation upstream performs lives in `src/vt/ops.cpp`, shared with the
@@ -2314,21 +2526,34 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 void Exl3MoeMlpKernelCuda(Queue& q, Tensor& output_state, const Tensor& hidden_state,
                           const Exl3MoeExpertTables& tables, const Exl3MoeRouting& routing,
                           const Exl3MoeTemps& temps, const Exl3MoeArgs& args) {
-  // The FUSED MoE arm stays at (3, mcg): it exists for the DeepSeek-V4 artifact
-  // and no stock EXL3 MoE checkpoint has reached this tree yet. It is a
-  // narrower set than the GEMM/GEMV arms above ON PURPOSE, and the refusal says
-  // which pair it wanted (QUANT-EXL3, #2181).
-  constexpr int kMoeBits = 3;
-  constexpr int kMoeCb = 1;
-  if (args.bits_gate != kMoeBits || args.bits_up != kMoeBits ||
-      args.bits_down != kMoeBits || args.codebook != kMoeCb) {
+  // `exl3_moe.cu:188-189` -- upstream is `int K = 0;` then
+  // `if (K_gate == K_up && K_up == K_down) K = K_gate;`. A tower whose widths
+  // disagree therefore leaves K at 0 and takes the runtime-width instance,
+  // whose per-band `switch (K)` is `exl3_moe_kernel.cuh:139-149`. This port does
+  // not carry that instance, so a disagreeing tower refuses here rather than
+  // decoding one band with another's width.
+  if (args.bits_gate != args.bits_up || args.bits_up != args.bits_down) {
     throw std::runtime_error(
-        "vt cuda exl3: exl3_moe has CUDA instantiations for bits == 3, codebook == 1 (mcg) "
-        "only; got bits (" +
+        "vt cuda exl3: exl3_moe carries ONE width for all three projections; got bits (" +
         std::to_string(args.bits_gate) + ", " + std::to_string(args.bits_up) + ", " +
-        std::to_string(args.bits_down) + ") codebook " + std::to_string(args.codebook) +
-        ". MODEL-DSV4-EXL3 W2 records the other widths as owed; the CPU arm decodes every "
-        "width and can serve them on a CPU queue.");
+        std::to_string(args.bits_down) +
+        "). Upstream's K == 0 instance switches the width at RUN TIME "
+        "(exl3_moe_kernel.cuh:139-149) and is NOT ported; QUANT-EXL3-MUL1 slice G records it "
+        "as owed (#2756). The CPU arm carries a width per projection and serves this on a "
+        "CPU queue.");
+  }
+  if (!Exl3MoeArmInstantiated(args.bits_gate, args.codebook)) {
+    throw std::runtime_error(
+        "vt cuda exl3: exl3_moe is instantiated for bits in {3, 4, 5, 6} at codebook 1 (mcg); "
+        "got bits " +
+        std::to_string(args.bits_gate) + " codebook " + std::to_string(args.codebook) +
+        ". Widths 1, 2, 7 and 8 have no device decode route at all -- `dq_dispatch` "
+        "static_asserts 3..6 for the GEMM too. Codebook 2 (mul1) is an upstream MoE arm "
+        "(exl3_moe.cu:184-185 admits mcg and mul1, and refuses 3INST) that this tree cannot "
+        "REACH: the loader accepts only an `mcg` marker and three call sites pin "
+        "`args.codebook` to 1, so the kernel would be dead code; QUANT-EXL3-MUL1 slice G "
+        "records it as owed (#2756). The CPU arm decodes every width over all three "
+        "codebooks and can serve them on a CPU queue.");
   }
   // NOT const: cudaLaunchCooperativeKernel takes `void**`, so every argument has
   // to be a modifiable lvalue whose address can be taken as `void*`.
@@ -2367,11 +2592,16 @@ void Exl3MoeMlpKernelCuda(Queue& q, Tensor& output_state, const Tensor& hidden_s
 
   // exl3_moe.cu:224-226. The N tile is 256 when both dims allow it.
   const bool n256 = (hidden_dim % 256 == 0) && (intermediate_dim % 256 == 0);
-  const void* kernel =
-      n256 ? reinterpret_cast<const void*>(
-                 &exl3_moe_kernel<kMoeBits, 256, kMoeCb>)
-           : reinterpret_cast<const void*>(
-                 &exl3_moe_kernel<kMoeBits, 128, kMoeCb>);
+  const void* kernel = MoeKernel(args.bits_gate, args.codebook, n256);
+  // A pair `Exl3MoeArmInstantiated` admitted and `MoeKernel` has no entry for is
+  // the two tables disagreeing. That is a defect in this file, not a refusal of
+  // the caller, and it must not reach `cudaLaunchCooperativeKernel` as a null.
+  if (kernel == nullptr)
+    throw std::runtime_error(
+        "vt cuda exl3: exl3_moe arm (bits " + std::to_string(args.bits_gate) + ", codebook " +
+        std::to_string(args.codebook) +
+        ") passed Exl3MoeArmInstantiated but MoeKernel has no entry for it. The two tables "
+        "disagree; this is a bug in cuda_exl3.cu, not a property of the call.");
   EnsureSmemOptIn(device, kernel);
 
   const half* hid = hidden_state.Ptr<half>();

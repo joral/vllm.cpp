@@ -2629,6 +2629,44 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     // you. Deleting the `Ltx2UpsampleVideoLatent` call in the rounds loop must
     // turn this red; that mutation is the row's headline evidence.
     CHECK(trace.temporal_upsample_calls == 1);
+    // THE TEMPORAL CHECKPOINT'S OWN WIDTH (A24 wave 5, #2857). The row asks BOTH
+    // upsampler loaders for `kBF16`, and until this line only the spatial one was
+    // observed: reverting the temporal loader alone left this suite at 116/116
+    // and test_ltx2_dfr at 11/11, 5638 assertions green. `temporal_upsample_calls`
+    // above says the arm RAN; this says it ran off narrow bytes. The two are a
+    // pair, because a bag nobody loaded also reports zero wide bytes.
+    const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+    INFO("temporal upsampler weights: " << trace.temporal_upsampler_weight_bytes
+                                        << " bytes over "
+                                        << trace.temporal_upsampler_weight_elems
+                                        << " parameters");
+    REQUIRE(trace.temporal_upsampler_weight_elems > 0);
+    CHECK(trace.temporal_upsampler_weight_bytes ==
+          trace.temporal_upsampler_weight_elems * bf16_bytes);
+    // And the SPATIAL bag on the same render, so a change that narrowed one arm
+    // by widening the other cannot pass here either.
+    REQUIRE(trace.upsampler_weight_elems > 0);
+    CHECK(trace.upsampler_weight_bytes == trace.upsampler_weight_elems * bf16_bytes);
+
+    // THE CALL SITES, COUNTED EXACTLY rather than as "more than zero". This row's
+    // M8 mutation deleted all three `Ltx2UpsampleVideoLatent` calls at once and
+    // read the red as covering each of them; deleting only the `up_slots` and DFR
+    // sites left the suite green, because no assertion pinned the count.
+    //
+    // THREE, and the number was MEASURED here rather than derived: this case's
+    // first version predicted two and read 3, so the prediction is reported as
+    // the wrong one it was. A DFR round-1 render reaches ALL THREE sites --
+    // stage 2's video latent, the generated keyframe slots, and this round --
+    // which is why this one subcase pins every one of them, and why deleting any
+    // single site now reds it.
+    INFO("upsample calls on a one-round DFR render: " << trace.upsample_calls);
+    CHECK(trace.upsample_calls == 3);
+    // And the bytes those calls really moved. Same reasoning as the spatial
+    // render's case: every other counter here is value-shaped.
+    REQUIRE(trace.upsample_volume_elems > 0);
+    CHECK(trace.upsample_volume_bytes == trace.upsample_volume_elems * bf16_bytes);
+    REQUIRE(trace.upsample_param_elems > 0);
+    CHECK(trace.upsample_param_bytes == trace.upsample_param_elems * bf16_bytes);
     // (:415) `2**round_idx` windows — AND THE CLAMP, which this expectation got
     // wrong on the first pass and which is worth recording rather than quietly
     // fixing. `tile_ranges` takes `min(num_tiles, n_segments)`
@@ -2668,6 +2706,12 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     // that upsampled once and then re-tiled twice produces a clip of the right
     // length at half the temporal detail.
     CHECK(trace.temporal_upsample_calls == 2);
+    // ONE MORE `Ltx2UpsampleVideoLatent` PER ROUND, and this is the assertion the
+    // round-1 count cannot make on its own: a build that upsampled once and
+    // reused the result would report 3 there and 3 here. The two fixed sites
+    // plus one call per round is 3 at one round and 4 at two.
+    INFO("upsample calls on a two-round DFR render: " << trace.upsample_calls);
+    CHECK(trace.upsample_calls == 4);
     // THE TILE COUNT GROWS WITH THE ROUND, which is the assertion that separates
     // a real re-tiling from a loop that denoises the canvas whole. Both values
     // are clamped by `min(num_tiles, n_segments)` (dfr_layout.py:171) — see the
@@ -7011,6 +7055,188 @@ TEST_CASE("ltx2 video: a typed PROMPT conditions the render") {
   REQUIRE(fox.trace.connector_audio_values > 0);
   CHECK(fox.trace.connector_video_not_bf16 == 0);
   CHECK(fox.trace.connector_audio_not_bf16 == 0);
+}
+
+TEST_CASE("ltx2 video: the VAE DECODE runs at upstream's dtype") {
+  // A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16, issue #2786.
+  //
+  // Upstream constructs `VideoDecoder` with the ONE pipeline dtype
+  // (`distilled.py:146-149`, `self.dtype` at `:148`) and its forward casts the
+  // latent to the weights' dtype on entry and back on exit
+  // (`conv_video_decoder.py:283-284, 357`). It carries no float32 pin of the kind
+  // the audio vocoder has (`vocoder.py:575-580`), which is the one place in this
+  // pipeline where f32 is argued rather than owed.
+  //
+  // THE COUNTER IS SAMPLED IN THE `Ltx2VideoDecodeStreaming` SINK, which is the
+  // one production route into the decoder. A unit test that builds
+  // `Ltx2ConvVideoDecode` itself would prove the class works and never that
+  // anything reaches it (AGENTS.md `## Nothing lands dead`).
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  const Rendered fox = RenderPrompt(mp, ws.root + "/p_vaedtype", "a b c");
+
+  // 1. THE FIXTURE CARRIES SUB-BF16 DETAIL INTO THE DECODE, measured rather than
+  //    assumed. Without this the next check goes quietly green on any fixture
+  //    whose numbers happen to land on bf16 grid points -- which is exactly the
+  //    hole A24 sat in for the whole tree. The latent is the decoder's own input
+  //    in this same render, produced by the f32 CPU reference DiT arm, so it is a
+  //    LIVE wide stream rather than an argument about one.
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count: a floor
+  //    below the real number is a mute switch. The measured value is printed
+  //    beside it so a reader can see the headroom.
+  INFO("latent into the decode, wider than bf16: "
+       << fox.trace.vae_latent_not_bf16 << " of " << fox.trace.vae_latent_values);
+  REQUIRE(fox.trace.vae_latent_values > 0);
+  CHECK(fox.trace.vae_latent_not_bf16 > fox.trace.vae_latent_values / 2);
+
+  // 2. AND THE DECODE ITSELF PRODUCES ONLY bf16-REPRESENTABLE PIXELS.
+  //
+  //    NOTHING ELSE ON THIS PATH CAN SEE THAT. The frame digests detect CHANGE
+  //    and the absmax detects COLLAPSE; both are computed over the same f32
+  //    container on either arm and are identical in shape whichever width filled
+  //    it. AGENTS.md names the blind spot exactly -- "a token gate cannot detect a
+  //    dtype that is too wide."
+  INFO("VAE decode output, wider than bf16: "
+       << fox.trace.vae_decode_not_bf16 << " of " << fox.trace.vae_decode_values);
+  REQUIRE(fox.trace.vae_decode_values > 0);
+  CHECK(fox.trace.vae_decode_not_bf16 == 0);
+}
+
+// A24 wave 4 (#2850). The DECODER's width above; this is the ENCODER's, and it
+// is a separate case rather than two more lines in that one because it enters
+// the engine by a different request: the decoder runs on every render and the
+// encoder only when a conditioning image is supplied.
+TEST_CASE("ltx2 video: the video VAE ENCODER computes at upstream's bfloat16") {
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/p_encdtype");
+  gen.first_frame_ppm = ConditioningPpm(20, 28, 7);
+  // crf 0 because an LTX-2.5 checkpoint otherwise resolves 18 and the H.264
+  // round trip is refused by name here. The CRF is not what this case measures.
+  gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  REQUIRE(trace.completed);
+  REQUIRE(result.frame_count > 0);
+
+  // 1. THE ENCODER'S INPUT CARRIES SUB-BF16 DETAIL, measured rather than
+  //    assumed. Without this the next check goes quietly green on any fixture
+  //    whose pixels happen to land on bf16 grid points, which is exactly the
+  //    hole A24 sat in for the whole tree. `Ltx2LoadImageAndPreprocess` produces
+  //    this stream in the same render, so it is LIVE rather than an argument
+  //    about one.
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count: a floor
+  //    below the real number is a mute switch. The measured value is printed
+  //    beside it so a reader can see the headroom.
+  INFO("pixels into the encode, wider than bf16: "
+       << trace.vae_encode_in_not_bf16 << " of " << trace.vae_encode_in_values);
+  REQUIRE(trace.vae_encode_in_values > 0);
+  CHECK(trace.vae_encode_in_not_bf16 > trace.vae_encode_in_values / 2);
+
+  // 2. AND THE ENCODE ITSELF PRODUCES ONLY bf16-REPRESENTABLE LATENTS.
+  //
+  //    NOTHING ELSE ON THIS PATH CAN SEE THAT. The latent is a
+  //    `std::vector<float>` on either arm and every digest, absmax and token
+  //    count downstream is computed over that same container, identical in shape
+  //    whichever width filled it. AGENTS.md names the blind spot exactly -- "a
+  //    token gate cannot detect a dtype that is too wide."
+  INFO("VAE encode output, wider than bf16: " << trace.vae_encode_not_bf16 << " of "
+                                              << trace.vae_encode_values);
+  REQUIRE(trace.vae_encode_values > 0);
+  CHECK(trace.vae_encode_not_bf16 == 0);
+}
+
+TEST_CASE("ltx2 video: the latent upsampler COMPUTES at bfloat16 on the render path") {
+  // A24 wave 5, row LTX25-A24-UPSAMPLER-BF16 (#2857). Upstream resolves ONE model
+  // dtype (`distilled.py:109`) and hands it to the latent upsampler at
+  // `:138-141`. The parity suite gates the ARITHMETIC against the executed
+  // module; this case gates the thing the parity suite structurally cannot see.
+  //
+  // WHY A RENDER AND NOT A UNIT TEST. `Ltx2LatentUpsample` constructed by hand
+  // proves the class narrows. It cannot prove that the ENGINE reaches the narrow
+  // path -- the loader could still widen the checkpoint, and every frame, digest
+  // and byte count downstream would be identical. AGENTS.md: "A unit test that
+  // constructs the type by hand proves that the class works, never that anything
+  // reaches it." So this drives `LoadVideoEngine` -> `Generate` on its default
+  // configuration through `upsampler_path`, which is the same entry a caller uses.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["upsampler_path"] = ws.paths.upsampler;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(FixtureGen(ws.root + "/ups_bf16"));
+  // A REAL two-stage render, so the upsampler is on the path that produced it
+  // rather than on one this case constructed for itself.
+  CHECK(result.width == 64);
+  CHECK(result.height == 64);
+  const auto* ltx2 = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+
+  // 1. SOMETHING RAN. Without this the two assertions below are satisfied by a
+  //    build that stopped calling the upsampler at all: zero wide calls and zero
+  //    wide values is what "never ran" looks like, and it reads as perfect.
+  INFO("upsampler calls on the render path: " << trace.upsample_calls);
+  REQUIRE(trace.upsample_calls > 0);
+
+  // 2. IT RAN AT UPSTREAM'S WIDTH, read off the latent the stage returned rather
+  //    than off the config that asked for it.
+  INFO("upsampler calls reporting a width other than bf16: " << trace.upsample_wide_calls
+                                                             << " of " << trace.upsample_calls);
+  CHECK(trace.upsample_wide_calls == 0);
+
+  // 3. AND THE VALUES AGREE WITH THE REPORT. A `dtype` field can be set
+  //    correctly by a path that computed wide; only the values can say whether
+  //    the arithmetic actually landed in bf16. This is the half that survives a
+  //    correct-looking field, and it is why both are here.
+  INFO("upsampled latent values wider than bf16: " << trace.upsample_not_bf16 << " of "
+                                                   << trace.upsample_values);
+  REQUIRE(trace.upsample_values > 0);
+  CHECK(trace.upsample_not_bf16 == 0);
+
+  // 4. AND THE STORAGE IS THE WIDTH, which is what 1-3 structurally cannot say.
+  //    All three above are VALUE-shaped. Sizing every internal buffer by
+  //    `sizeof(float)` while still rounding each stored value to bf16 leaves each
+  //    of them bit-identical -- that build was made and run during this row's
+  //    review and 9125 assertions stayed green -- and it moves twice the bytes,
+  //    which is the polarity AGENTS.md says a token gate cannot see. These are
+  //    the bytes the upsampler really reserved and really read through, drained
+  //    per call, so `bytes / elems` IS the storage width.
+  const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+  INFO("upsampler volumes: " << trace.upsample_volumes << ", " << trace.upsample_volume_bytes
+                             << " bytes over " << trace.upsample_volume_elems << " elements");
+  REQUIRE(trace.upsample_volumes > 0);
+  REQUIRE(trace.upsample_volume_elems > 0);
+  CHECK(trace.upsample_volume_bytes == trace.upsample_volume_elems * bf16_bytes);
+
+  INFO("upsampler parameter views: " << trace.upsample_param_views << ", "
+                                     << trace.upsample_param_bytes << " bytes over "
+                                     << trace.upsample_param_elems << " elements");
+  REQUIRE(trace.upsample_param_views > 0);
+  REQUIRE(trace.upsample_param_elems > 0);
+  CHECK(trace.upsample_param_bytes == trace.upsample_param_elems * bf16_bytes);
+
+  // 5. AND THE LOADER HANDED IT NARROW BYTES. The volumes above would still be
+  //    bf16 if the checkpoint had been widened to f32 on the way in and rounded
+  //    at the first store: the arm comes off the bag, so the bag is what has to
+  //    be narrow. `Ltx2VaeWeights::Bytes()` is the tree's own measurement for
+  //    this and had no caller at all before this row.
+  INFO("spatial upsampler weights: " << trace.upsampler_weight_bytes << " bytes over "
+                                     << trace.upsampler_weight_elems << " parameters");
+  REQUIRE(trace.upsampler_weight_elems > 0);
+  CHECK(trace.upsampler_weight_bytes == trace.upsampler_weight_elems * bf16_bytes);
+
+  // 6. THE SPATIAL SITE IS NOT THE ONLY ONE. This fixture renders one stage-2
+  //    upsample; the DFR case below carries the temporal arm's own counters,
+  //    which this render cannot observe at all.
+  CHECK(trace.temporal_upsampler_weight_elems == 0);
 }
 
 TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {
@@ -11388,8 +11614,11 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   const std::string lora =
       WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
 
-  // `max_phase` is a LOAD extra, so each arm is its own engine.
-  const auto render = [&](const char* strength, const char* max_phase, const char* out) {
+  // `max_phase` is a LOAD extra, so each arm is its own engine. `trace` is an
+  // out-parameter rather than a second render, because two renders of the same
+  // arm would be two chances for the comparison to be about noise.
+  const auto render = [&](const char* strength, const char* max_phase, const char* out,
+                          vllm::multimodal::Ltx2ConditioningTrace* trace = nullptr) {
     vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2LoraStrengthExtra] = strength;
     if (max_phase != nullptr) mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = max_phase;
@@ -11398,6 +11627,11 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
     REQUIRE(engine != nullptr);
     const std::string dir = std::string(ws.root) + "/" + out;
     const vllm::multimodal::VideoResult result = engine->Generate(A2VidGen(dir, wav));
+    if (trace != nullptr) {
+      const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+      REQUIRE(ltx != nullptr);
+      *trace = ltx->last_conditioning();
+    }
     return A2VidArtifacts(dir, result);
   };
 
@@ -11420,8 +11654,9 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   CHECK(s1_differing == 0);
 
   // ── both stages, the same two strengths ───────────────────────────────────
-  const std::string both_full = render("1.0", nullptr, "both_full");
-  const std::string both_zero = render("0.0", nullptr, "both_zero");
+  vllm::multimodal::Ltx2ConditioningTrace both_full_trace, both_zero_trace;
+  const std::string both_full = render("1.0", nullptr, "both_full", &both_full_trace);
+  const std::string both_zero = render("0.0", nullptr, "both_zero", &both_zero_trace);
   REQUIRE(both_full.size() == both_zero.size());
 
   size_t both_differing = 0;
@@ -11431,14 +11666,34 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   MESSAGE("both stages: the adapter moves " << both_differing << " of " << both_full.size()
                                             << " artifact bytes");
   // THE HALF THAT REDS ON "STOPPED FUSING ALTOGETHER". `stage_2_loras` at `:114`
-  // DOES carry the distilled adapter, so it must reach the pixels through stage
+  // DOES carry the distilled adapter, so it must reach the render through stage
   // 2. Without this line the case above is satisfied by an engine that ignores
   // `lora_path` entirely, which is the same shape of green-but-proves-nothing
   // the row's spec rejects.
   //
-  // Strictly greater than zero and no count floor above it: a count-based
-  // tolerance would bound nothing.
-  CHECK(both_differing > 0);
+  // THE ARTIFACT-BYTE COMPARISON THAT USED TO CARRY THIS CANNOT ANY MORE, AND THE
+  // NUMBERS ARE WHY (A24 wave 3, #2786). On an f32 decode the adapter moved 19 of
+  // 146753 PPM bytes -- 0.013% of the clip, a handful of pixels that happened to
+  // straddle an 8-bit quantization boundary. The decode now runs at upstream's
+  // own bfloat16 (`distilled.py:109`, handed to `VideoDecoder` at `:148`), whose
+  // mantissa is also 8 bits, and a difference that small rounds away: measured 0
+  // of 146753. Raising the fixture's delta does NOT recover it -- at scale 8 the
+  // count is 0 as well, because a larger delta pushes the render further into the
+  // writer's clamp and both arms saturate to the same bytes. The instrument had a
+  // narrow window and the shipping dtype closed it.
+  //
+  // So the claim is made ONE STEP UPSTREAM, on the latent the decoder is handed,
+  // which is where the adapter's effect lives and which no pixel quantization
+  // touches. This is strictly a different statement from "reaches the pixels" and
+  // is written as such: it proves the adapter reaches the DECODER'S INPUT. That
+  // the decode depends on its input is gated separately and numerically by
+  // tests/vllm/models/test_ltx2_vae.cpp's decoder goldens, so the two together
+  // still close the path the byte comparison used to close alone.
+  MESSAGE("both stages: latent digest full=" << both_full_trace.vae_latent_digest
+                                             << " zero=" << both_zero_trace.vae_latent_digest);
+  REQUIRE(both_full_trace.vae_latent_values > 0);
+  REQUIRE(both_full_trace.vae_latent_absmax > 1e-6);
+  CHECK(both_full_trace.vae_latent_digest != both_zero_trace.vae_latent_digest);
 
   // ── and the two arms are not the same render ──────────────────────────────
   // Stage 2 upsamples, so a stage-1-only artifact cannot equal a two-stage one.

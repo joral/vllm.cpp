@@ -131,7 +131,7 @@ class Dots3NoteImageProcessor {
   Dots3NoteProcessorConfig cfg_;
 };
 
-// ─── THE AUDIO PROCESSOR (W7a, #2703) ───────────────────────────────────────
+// ─── THE AUDIO PROCESSOR (W7a, #2703; the chunk loop W7b, #2797) ────────────
 //
 // Ported from `vllm/models/dots3_note/nvidia/audio.py` @ `9035151d6`:
 //   SAMPLE_RATE / N_FFT / HOP_LENGTH               :15-17
@@ -142,6 +142,8 @@ class Dots3NoteImageProcessor {
 //   pad_or_trim                                    :84-93
 //   _mel_filters                                   :96-107
 //   log_mel_spectrogram                            :117-126
+//   compute_audio_token_length (DEAD upstream)     :129-147
+//   encode_waveform's segment loop (W7b)           :193-218
 //   the per-segment token count                    :210-212
 // and from `common/processor.py` @ `9035151d6`:
 //   AUDIO_START / AUDIO_PAD / AUDIO_END            :44-46
@@ -151,7 +153,7 @@ class Dots3NoteImageProcessor {
 // THE FRONT END IS NOT RE-WRITTEN HERE, and that is the point of this class.
 // `log_mel_spectrogram` (`audio.py:117-126`) is Whisper's verbatim, and
 // `WhisperAudioProcessor::ProcessWaveform`
-// (src/vllm/multimodal/audio_processor.cpp:91-199) already is that function in
+// (src/vllm/multimodal/audio_processor.cpp:211-319) already is that function in
 // double precision: reflect pad, dropped last frame, PERIODIC Hann, POWER
 // spectrogram, `clamp(1e-10)` + `log10`, GLOBAL-max `-8` floor, `(x+4)/4`. The
 // only dots3 deltas are CONFIG — `chunk_length_s` 30 -> 60, `n_mels` 80 -> 128 —
@@ -160,9 +162,11 @@ class Dots3NoteImageProcessor {
 // the shared `MelFilterBankSlaney` seam, which reproduces the committed
 // `voxtral_mel_filters_f32.bin` bit-for-bit; see mel_filter_bank.h.
 //
-// WHAT THIS CLASS ADDS ON TOP: `pad_or_trim` to `chunk_samples`, the
+// WHAT THIS CLASS ADDS ON TOP: the `chunk_seconds` SEGMENT LOOP (W7b, #2797,
+// `audio.py:193-218`), `pad_or_trim` to `chunk_samples` per segment, the
 // `ceil(num_samples / token_stride)` token count, the VALID mel-frame count the
-// tower's temporal mask needs, and the two refusals W7b and W7c own.
+// tower's temporal mask needs, the SAMPLE-RATE conversion (W7c-2, #2828, through
+// the shared `ResampleAudioScipy` seam), and the refusal §4.15.3 owns.
 struct Dots3NoteAudioProcessorConfig {
   // False when `config.json` carries no `audio_config`. Upstream builds no
   // `Dots3NoteAudioModel` in that case (`multimodal.py:119-126` @ `9035151d6`).
@@ -272,24 +276,111 @@ class Dots3NoteAudioProcessor {
   // through the same object the front end actually uses.
   const std::vector<float>& mel_filters() const;
 
-  // `pad_or_trim` + `log_mel_spectrogram` + the token count
-  // (`audio.py:208-218`). REFUSES BY NAME, before any arithmetic:
-  //   * `sample_rate != cfg.sampling_rate`  -> W7c (no resampler is ported)
-  //   * `num_samples > cfg.chunk_samples()` -> W7b (no segmentation is ported)
-  // The second is not a convenience. Past one chunk upstream's tower sums
-  // `ceil(chunk_len / stride)` PER SEGMENT (`audio.py:141-146`) while the
-  // prompt side computes one `ceil(total / stride)` (`processor.py:771`); the
-  // two agree at or under one chunk and diverge past it, and a divergence is a
-  // masked scatter that does not balance.
+  // ONE `chunk_seconds` segment of the waveform, as
+  // `DotsEncoderWithMask.encode_waveform` slices it (`audio.py:196-212` @
+  // `9035151d6`). `length` is the segment's OWN sample count — `chunk_samples`
+  // for every segment but the last — and `num_tokens` is
+  // `NumAudioTokens(length)`, upstream's per-segment `token_len` (`:210-212`).
+  struct AudioChunk {
+    int64_t start = 0;
+    int64_t length = 0;
+    int64_t num_tokens = 0;
+  };
+
+  // The SEGMENTATION on its own (W7b, #2797), exposed because it is the seam a
+  // gate can drive without a front end and because the tower and the prompt
+  // side must read the SAME geometry rather than two copies of the loop.
+  // Upstream's `while time_step * SAMPLE_RATE < audio_waveform.shape[0]`
+  // (`audio.py:196-203`), so no segment is ever EMPTY — which is why the
+  // per-segment count can be `NumAudioTokens` unchanged; see its note.
+  std::vector<AudioChunk> SegmentWaveform(int64_t num_samples) const;
+
+  // `encode_waveform`'s front-end half (`audio.py:193-218`): slice into
+  // `chunk_seconds` segments, and for each one `pad_or_trim` to
+  // `chunk_samples`, take the log-mel and assert `mel.shape[1] ==
+  // chunk_mel_frames`. The mels are STACKED (`:220`), so `input_features` is
+  // `[num_chunks, n_mels, chunk_mel_frames]` and `chunk_num_samples` /
+  // `chunk_num_tokens` carry upstream's `audio_sample_lens` / `token_lens`.
+  //
+  // THE LOG-MEL IS TAKEN PER SEGMENT AND THAT IS NOT AN OPTIMISATION.
+  // `log_mel_spectrogram` floors at `log_spec.max() - 8.0` (`audio.py:124`), a
+  // GLOBAL max over the tensor it is handed, and upstream hands it one padded
+  // segment at a time. One pass over the whole waveform would use one max for
+  // every chunk and shift the quietest bands of the quietest chunk.
+  //
+  // RESAMPLES a `sample_rate` that is not `cfg.sampling_rate` (W7c-2, #2828)
+  // through `vllm::multimodal::ResampleAudioScipy`, which is upstream's own
+  // `"scipy"` `AudioResampler` arm and NOT its `"pyav"` default; that choice is
+  // a recorded divergence and the seam header carries the reason. At the target
+  // rate the call returns its input unchanged, so nothing at 16 kHz moves.
+  //
+  // REFUSES BY NAME, before any arithmetic:
+  //   * a non-positive rate, or a reduced polyphase ratio past
+  //     `kMaxPolyphaseRate` (from inside the resample seam)
+  //   * more than one chunk on a config whose `chunk_samples` is not a whole
+  //     number of `token_stride`s. That is the ONE thing segmentation cannot
+  //     make safe: the tower produces `sum_i ceil(seg_i / stride)` rows
+  //     (`audio.py:129-147`) and the prompt side expands one
+  //     `ceil(total / stride)` span (`processor.py:771`), and those two are
+  //     equal for every waveform exactly when `chunk_samples % token_stride ==
+  //     0`. The released config satisfies it (960000 = 750 * 1280) and so does
+  //     every EVEN `chunk_seconds` at 16 kHz. A SINGLE-chunk waveform is served
+  //     either way, because a one-segment sum is `ceil(n / stride)` on both
+  //     sides — which is why this is a per-request refusal and not an
+  //     install-time one.
+  //
+  // HANDS BACK THE RESAMPLED BUFFER when `resampled_out` is not null, so that a
+  // caller which also needs the encoder-cache key does not pay for the resample
+  // a second time (PR #2842 F2). It is left EMPTY when no resample happened, which
+  // is exactly the case in which the caller's own pointer is already the
+  // waveform the tower consumed. Nothing about the returned `AudioKwargs`
+  // depends on the argument.
   AudioKwargs ProcessWaveform(const float* samples, int64_t num_samples,
-                              int sample_rate) const;
+                              int sample_rate,
+                              std::vector<float>* resampled_out = nullptr) const;
 
   // `ceil(num_samples / token_stride)`, exposed because the chat seam needs the
   // placeholder count and the encoder needs the row count and they must be the
   // same function rather than two copies of the same formula.
+  //
+  // W7b DELIBERATELY DID NOT CHANGE THIS, and #2797 records the check.
+  // Upstream's per-segment form is `(n - 1) // stride + 1` (`audio.py:210-212`)
+  // and it is algebraically identical to `ceil(n / stride)` for every
+  // `n >= 1`. The two differ at `n == 0`, and only in C++: Python's `//`
+  // floors, so `(0-1)//1280 + 1 == 0`, while C++ integer division truncates
+  // toward zero, so a LITERAL transcription of upstream's expression returns 1
+  // — one phantom token for an empty segment. `SegmentWaveform` never emits an
+  // empty segment, so the two forms agree everywhere this port calls them; the
+  // identity was ported, not the characters.
   int64_t NumAudioTokens(int64_t num_samples) const;
 
   std::string HashAudio(const float* samples, int64_t num_samples) const;
+
+  // The encoder-cache key for a request that names its OWN sample rate
+  // (W7c-2, #2828). It hashes the RESAMPLED waveform, which is what the tower
+  // consumes.
+  //
+  // THE TWO-ARGUMENT FORM IS NOT SAFE FOR A MULTI-RATE CALLER, and W7c-2
+  // created that hazard by serving more than one rate. A file carrying N PCM16
+  // samples at 16000 Hz and a file carrying the identical N samples at
+  // 44100 Hz decode to identical float buffers and hash identically under it,
+  // while their features differ. `mm_hash` is a cross-request encoder-cache key
+  // (`EncoderCacheManager::cached_`), so that is a hit that serves the wrong
+  // audio. Every caller that has a request rate in hand must use this overload;
+  // the two-argument one stays for the callers that are single-rate by
+  // construction.
+  //
+  // `resampled` IS AN ANSWER, NOT A HINT: when it is not null it must be the
+  // buffer `ProcessWaveform` filled for THIS waveform and THIS rate, and it is
+  // hashed as-is. `RouteDots3NoteAudioWav` passes it because it has just called
+  // `ProcessWaveform`, and that is what makes the served path resample ONCE
+  // rather than twice — the second resample was a 1220.7 MB allocation on the
+  // request measured in §4.17.10. A caller that does not hold the buffer passes
+  // nothing and this resamples for itself, which is the only behaviour that
+  // ever existed and is what the unit suite drives.
+  std::string HashAudio(const float* samples, int64_t num_samples,
+                        int sample_rate,
+                        const std::vector<float>* resampled = nullptr) const;
 
  private:
   Dots3NoteAudioProcessorConfig cfg_;

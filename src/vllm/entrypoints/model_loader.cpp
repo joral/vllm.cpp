@@ -33,6 +33,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/clip_mmproj_gguf.h"  // LOAD-GGUF-MMPROJ, #821
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
+#include "vllm/model_executor/models/dots3_note.h"  // the OWED dots3note GGUF refusal (#2882)
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/glm5_next_weights.h"  // glm5next GGUF arm
 #include "vllm/model_executor/models/glm_moe_dsa.h"  // glm-dsa GGUF arm
@@ -1287,6 +1288,9 @@ HfConfig HfConfigFromGgufDispatch(const vllm::GgufFile& gguf) {
   // understates them: the file IS one this project knows.
   if (vllm::IsNemotronHGguf(gguf)) {
     throw std::runtime_error(vllm::NemotronHGgufRefusal());
+  }
+  if (vllm::IsDots3NoteGguf(gguf)) {
+    throw std::runtime_error(vllm::Dots3NoteGgufRefusal());
   }
   throw std::runtime_error(
       "GGUF architecture '" + arch +

@@ -26,6 +26,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "vt/grow_only_stream_scratch.h"
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
@@ -605,34 +606,32 @@ inline void Check(hipError_t err, const char* what) {
 
 // Grow-only, per-stream activation-quant scratch pool — the mirror of the
 // donor's EnsureScratch + RetireGraphScratch discipline
-// (src/vt/cuda/cuda_quant_dot.cu:1507, src/vt/cuda/graph_safe_scratch.h):
-// hipMalloc/hipFree/hipStreamSynchronize per call are ILLEGAL under hipGraph
-// stream capture (the #473/#332 decode-graph lane), and the old free-after-
-// launch also needed the sync that serialized every call. The pool allocates
-// stream-ordered (hipMallocAsync), never frees during the process (a captured
-// graph may have baked the pointer), and needs NO synchronization: reuse is
-// stream-ordered and retirement keeps every baked pointer valid. Bounded: the
-// buffer grows O(log(max/min)) times over a process.
-struct StreamScratch {
-  void* buf = nullptr;
-  size_t bytes = 0;
-};
-
-StreamScratch& ScratchFor(hipStream_t s) {
-  static std::mutex mu;
-  static std::unordered_map<hipStream_t, StreamScratch> pools;
-  std::lock_guard<std::mutex> lk(mu);
-  return pools[s];
+// (src/vt/cuda/cuda_quant_dot.cu:1812 `EnsureScratch`,
+// src/vt/cuda/graph_safe_scratch.h; the :1507 this comment used to cite has
+// moved): hipMalloc/hipFree/hipStreamSynchronize per call are ILLEGAL under
+// hipGraph stream capture (the #473/#332 decode-graph lane), and the old
+// free-after-launch also needed the sync that serialized every call. The pool
+// allocates stream-ordered (hipMallocAsync), never frees during the process (a
+// captured graph may have baked the pointer), and needs NO stream
+// synchronization: reuse is stream-ordered and retirement keeps every baked
+// pointer valid. Bounded: the buffer grows O(log(max/min)) times over a process.
+//
+// The bookkeeping is vt::GrowOnlyStreamScratch (src/vt/grow_only_stream_scratch.h),
+// which is free of HIP headers so the HOST synchronization it owns is gated on a
+// CPU-only runner (#2712). Only the hipMallocAsync stays here.
+vt::GrowOnlyStreamScratch<hipStream_t>& QuantScratchPool() {
+  static vt::GrowOnlyStreamScratch<hipStream_t> pool;
+  return pool;
 }
 
 void* EnsureQuantScratch(size_t need, hipStream_t s) {
-  StreamScratch& sc = ScratchFor(s);
-  if (need > sc.bytes) {
-    // Retire, never free (see the header note above).
-    Check(hipMallocAsync(&sc.buf, need, s), "quant scratch grow");
-    sc.bytes = need;
-  }
-  return sc.buf;
+  return QuantScratchPool().Ensure(s, need, [s](size_t bytes) {
+    void* block = nullptr;
+    // Retire, never free (see the header note above). Throws on failure, which
+    // leaves the pool entry exactly as it was.
+    Check(hipMallocAsync(&block, bytes, s), "quant scratch grow");
+    return block;
+  });
 }
 
 enum class Q8KQuantArm : uint8_t { kLegacy = 0, kCandidate = 1 };

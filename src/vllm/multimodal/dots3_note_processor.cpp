@@ -16,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/multimodal/audio_resample.h"
 #include "vllm/multimodal/hasher.h"
 #include "vllm/multimodal/mel_filter_bank.h"
 #include "vllm/v1/engine/validation_error.h"
@@ -477,65 +478,173 @@ int64_t Dots3NoteAudioProcessor::NumAudioTokens(int64_t num_samples) const {
   return (num_samples - 1) / stride + 1;
 }
 
-AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
-    const float* samples, int64_t num_samples, int sample_rate) const {
-  if (sample_rate != cfg_.sampling_rate) {
-    // `InputValidationError`, so the server answers HTTP 400: the RATE is a
-    // property of the request, and `ApiServer::handle_chat_completions` maps a
-    // bare `runtime_error` to 500. Upstream's own mapping is `ValueError` ->
-    // `BadRequestError` (serve/utils/error_response.py:62-65).
-    throw v1::InputValidationError(
-        "dots3-note audio processor: the request carries audio at " +
-        std::to_string(sample_rate) + " Hz and this checkpoint's "
-        "`audio_config.sampling_rate` is " +
-        std::to_string(cfg_.sampling_rate) +
-        " Hz. RESAMPLING IS NOT PORTED and is owed to W7c: upstream resamples "
-        "in its data parser (MultiModalDataParser(target_sr=...), "
-        "common/processor.py:523-525 @ 9035151d6) with librosa, and a "
-        "windowed-sinc resampler is a numerically delicate port of its own. "
-        "Refused by name rather than fed to a front end that would produce "
-        "correctly-shaped wrong features. See .agents/specs/dots3-note.md "
-        "§4.14.5 and issue #2703.");
+std::vector<Dots3NoteAudioProcessor::AudioChunk>
+Dots3NoteAudioProcessor::SegmentWaveform(int64_t num_samples) const {
+  // `encode_waveform`'s slicing loop, `nvidia/audio.py:196-203` @ `9035151d6`:
+  //
+  //   while time_step * SAMPLE_RATE < audio_waveform.shape[0]:
+  //       segments.append(audio_waveform[time_step * SAMPLE_RATE :
+  //                                      (time_step + chunk_seconds) * SAMPLE_RATE])
+  //       time_step += chunk_seconds
+  //
+  // Upstream steps in SECONDS and multiplies by the module constant
+  // SAMPLE_RATE (`audio.py:15`), not by `self.sampling_rate`; the two are the
+  // same 16000 wherever this port runs. Before W7c-2 (#2828) that held because a
+  // rate that was not `audio_config.sampling_rate` was REFUSED before this was
+  // reached; it now holds because such a rate is RESAMPLED to it, which is the
+  // stronger of the two reasons and reaches this function the same way. The
+  // stride is written in SAMPLES here so the loop cannot overflow a second
+  // count on a long recording.
+  std::vector<AudioChunk> out;
+  if (num_samples <= 0) return out;
+  const int64_t chunk = cfg_.chunk_samples();
+  for (int64_t start = 0; start < num_samples; start += chunk) {
+    AudioChunk c;
+    c.start = start;
+    // Python's slice CLAMPS its stop, so the last segment is short rather than
+    // padded here; `pad_or_trim` is what pads it, and only for the mel.
+    c.length = std::min(chunk, num_samples - start);
+    // `token_len = (segment_length - 1) // stride + 1` (`:210-212`), which is
+    // `NumAudioTokens` — the same function, not a second copy. The loop above
+    // never emits a zero-length segment, which is the condition under which the
+    // two forms are the same function; see the header.
+    c.num_tokens = NumAudioTokens(c.length);
+    out.push_back(c);
   }
+  return out;
+}
+
+AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
+    const float* samples, int64_t num_samples, int sample_rate,
+    std::vector<float>* resampled_out) const {
+  // W7c-2 (#2828): a rate that is not `audio_config.sampling_rate` is
+  // RESAMPLED, not refused. Upstream resamples in its data parser
+  // (`MultiModalDataParser(target_sr=..., target_channels=1)`,
+  // `vllm/models/dots3_note/common/processor.py:523-525` @ `9035151d6` ->
+  // `vllm/multimodal/parse.py:695`), and this is the function that is handed a
+  // rate, so this is where the conversion goes.
+  //
+  // `ResampleAudioScipy` is upstream's `"scipy"` arm and NOT its `"pyav"`
+  // default, and that is a recorded DIVERGENCE rather than an oversight:
+  // libswresample is not bit-identical to itself across CPU dispatch on one
+  // binary and one input, so no bit-exact gate against the default can exist.
+  // vLLM ships the scipy arm in production for another model
+  // (`vllm/model_executor/models/phi4mm.py:580`). See the seam header and
+  // `.agents/specs/dots3-note.md` §4.17.
+  //
+  // THIS IS THE PRODUCTION CALL SITE the reachability mutation deletes. The
+  // guard below is upstream's own `if orig_sr_int == target_sr_int: return
+  // audio` (`audio.py:241-242`) hoisted to the caller, and `ResampleAudioScipy`
+  // repeats it internally rather than trusting it, so a 16 kHz waveform cannot
+  // move by a bit whichever way it arrives.
+  //
+  // THE THREE VARIABLES DESCRIBING THE WAVEFORM MOVE TOGETHER, and `sample_rate`
+  // is one of them. Rebinding the pointer and the length while leaving the rate
+  // at the request's value left the resampled buffer described as 22050 Hz, and
+  // `WhisperAudioProcessor::ProcessWaveform` — which this drives once per chunk
+  // and which carries its OWN rate refusal for the Whisper/Voxtral row
+  // (`audio_processor.cpp:214-221`) — threw a bare `runtime_error`. That is
+  // HTTP 500, not 400: the served suite read `500 == 400` before this line was
+  // written. Before W7c-2 the assignment was unreachable, because the refusal
+  // above it guaranteed the two rates were already equal.
+  //
+  // THE BUFFER IS HANDED BACK when the caller asked for it (PR #2842 F2). The
+  // route needs the SAME resampled waveform for the encoder-cache key, and
+  // before this it got it by resampling a second time — 1220.7 MB twice on the
+  // request measured in spec §4.17.10. `resampled_out` is used as the local,
+  // so there is one buffer and no copy, and it stays empty at the target rate
+  // because then the caller's own pointer already is the consumed waveform.
+  std::vector<float> owned;
+  std::vector<float>& resampled = resampled_out != nullptr ? *resampled_out : owned;
+  resampled.clear();
+  if (sample_rate != cfg_.sampling_rate) {
+    resampled = ResampleAudioScipy(samples, num_samples, sample_rate,
+                                   cfg_.sampling_rate);
+    samples = resampled.data();
+    num_samples = static_cast<int64_t>(resampled.size());
+    sample_rate = cfg_.sampling_rate;
+  }
+
   if (num_samples <= 0) {
     throw v1::InputValidationError(
         "dots3-note audio processor: the request carries an empty waveform");
   }
-  if (num_samples > cfg_.chunk_samples()) {
-    throw v1::InputValidationError(
-        "dots3-note audio processor: the request carries " +
-        std::to_string(num_samples) + " samples (" +
-        std::to_string(static_cast<double>(num_samples) / cfg_.sampling_rate) +
-        " s) and this checkpoint's `audio_config.chunk_seconds` is " +
-        std::to_string(cfg_.chunk_seconds) + " (" +
-        std::to_string(cfg_.chunk_samples()) +
-        " samples). SEGMENTATION IS NOT PORTED and is owed to W7b. It is not "
-        "a convenience: past one chunk upstream's tower sums "
-        "ceil(chunk_len / stride) PER SEGMENT (nvidia/audio.py:141-146 @ "
-        "9035151d6) while the prompt side computes one ceil(total / stride) "
-        "(common/processor.py:771), the two numbers diverge, and a placeholder "
-        "span that does not match the tower's row count splices audio features "
-        "onto text rows. See .agents/specs/dots3-note.md §4.14.5 and issue "
-        "#2703.");
+
+  // `segments` (`audio.py:194-203`).
+  const std::vector<AudioChunk> chunks = SegmentWaveform(num_samples);
+  const int64_t total_tokens = NumAudioTokens(num_samples);
+
+  // THE ONE THING SEGMENTATION CANNOT MAKE SAFE, refused BY NAME rather than
+  // spliced. The tower emits `sum_i ceil(seg_i / stride)` rows — upstream's own
+  // `compute_audio_token_length` (`audio.py:129-147`) — while the prompt side
+  // expands ONE `ceil(total / stride)` span (`common/processor.py:771`). Every
+  // segment but the last is exactly `chunk_samples` long, so those two are
+  // equal for every waveform exactly when `chunk_samples % token_stride == 0`.
+  // The released config satisfies it (960000 = 750 * 1280); the check is on the
+  // NUMBERS rather than on the config so it cannot drift from the loop above.
+  //
+  // A SINGLE-chunk waveform is served either way, because a one-segment sum IS
+  // `ceil(n / stride)`. That is why this is refused per request and not at
+  // install: refusing the capability would turn away clips upstream serves.
+  if (chunks.size() > 1) {
+    int64_t summed = 0;
+    for (const AudioChunk& c : chunks) summed += c.num_tokens;
+    if (summed != total_tokens) {
+      throw v1::InputValidationError(
+          "dots3-note audio processor: this request's " +
+          std::to_string(num_samples) + " samples need " +
+          std::to_string(chunks.size()) + " chunks, and this checkpoint's "
+          "`audio_config` gives " + std::to_string(cfg_.chunk_samples()) +
+          " chunk samples, which is not a whole number of " +
+          std::to_string(cfg_.token_stride()) +
+          "-sample token strides. The tower would produce " +
+          std::to_string(summed) + " rows (the per-segment sum, "
+          "nvidia/audio.py:129-147 @ 9035151d6) against a placeholder span of " +
+          std::to_string(total_tokens) + " (the prompt side's one "
+          "ceil(total / stride), common/processor.py:771), and a masked "
+          "scatter that does not balance splices audio features onto text "
+          "rows. Upstream computes both numbers and never compares them. A "
+          "waveform inside ONE chunk is served on this config; a longer one is "
+          "refused. See .agents/specs/dots3-note.md §4.15.3 and issue #2797.");
+    }
   }
 
   AudioKwargs out;
-  // `pad_or_trim(audio_segment.flatten(), length=self.chunk_samples)`
-  // (`audio.py:213`). The trim arm is unreachable here — the refusal above
-  // already turned away anything longer — and the PAD arm is what every request
-  // takes. `WhisperAudioProcessor::ProcessWaveform` performs the pad itself
-  // (audio_processor.cpp:108-112, `padding="max_length"` with truncation), so
-  // this call IS `pad_or_trim` followed by `log_mel_spectrogram`.
-  out = front_end_->ProcessWaveform(samples, num_samples, sample_rate);
+  out.n_mels = cfg_.n_mels;
+  out.n_frames = cfg_.chunk_mel_frames();
   out.num_samples = num_samples;
-  out.num_tokens = NumAudioTokens(num_samples);
-  if (out.n_frames != cfg_.chunk_mel_frames()) {
-    // Upstream's own assert (`audio.py:215`), kept rather than trusted.
-    throw std::runtime_error(
-        "dots3-note audio processor: the front end produced " +
-        std::to_string(out.n_frames) + " mel frames for a chunk of " +
-        std::to_string(cfg_.chunk_mel_frames()) +
-        " (nvidia/audio.py:215 @ 9035151d6)");
+  out.num_tokens = total_tokens;
+  out.num_chunks = static_cast<int64_t>(chunks.size());
+  out.input_features.reserve(static_cast<size_t>(out.num_chunks) *
+                             static_cast<size_t>(out.n_mels) *
+                             static_cast<size_t>(out.n_frames));
+
+  for (const AudioChunk& c : chunks) {
+    // `pad_or_trim(audio_segment.flatten(), length=self.chunk_samples)` then
+    // `log_mel_spectrogram(pad_audio)` (`audio.py:213-214`), PER SEGMENT.
+    // `WhisperAudioProcessor::ProcessWaveform` performs the pad itself
+    // (audio_processor.cpp:228-232, `padding="max_length"` with truncation), so
+    // this call IS that pair. The `-8` floor inside it is a GLOBAL max over the
+    // segment it is handed, which is why the front end is driven once per
+    // segment and not once over the whole waveform.
+    const AudioKwargs one = front_end_->ProcessWaveform(
+        samples + c.start, c.length, sample_rate);
+    if (one.n_frames != cfg_.chunk_mel_frames() || one.n_mels != cfg_.n_mels) {
+      // Upstream's own assert (`audio.py:215`), kept rather than trusted.
+      throw std::runtime_error(
+          "dots3-note audio processor: the front end produced " +
+          std::to_string(one.n_mels) + " x " + std::to_string(one.n_frames) +
+          " mel for a chunk of " + std::to_string(cfg_.n_mels) + " x " +
+          std::to_string(cfg_.chunk_mel_frames()) +
+          " (nvidia/audio.py:215 @ 9035151d6)");
+    }
+    // `torch.stack(mel_features, dim=0)` (`:220`), flattened.
+    out.input_features.insert(out.input_features.end(),
+                              one.input_features.begin(),
+                              one.input_features.end());
+    // `audio_sample_lens` and `token_lens` (`:217-218`).
+    out.chunk_num_samples.push_back(c.length);
+    out.chunk_num_tokens.push_back(c.num_tokens);
   }
   return out;
 }
@@ -543,6 +652,50 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
 std::string Dots3NoteAudioProcessor::HashAudio(const float* samples,
                                                int64_t num_samples) const {
   return front_end_->HashAudio(samples, num_samples);
+}
+
+std::string Dots3NoteAudioProcessor::HashAudio(
+    const float* samples, int64_t num_samples, int sample_rate,
+    const std::vector<float>* resampled) const {
+  // W7c-2 (#2828) CREATED the defect this closes, and closes it in the same
+  // change. While every served rate was `audio_config.sampling_rate` the raw
+  // waveform was an unambiguous encoder-cache key. It stops being one the
+  // moment two rates are served: a file carrying N PCM16 samples at 16000 Hz
+  // and a file carrying THE IDENTICAL N SAMPLES at 44100 Hz decode to identical
+  // float buffers, hash identically under the two-argument form, and must
+  // produce different features. `mm_hash` is a CROSS-REQUEST key —
+  // `EncoderCacheManager::cached_` is keyed on it and `scheduler.cpp:511-590`
+  // reuses a hit — so the second request would be handed the first's
+  // embeddings.
+  //
+  // BE EXACT ABOUT WHAT THAT COSTS, because the two also differ in RESAMPLED
+  // LENGTH: a collision needs identical raw buffers, and identical buffers at
+  // different rates cannot resample to the same row count. So the observable
+  // failure is a wrong-length splice rather than a quiet substitution. Either
+  // way the key is wrong, and a key that is only accidentally caught downstream
+  // is not a key.
+  //
+  // The key is therefore the RESAMPLED waveform — the buffer the tower actually
+  // consumes. That also makes two requests that resample to the same waveform
+  // share a cache entry, which is correct, and it is why this hashes the output
+  // rather than merely mixing the rate into the input.
+  if (sample_rate == cfg_.sampling_rate) {
+    return front_end_->HashAudio(samples, num_samples);
+  }
+  // RESAMPLE ONCE (PR #2842 F2). `RouteDots3NoteAudioWav` has just driven
+  // `ProcessWaveform` over this same waveform and this same rate, so it already
+  // holds the buffer this would otherwise rebuild; on the request measured in
+  // spec §4.17.10 that rebuild was a second 1220.7 MB allocation, doubling the
+  // cost of a 40 KB upload. The argument is the answer and not a hint: it is
+  // hashed as-is. A caller that does not hold it passes nothing and this
+  // resamples for itself, which is the only behaviour that ever existed.
+  if (resampled != nullptr) {
+    return front_end_->HashAudio(resampled->data(),
+                                 static_cast<int64_t>(resampled->size()));
+  }
+  const std::vector<float> own =
+      ResampleAudioScipy(samples, num_samples, sample_rate, cfg_.sampling_rate);
+  return front_end_->HashAudio(own.data(), static_cast<int64_t>(own.size()));
 }
 
 }  // namespace vllm::multimodal

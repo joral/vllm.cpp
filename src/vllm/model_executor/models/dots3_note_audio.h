@@ -112,6 +112,14 @@ struct Dots3NoteAudioParams {
   bool use_latent_input = false;
   int64_t downsample_hidden_size = 480;  // audio.py:46
   int64_t merge_factor = 1;              // audio.py:40
+  // `chunk_seconds` (`audio.py:41`), carried on the TOWER and not only on the
+  // processor because `DotsEncoderWithMask` keeps it too (`audio.py:169-171`)
+  // and it is what upstream's `mel.shape[1] == self.chunk_mel_frames` assert
+  // (`:215`) compares against. W7b (#2797) made that assert executable here:
+  // once the mel is a STACK of chunks, a caller that hands the tower the whole
+  // stack instead of one chunk produces correctly-shaped output, and only this
+  // number can tell the two apart.
+  int64_t chunk_seconds = 60;
   int64_t adapter_in_dim = 1280;         // whisper_adapter_in_dim, audio.py:30
   int64_t adapter_out_dim = 5120;        // whisper_adapter_out_dim, audio.py:33
 
@@ -144,6 +152,10 @@ struct Dots3NoteAudioParams {
   // `norm_cls(self.embed_dim)` call takes (`audio_encoder.py:322-323`, `:336`,
   // `:515-516`).
   double rms_norm_eps = 1e-6;
+
+  // `chunk_mel_frames` (`audio.py:79-81`): `chunk_seconds * 100`, which is also
+  // `chunk_samples / hop_length` at 16 kHz and 160.
+  int64_t chunk_mel_frames() const { return chunk_seconds * 100; }
 
   int64_t head_dim() const { return d_model / num_heads; }
   // `rotary_dim = int(head_dim * partial_rotary_factor)`, then rounded DOWN to
@@ -309,6 +321,45 @@ std::vector<float> Dots3NoteAudioForward(const std::vector<float>& mel,
                                          const Dots3NoteAudioParams& a,
                                          vt::Backend& backend,
                                          Dots3NoteAudioCapture* capture = nullptr);
+
+// THE MULTI-CHUNK TOWER (W7b, #2797) — `DotsEncoderWithMask.encode_waveform`'s
+// encoder half, `nvidia/audio.py:220-234` @ `9035151d6`. THIS IS THE PRODUCTION
+// ENTRY POINT from W7b on; `Dots3NoteAudioForward` above is one chunk of it.
+//
+// `mels` is the STACKED `[num_chunks, n_mels, chunk_mel_frames]` host f32
+// `Dots3NoteAudioProcessor::ProcessWaveform` returns (`torch.stack`, `:220`),
+// `chunk_num_samples` is upstream's `audio_sample_lens` and `chunk_num_tokens`
+// its `token_lens` (`:217-218`). Returns
+// `[sum(chunk_num_tokens), adapter_out_dim]` host f32: each chunk's first
+// `token_len * merge_factor` rows, concatenated IN ORDER (`:229-234`).
+//
+// A LOOP IS UPSTREAM'S BATCHED CALL, and this is the one claim worth reading
+// before changing it. Upstream stacks the mels and makes ONE
+// `speech_encoder(...)` call with `input_seq_lens` (`:225-227`), and inside it:
+//   * the stem masks each batch element from ITS OWN `valid_mel_lens`
+//     (`audio_encoder.py:570-577`) and Conv2d is batch-independent;
+//   * the varlen PACK builds `cu_seqlens` from `input_seq_lens.cumsum`
+//     (`:674-677`), so each chunk is its own bidirectional attention window;
+//   * the packed rope positions are `arange(S)` gathered by the valid mask
+//     (`:679-685`), so every chunk RESTARTS at position 0;
+//   * the UNPACK (`:711-719`), the final `layer_norm` (`:721`) and the whole
+//     adapter (`audio.py:240-248`) are row-wise, and the zero rows the unpack
+//     writes are sliced away before anything reads them.
+// So the chunks never interact, and `k` calls to the single-chunk tower compute
+// the same numbers as one call over a batch of `k`. What the batch buys
+// upstream is one kernel launch instead of `k`; this row claims no performance
+// axis. At `num_chunks == 1` this is W7a's path with W7a's arguments, byte for
+// byte.
+//
+// `captures`, when non-null, is resized to one capture PER CHUNK, so a gate can
+// read each chunk's four mask stages rather than only the first one's.
+std::vector<float> Dots3NoteAudioForwardChunks(
+    const std::vector<float>& mels,
+    const std::vector<int64_t>& chunk_num_samples,
+    const std::vector<int64_t>& chunk_num_tokens, int64_t hop_length,
+    const Dots3NoteAudioWeights& w, const Dots3NoteAudioParams& a,
+    vt::Backend& backend,
+    std::vector<Dots3NoteAudioCapture>* captures = nullptr);
 
 }  // namespace vllm
 

@@ -89,6 +89,26 @@ struct AudioKwargs {
   int64_t num_samples = 0;
   int64_t num_tokens = 0;
 
+  // ── ADDED BY dots3-note W7b (#2797), additively ────────────────────────────
+  //
+  // The CHUNK axis. `input_features` is `[num_chunks, n_mels, n_frames]`, one
+  // `chunk_mel_frames`-wide padded mel per `chunk_seconds` segment, which is
+  // upstream's `torch.stack(mel_features, dim=0)` (`nvidia/audio.py:220` @
+  // `9035151d6`). At `num_chunks == 1` that layout is BYTE-IDENTICAL to the one
+  // W7a produced, which is why the default is 1 and why every pre-W7b producer
+  // and consumer is unchanged: Whisper's `RouteAudioWav` fills one mel and
+  // leaves the two vectors empty.
+  //
+  // The two vectors are upstream's `audio_sample_lens` and `token_lens`
+  // (`audio.py:217-218`) and they are NOT derivable from `num_samples` and
+  // `num_tokens` above, which stay the WHOLE waveform's numbers: `num_tokens`
+  // is the placeholder run length the prompt was expanded with, and
+  // `chunk_num_tokens[i]` is how many rows chunk `i` contributes to it. The
+  // last chunk is short, so its two entries are smaller than the others'.
+  int64_t num_chunks = 1;
+  std::vector<int64_t> chunk_num_samples;
+  std::vector<int64_t> chunk_num_tokens;
+
   bool empty() const { return n_frames == 0; }
 };
 

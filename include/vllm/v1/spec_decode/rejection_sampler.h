@@ -141,6 +141,28 @@ struct RejectionSamplerOutput {
 //       accept kernel, and the damage it does is a wrong accept prefix that no
 //       token gate in this tree can see (SPEC-DFLASH2 A2-2, #2802).
 //
+//   OWNED, BUT NOT FREE-AT-WILL — "which buffers" is only half the invariant and
+//   the other half is WHEN. A destructor that frees these five without waiting
+//   is the same defect as the backend global, relocated from the backend into
+//   this object's own scope, and it has a concrete caller: on the copy-queue
+//   route in `GPUModelRunner::sample_tokens_async` the device result is a
+//   BLOCK-SCOPED LOCAL destroyed at the close of the `else`, while A2-4's stated
+//   job is to move `SynchronizeEvent(verify_ready_event_)` past `propose_drafts`.
+//   Move that wait past the closing brace and the destructor frees `sampled_`,
+//   `num_sampled_` and `target_argmax_` while the D2H copy is still writing them:
+//   garbage accept prefix, wrong emitted ids, nothing raised, and — because the
+//   verify is lossless — invisible to every token gate in this tree (#1366).
+//
+//   So `Release` DRAINS BEFORE IT FREES. It synchronizes the queue `verify`
+//   issued the walk on, and the queue of the last `CopyToHost` when that is a
+//   different one, and only then frees. This is a SAFETY NET, not a licence: a
+//   caller that destroys the object before its own wait now pays a full drain in
+//   the destructor instead of corrupting silently. That trade is deliberate. A
+//   stall is visible in the G4 `nsys` read A2-5 must take anyway; a wrong accept
+//   prefix is visible to nothing. A2-4 still has to destroy this object AFTER
+//   the wait it moves — the net makes the mistake slow rather than wrong, and it
+//   does not make the mistake correct.
+//
 //   NOT OWNED, and therefore a CALLER OBLIGATION with no destructor to enforce
 //   it:
 //     * `logits` — the [num_logits, vocab] tensor passed to `verify`. It is the
@@ -157,6 +179,13 @@ struct RejectionSamplerOutput {
 //     * on a unified-memory backend the `draft_` / `cu_` staging IS the caller's
 //       `draft_sampled` / `cu_num_logits` vectors, wrapped in place. They must
 //       outlive this object, exactly as they must outlive a `forward` call.
+//     * the QUEUES. The drain above holds a `vt::Queue*` to the queue `verify`
+//       was given and to the queue the last `CopyToHost` was given, so both must
+//       outlive this object. That is the ordinary shape already — the runner's
+//       `queue_` and its async copy queue are both members — and it is a
+//       scope inversion a reviewer can see, unlike the corruption it replaces.
+//       Destroying a queue that still has work on it is undefined on CUDA
+//       regardless of this type.
 class RejectionSamplerDeviceOutput {
  public:
   RejectionSamplerDeviceOutput() = default;
@@ -178,7 +207,9 @@ class RejectionSamplerDeviceOutput {
   // Issue the two D2H copies on `q`. NO `Synchronize` and NO event recorded —
   // the caller owns the wait, which is exactly what lets that wait be a
   // copy-queue event instead of a main-queue drain. `sampled_out` receives
-  // num_reqs * width i32 values, `num_sampled_out` receives num_reqs.
+  // num_reqs * width i32 values, `num_sampled_out` receives num_reqs. `q` is
+  // RECORDED, so the destructor can drain it if the caller frees this object
+  // before waiting; it must therefore outlive this object.
   void CopyToHost(vt::Queue& q, int32_t* sampled_out,
                   int32_t* num_sampled_out) const;
 
@@ -203,6 +234,13 @@ class RejectionSamplerDeviceOutput {
   void* target_argmax_ = nullptr;
   int64_t num_reqs_ = 0;
   int64_t width_ = 0;
+  // The queues the object's own work is on, so `Release` can drain before it
+  // frees (see "OWNED, BUT NOT FREE-AT-WILL" above). `verify_q_` is the queue
+  // the accept walk was issued on; `copy_q_` is the queue of the last
+  // `CopyToHost`, null when the caller never copied. Both are borrowed and must
+  // outlive this object.
+  vt::Queue* verify_q_ = nullptr;
+  mutable vt::Queue* copy_q_ = nullptr;
   // The kernel's INPUTS, held for the same reason the outputs are.
   std::unique_ptr<DeviceScratch> draft_;
   std::unique_ptr<DeviceScratch> cu_;

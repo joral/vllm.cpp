@@ -29,8 +29,8 @@ re-port).
   defaulted.
 - **Out (named later bricks):** fp8_e5m2 compute on either backend,
   per-attention-head scales, the Metal fp8-KV arm (refuses by name
-  — see `## W2` below), `--calculate-kv-scales` (upstream's deprecated dynamic
-  scale), the C-ABI exposure of `--kv-cache-dtype`, the 16 architectures whose
+  — see `## W2` below), `--calculate-kv-scales` (upstream's dynamic scale, since
+  DELETED there by vllm#49389), the C-ABI exposure of `--kv-cache-dtype`, the 16 architectures whose
   attention blocks W3 refuses rather than routes, and the vendor
   KV dtypes (`fp8_inc`, `fp8_ds_mla` — `QUANT-KV-FP8-VENDOR`) and turboquant /
   nvfp4 / per-token-head KV (`KV-NVFP4-TURBO`).
@@ -44,7 +44,12 @@ store/read kernels are vLLM's own csrc:
   `auto`/`fp8`/`fp8_e4m3`/`fp8_e5m2` (+ `fp8_inc`/`fp8_ds_mla`/`turboquant_*`/
   `int*_per_token_head`/`nvfp4`); `cache_dtype: CacheDType = "auto"`
   (`:76`, "if auto, use model dtype; fp8 == fp8_e4m3"); `calculate_kv_scales`
-  (`:99-104`, dynamic on-the-fly k/v scale when the checkpoint has none).
+  (dynamic on-the-fly k/v scale when the checkpoint has none). **That last one is
+  GONE upstream** — vllm#49389 `dd11df04f3` deleted the field, inside the advance
+  to the current pin `e126687a9a` (#2817). Its `:99-104` anchor was wrong even at
+  the prior pin, where the field sits at `:111` and `:99-104` is
+  `prefix_caching_hash_algo`'s docstring; it is dropped rather than re-numbered,
+  since there is nothing left to number.
   `is_quantized_kv_cache` (`vllm/utils/torch_utils.py`) = `cache_dtype != "auto"`.
 - **Scale handling.** `BaseKVCacheMethod` (`kv_cache.py:42`) adds `_k_scale`/
   `_v_scale`/`_q_scale`/`_prob_scale` to the Attention layer;
@@ -1041,9 +1046,12 @@ change does not close it.
   per-layer scale-tensor read, and a per-layer (rather than per-engine) scale on
   `AttentionSpec`, are owed.
 - **W3: `--calculate-kv-scales` is refused, not implemented** (#1593). Upstream's
-  dynamic on-the-fly scale (`config/cache.py:111`) is deprecated there for
-  removal in v0.19; `ResolveKvCacheScales` refuses it BY NAME rather than
-  silently taking the static arm, and no flag exposes it.
+  dynamic on-the-fly scale was `config/cache.py:111` at the prior pin
+  `555967922`, deprecated there for removal in v0.19; vllm#49389 `dd11df04f3`
+  then DELETED it, and that commit is inside the advance to the current pin
+  `e126687a9a` (#2817), so no such key exists upstream now.
+  `ResolveKvCacheScales` still takes the parameter and refuses it BY NAME rather
+  than silently taking the static arm, and no flag exposes it.
 - **W3: an fp8 KV cache is served by the SLOW attention kernels only** (#1593).
   `fa2_prefill` and `fa2_decode` in `src/vllm/model_executor/models/qwen3_5.cpp`
   both require `kv.dtype == DType::kBF16`, and

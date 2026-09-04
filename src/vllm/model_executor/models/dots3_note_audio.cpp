@@ -108,6 +108,7 @@ Dots3NoteAudioParams ParseDots3NoteAudioParams(const HfConfig& config) {
   a.use_causal = ReadBoolOr(j, "use_causal", false);
   a.downsample_hidden_size = ReadIntOr(j, "downsample_hidden_size", 480);
   a.merge_factor = ReadIntOr(j, "merge_factor", 1);
+  a.chunk_seconds = ReadIntOr(j, "chunk_seconds", 60);
   // `whisper_adapter_in_dim` falls back to `adapter_in_dim` upstream
   // (`audio.py:30-35`), so both spellings are read here.
   a.adapter_in_dim = ReadIntOr(j, "whisper_adapter_in_dim",
@@ -591,6 +592,23 @@ std::vector<float> Dots3NoteAudioForward(const std::vector<float>& mel,
   VT_CHECK(w.present,
            "dots3-note audio tower: the weights were never materialized. The "
            "loader only materializes a tower Dots3NoteAudioRefusal accepted.");
+  // `assert mel.shape[1] == self.chunk_mel_frames` (`nvidia/audio.py:215` @
+  // `9035151d6`), made executable HERE by W7b (#2797) rather than only in the
+  // processor. Upstream can only ever hand `_forward_speech_encoder` a STACK of
+  // `chunk_mel_frames`-wide segments (`torch.stack`, `:220`), and this function
+  // is one element of that stack. A caller that hands it the WHOLE stack — the
+  // shape the code had before `Dots3NoteAudioForwardChunks` existed — gets a
+  // correctly-shaped answer of the right row count off a mel of the wrong
+  // width, and this width is the only number that can tell the two apart.
+  VT_CHECK(a.num_mel_bins > 0 &&
+               static_cast<int64_t>(mel.size()) ==
+                   a.num_mel_bins * a.chunk_mel_frames(),
+           "dots3-note audio tower: the mel holds " +
+               std::to_string(mel.size()) + " values, which is not ONE chunk of "
+               + std::to_string(a.num_mel_bins) + " x " +
+               std::to_string(a.chunk_mel_frames()) +
+               " (nvidia/audio.py:215 @ 9035151d6). Pass one chunk; "
+               "`Dots3NoteAudioForwardChunks` is what takes the stack.");
   const int64_t D = a.d_model, F = a.ffn_dim;
   const int64_t nh = a.num_heads, hd = a.head_dim();
   const int64_t Fmel = a.num_mel_bins;
@@ -834,6 +852,78 @@ std::vector<float> Dots3NoteAudioForward(const std::vector<float>& mel,
     LinearBias(d, a2, a1.t(), fw, &fb);
   }
   return DownloadF32(d, a2, T * AO);
+}
+
+// ── W7b (#2797): the CHUNK LOOP, `nvidia/audio.py:220-234` @ `9035151d6` ────
+//
+// See the header for why a loop over the single-chunk tower IS upstream's one
+// batched varlen call: the pack gives each chunk its own `cu_seqlens` window
+// and restarts its rope positions at 0, so no chunk can reach another.
+std::vector<float> Dots3NoteAudioForwardChunks(
+    const std::vector<float>& mels,
+    const std::vector<int64_t>& chunk_num_samples,
+    const std::vector<int64_t>& chunk_num_tokens, int64_t hop_length,
+    const Dots3NoteAudioWeights& w, const Dots3NoteAudioParams& a,
+    vt::Backend& backend, std::vector<Dots3NoteAudioCapture>* captures) {
+  const int64_t k = static_cast<int64_t>(chunk_num_tokens.size());
+  VT_CHECK(k > 0,
+           "dots3-note audio tower: a waveform with no chunks. The processor's "
+           "segment loop emits at least one for any non-empty waveform "
+           "(nvidia/audio.py:196-203 @ 9035151d6).");
+  VT_CHECK(static_cast<int64_t>(chunk_num_samples.size()) == k,
+           "dots3-note audio tower: " +
+               std::to_string(chunk_num_samples.size()) +
+               " chunk sample lengths against " + std::to_string(k) +
+               " chunk token counts. They are upstream's `audio_sample_lens` "
+               "and `token_lens` and are built in the same loop "
+               "(nvidia/audio.py:217-218 @ 9035151d6).");
+  const int64_t Fmel = a.num_mel_bins;
+  VT_CHECK(Fmel > 0 && !mels.empty() &&
+               static_cast<int64_t>(mels.size()) % (Fmel * k) == 0,
+           "dots3-note audio tower: the stacked mel holds " +
+               std::to_string(mels.size()) + " values, which is not " +
+               std::to_string(k) + " chunks of " + std::to_string(Fmel) +
+               " bins");
+  // One chunk's mel is the whole buffer divided by the chunk count: upstream
+  // stacks EQUAL-length padded mels (`pad_or_trim` to `chunk_samples`,
+  // `:213`), which is what makes `torch.stack` legal there and this division
+  // legal here.
+  const int64_t per = static_cast<int64_t>(mels.size()) / k;
+
+  if (captures != nullptr) captures->assign(static_cast<size_t>(k), {});
+
+  std::vector<float> out;
+  for (int64_t i = 0; i < k; ++i) {
+    // `mel_features[idx]` — one padded chunk, at its OWN valid sample length.
+    // Handing `chunk_num_samples[i]` rather than the padded length is what
+    // makes the four-stage temporal mask fire on the SHORT final chunk;
+    // `valid_mel_lens = audio_sample_lens // hop_length` is per batch element
+    // upstream too (`audio_encoder.py:570-577`).
+    const std::vector<float> one(
+        mels.begin() + static_cast<std::ptrdiff_t>(i * per),
+        mels.begin() + static_cast<std::ptrdiff_t>((i + 1) * per));
+    const std::vector<float> rows = Dots3NoteAudioForward(
+        one, chunk_num_samples[static_cast<size_t>(i)],
+        chunk_num_tokens[static_cast<size_t>(i)], hop_length, w, a, backend,
+        captures != nullptr ? &(*captures)[static_cast<size_t>(i)] : nullptr);
+    // `audio_embedding[idx, : token_len * merge_factor, :]` (`:229-233`): the
+    // single-chunk tower already returns exactly those rows, because the varlen
+    // pack it mirrors keeps the first `num_tokens` of the stem output and
+    // everything after that is row-wise. `merge_factor != 1` is refused by
+    // name, so `token_len * merge_factor` is `token_len`.
+    VT_CHECK(static_cast<int64_t>(rows.size()) ==
+                 chunk_num_tokens[static_cast<size_t>(i)] * a.adapter_out_dim,
+             "dots3-note audio tower: chunk " + std::to_string(i) +
+                 " produced " + std::to_string(rows.size()) +
+                 " floats for " +
+                 std::to_string(chunk_num_tokens[static_cast<size_t>(i)]) +
+                 " rows of " + std::to_string(a.adapter_out_dim));
+    // `torch.cat(chunk_embeddings, dim=0)` (`:234`) — IN ORDER. Concatenating
+    // the same chunks in another order produces a correctly-shaped answer, so
+    // the order is asserted in the gate rather than only written here.
+    out.insert(out.end(), rows.begin(), rows.end());
+  }
+  return out;
 }
 
 }  // namespace vllm

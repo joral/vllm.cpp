@@ -475,7 +475,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 583 585 1217 1313 1409 1425 1560 1564 1667 1745 1863 1905 1947 1949
+// 637 639 1271 1367 1463 1479 1614 1618 1751 1834 1952 1994 2036 2038
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -507,10 +507,64 @@ uint64_t DigestF32(const std::vector<float>& values) {
 // How many values could NOT have come out of a bf16 store. The dtype instrument
 // the digest and the absmax cannot be: both are computed over the same f32
 // container on either arm and are blind to the width that filled it.
+// ─── THE BRIDGE TO THE STILL-f32 UPSAMPLER (A24 wave 3, #2786) ─────────────
+//
+// The video VAE decoder's bag is loaded at bf16 now, and the LATENT UPSAMPLER --
+// a separate component, still f32 in this tree and owed its own bf16 arm -- reads
+// the same checkpoint's `per_channel_statistics` to un-normalize and re-normalize
+// around itself (`upsample_video`, upsampler/model.py:129-143). It takes
+// `std::vector<float>`, so the two 128-element buffers are widened here.
+//
+// THE VALUES IT GETS ARE bf16-ROUNDED, AND THAT IS UPSTREAM'S ANSWER RATHER THAN
+// A LOSS THIS INTRODUCES: upstream constructs the upsampler in the SAME one
+// pipeline dtype (`VideoUpsampler`, distilled.py:138-141), so its own statistics
+// are bf16 there too. What is still divergent is the upsampler's arithmetic
+// around them, which stays f32 and is named under `## Owed` in
+// .agents/specs/ltx25-a24-video-vae-bf16.md.
+std::vector<float> VaeStatsAsF32(const Ltx2VaeWeights& weights, const std::string& name) {
+  if (weights.dtype != vt::DType::kBF16) return weights.Get(name);
+  const std::vector<uint16_t>& raw = weights.GetBf16(name);
+  std::vector<float> out(raw.size());
+  for (size_t i = 0; i < raw.size(); ++i) out[i] = vt::BF16ToF32(raw[i]);
+  return out;
+}
+
 int64_t CountWiderThanBf16(const std::vector<float>& values) {
   int64_t n = 0;
   for (float v : values)
     if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++n;
+  return n;
+}
+
+// The A24 wave 5 instrument, in ONE place so all three upsampler call sites
+// report the same thing. `latent.dtype` is the width `Ltx2LatentUpsample` took
+// off the weight bag and actually computed at, and the value scan is the half
+// that a correctly-set field over a wide computation cannot fool.
+void RecordUpsampleWidth(Ltx2ConditioningTrace& trace, const Ltx2LatentVolume& latent) {
+  ++trace.upsample_calls;
+  if (latent.dtype != vt::DType::kBF16) ++trace.upsample_wide_calls;
+  trace.upsample_not_bf16 += CountWiderThanBf16(latent.data);
+  trace.upsample_values += static_cast<int64_t>(latent.data.size());
+  // THE STORAGE, drained here because the call that produced `latent` is the
+  // only work that could have accumulated it. The two counters above are both
+  // value-shaped and neither can see a bf16 arm that reserved f32 bytes; this
+  // one is the byte count itself. See `Ltx2UpsamplerStorage`.
+  const Ltx2UpsamplerStorage storage = Ltx2TakeUpsamplerStorage();
+  trace.upsample_volumes += storage.volumes;
+  trace.upsample_volume_elems += storage.elems;
+  trace.upsample_volume_bytes += storage.bytes;
+  trace.upsample_param_views += storage.param_views;
+  trace.upsample_param_elems += storage.param_elems;
+  trace.upsample_param_bytes += storage.param_bytes;
+}
+
+// Elements of a whole weight bag, whichever arm holds it. `Ltx2VaeWeights` has
+// `Bytes()` and no element count, and the RATIO is what says "narrow": bytes
+// alone move with the fixture's size and would have to be quoted.
+int64_t VaeWeightElems(const Ltx2VaeWeights& weights) {
+  int64_t n = 0;
+  for (const auto& kv : weights.tensors) n += static_cast<int64_t>(kv.second.size());
+  for (const auto& kv : weights.bf16) n += static_cast<int64_t>(kv.second.size());
   return n;
 }
 
@@ -1599,7 +1653,29 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     const SafetensorsFile f = SafetensorsFile::Open(params.video_vae_path);
     const nlohmann::json vae_config = Ltx2ReadCheckpointConfig(f);
     im.video_cfg = Ltx2ParseConvVideoDecoderConfig(vae_config, &im.video_kind);
-    im.video_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeDecoderKeyRules());
+    // THE ARM UPSTREAM RUNS (A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16, #2786).
+    // `distilled.py:109` resolves ONE pipeline dtype and hands it to
+    // `VideoDecoder` at `:148`, so the conv video VAE decodes at bfloat16
+    // upstream. Asking for it HERE, at the load, is what makes the decode's arm a
+    // property of the checkpoint bag rather than of a flag:
+    // `Ltx2ConvVideoDecode` reads `weights.dtype` and follows it, which is
+    // upstream's own `weights_dtype = next(self.parameters()).dtype` followed by
+    // `sample.to(weights_dtype)` (conv_video_decoder.py:283-284).
+    //
+    // IT ALSO STOPS THE WIDENING, which is half the point: the f32 arm expanded
+    // every checkpoint BF16 word through `Bf16ToF32`, so the decoder's parameters
+    // were resident at twice the checkpoint's bytes for a render.
+    //
+    // This is the DELETION SITE for the reachability mutation: swap `kBF16` back
+    // to the default and `vae_decode_not_bf16` goes from 0 to the whole clip
+    // while every digest, absmax, frame byte and determinism check on this path
+    // stays green.
+    //
+    // The ENCODER below asks for the SAME width, and it is a separate call
+    // because it is a separate port with its own route and its own weights bag.
+    // A24 wave 4 (#2850) landed its arm; wave 3 recorded it owed here.
+    im.video_weights =
+        Ltx2LoadVaeWeights(f, Ltx2VideoVaeDecoderKeyRules(), vt::DType::kBF16);
 
     // `ImageConditioner` builds its VideoEncoder from the SAME checkpoint with
     // `VAE_ENCODER_COMFY_KEYS_FILTER` (blocks.py:956-961). It builds it lazily
@@ -1610,7 +1686,15 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // configurator, same weights.
     if (Ltx2CheckpointHasVideoEncoder(f.Names())) {
       im.video_encoder_cfg = Ltx2ParseConvVideoEncoderConfig(vae_config);
-      im.video_encoder_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeEncoderKeyRules());
+      // A24 wave 4 (#2850): THE PRODUCTION WIRING, and it is the single site the
+      // reachability mutation deletes. `ImageConditioner` builds the encoder at
+      // the pipeline dtype (distilled.py:120-125, utils/blocks.py:985-986), so
+      // the bag it is fed is bf16. Removing this argument leaves every value
+      // gate in `test_ltx2_vae` green and reds the render-path dtype case, which
+      // is the polarity that makes that case measure a capability rather than a
+      // class.
+      im.video_encoder_weights =
+          Ltx2LoadVaeWeights(f, Ltx2VideoVaeEncoderKeyRules(), vt::DType::kBF16);
       im.has_video_encoder = true;
 
       // The encoder's LATENT WIDTH against the DiT's input, asserted rather
@@ -1670,7 +1754,12 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     const SafetensorsFile f = SafetensorsFile::Open(upsampler_path);
     const nlohmann::json config = Ltx2ReadCheckpointConfig(f);
     im.upsampler_cfg = Ltx2ParseUpsamplerConfig(config);
-    im.upsampler_weights = Ltx2LoadVaeWeights(f);
+    // A24 wave 5 (#2857). Upstream resolves ONE model dtype (distilled.py:109)
+    // and hands it to the latent upsampler at :138-141, so the checkpoint is
+    // loaded at the width it is stored and RUN at, not widened to f32. The
+    // shipped spatial upsampler is 512 mid-channels of Conv3d weight, so the
+    // widening this removes is the whole point rather than a tidy-up.
+    im.upsampler_weights = Ltx2LoadVaeWeights(f, {}, vt::DType::kBF16);
     im.has_upsampler = true;
   }
 
@@ -1722,7 +1811,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
            "it is handed a 4-D tensor. The frame axis is gone by then, which is why no 2-D arm "
            "can upsample it.");
     }
-    im.temporal_upsampler_weights = Ltx2LoadVaeWeights(f);
+    im.temporal_upsampler_weights = Ltx2LoadVaeWeights(f, {}, vt::DType::kBF16);
     im.has_temporal_upsampler = true;
   }
 
@@ -2699,6 +2788,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const float* audio_context = im.audio_prompt_embeds.data();
   int64_t context_tokens = im.prompt_tokens;
   im.trace = Ltx2ConditioningTrace{};
+  // THE LOADED WIDTH OF EACH UPSAMPLER, recorded per render because there are
+  // TWO checkpoints and a counter over the render reports whichever one ran.
+  // `Load` asks both for `kBF16`; this is what says the file agreed, and it is
+  // the only thing standing between the temporal loader line and a silent revert
+  // to f32 -- which stayed green across 5638 assertions during this row's review.
+  if (im.has_upsampler) {
+    im.trace.upsampler_weight_elems = VaeWeightElems(im.upsampler_weights);
+    im.trace.upsampler_weight_bytes = static_cast<int64_t>(im.upsampler_weights.Bytes());
+  }
+  if (im.has_temporal_upsampler) {
+    im.trace.temporal_upsampler_weight_elems = VaeWeightElems(im.temporal_upsampler_weights);
+    im.trace.temporal_upsampler_weight_bytes =
+        static_cast<int64_t>(im.temporal_upsampler_weights.Bytes());
+  }
 
   if (!gen.prompt.empty()) {
     // W0: the phase #1269 and W4 are about. Split into the TOWER and the
@@ -3728,8 +3831,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // the VAE checkpoint, not in the upsampler's.
       const Ltx2LatentVolume up = Ltx2UpsampleVideoLatent(
           im.upsampler_cfg, im.upsampler_weights, in,
-          im.video_weights.Get("per_channel_statistics.std-of-means"),
-          im.video_weights.Get("per_channel_statistics.mean-of-means"));
+          VaeStatsAsF32(im.video_weights, "per_channel_statistics.std-of-means"),
+          VaeStatsAsF32(im.video_weights, "per_channel_statistics.mean-of-means"));
+      RecordUpsampleWidth(im.trace, up);
       if (up.channels != vshape.channels || up.frames != vshape.frames ||
           up.height != vshape.height || up.width != vshape.width) {
         Fail("the upsampled latent is " + std::to_string(up.channels) + "x" +
@@ -3755,8 +3859,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       if (slot_keyframes.frames > 0) {
         const Ltx2LatentVolume up_slots = Ltx2UpsampleVideoLatent(
             im.upsampler_cfg, im.upsampler_weights, slot_keyframes,
-            im.video_weights.Get("per_channel_statistics.std-of-means"),
-            im.video_weights.Get("per_channel_statistics.mean-of-means"));
+            VaeStatsAsF32(im.video_weights, "per_channel_statistics.std-of-means"),
+            VaeStatsAsF32(im.video_weights, "per_channel_statistics.mean-of-means"));
+        RecordUpsampleWidth(im.trace, up_slots);
         if (up_slots.height != vshape.height || up_slots.width != vshape.width ||
             up_slots.channels != vshape.channels ||
             up_slots.frames != static_cast<int64_t>(slot_positions.size())) {
@@ -3980,6 +4085,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       const Ltx2LatentVolume encoded = Ltx2ConvVideoEncode(
           im.video_encoder_cfg, im.video_encoder_weights, pixels,
           im.video_encoder_cfg.in_channels, /*frame_count=*/1, phase_h, phase_w, &cropped);
+      // A24 wave 4 (#2850): the encoder's INPUT and OUTPUT widths, on a
+      // production route. Summed over images. See `Ltx2ConditioningTrace` for
+      // why both halves are needed and why nothing else here can see either.
+      im.trace.vae_encode_in_not_bf16 += CountWiderThanBf16(pixels);
+      im.trace.vae_encode_in_values += static_cast<int64_t>(pixels.size());
+      im.trace.vae_encode_not_bf16 += CountWiderThanBf16(encoded.data);
+      im.trace.vae_encode_values += static_cast<int64_t>(encoded.data.size());
       if (encoded.frames != 1) {
         Fail("the video VAE encoder returned " + std::to_string(encoded.frames) +
              " latent frames for a single image; both arms of "
@@ -5265,8 +5377,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       before_round.data = video_latent_volume;
       const Ltx2LatentVolume upsampled = Ltx2UpsampleVideoLatent(
           im.temporal_upsampler_cfg, im.temporal_upsampler_weights, before_round,
-          im.video_weights.Get("per_channel_statistics.std-of-means"),
-          im.video_weights.Get("per_channel_statistics.mean-of-means"));
+          VaeStatsAsF32(im.video_weights, "per_channel_statistics.std-of-means"),
+          VaeStatsAsF32(im.video_weights, "per_channel_statistics.mean-of-means"));
+      RecordUpsampleWidth(im.trace, upsampled);
       ++im.trace.temporal_upsample_calls;
 
       // (:408) The canvas doubles as `2 * (frames - 1) + 1`, not as `2 * frames`.
@@ -5680,6 +5793,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // least half of this render's `decode.video.chunk` seconds.
   size_t chunk_handle =
       phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
+  // A24 wave 3 (#2786). The decoder's INPUT width, taken here rather than in the
+  // sink because this is the last point the latent exists as itself. It is the
+  // live control that makes the sink's counter mean something: the two are the
+  // same fixture, in the same render, one statement apart.
+  im.trace.vae_latent_not_bf16 = CountWiderThanBf16(video_latent_volume);
+  im.trace.vae_latent_values = static_cast<int64_t>(video_latent_volume.size());
+  im.trace.vae_latent_digest = DigestF32(video_latent_volume);
+  im.trace.vae_latent_absmax = AbsMax(video_latent_volume);
   Ltx2VideoDecodeStreaming(
       im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc, video_lf,
       video_lh, video_lw, &decode_noise,
@@ -5687,6 +5808,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       [&](const Ltx2VideoChunk& chunk) {
         phase::PhaseLog::Instance().Close(chunk_handle);
         phase::PhaseLog::Instance().Close(decode_handle);
+        // A24 wave 3 (#2786): the decode's OUTPUT width, on the one production
+        // route into the decoder. Summed over chunks, because the tiled decode
+        // emits one per temporal group and the last one is not the render.
+        im.trace.vae_decode_not_bf16 += CountWiderThanBf16(chunk.frames.data);
+        im.trace.vae_decode_values += static_cast<int64_t>(chunk.frames.data.size());
         phase::Scope write_phase("artifacts.frames");
         MiniMaxH3VideoFrameShape shape;
         shape.channels = chunk.frames.channels;

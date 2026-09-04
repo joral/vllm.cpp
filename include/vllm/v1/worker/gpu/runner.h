@@ -145,9 +145,13 @@ void apply_grammar_bitmask(
 // block that a queued copy still writes is the same defect this wave's review
 // found in the accept walk's argmax scratch: correct while the wait is in step,
 // silently wrong the moment a later wave moves the wait. Retaining costs one
-// pointer per distinct size ever asked for — a handful over a process lifetime,
-// since the step shape is bounded by the batch — and it cannot be wrong.
-// Everything is released together in the destructor.
+// block per DISTINCT LARGER STEP SHAPE — the ask is `rows * width + rows` — so a
+// serving ramp that adds one request at a time retains one block per request
+// added, bounded by the batch. It is not a handful and it is not a leak either:
+// the sizes are strictly increasing and the shape is bounded, so the total is on
+// the order of N^2/2 int32 for a batch of N. The precise statement is worth
+// making because page-locked memory is the scarce kind. Everything is released
+// together in the destructor.
 //
 // On a backend without page-locked memory `AllocPinned` forwards to `Alloc`
 // (`vt::Backend::AllocPinned`), so this degrades to a plain host buffer and the

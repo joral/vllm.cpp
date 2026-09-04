@@ -121,7 +121,7 @@ port of those deleted kernels, so there is no corresponding local code to retire
 | `reshape_and_cache` (write K/V into paged NHD cache at slot_mapping) | `csrc/.../cache_kernels.cu::reshape_and_cache_flash` | T0 ✅ `e231196`→`7de4f0c` (vt::ReshapeAndCache, stride-based NHD write CPU+CUDA; GB10 gates pass; other CUDA targets unvalidated) |
 | Paged attention for full-attn layers on sm_121 (bf16, GQA 16/2, partial RoPE) — FlashInfer-class performance is the bar; strategy in §9 | ref: `v1/attention/backends/{flashinfer,triton_attn,flash_attn}.py` | T0 🚧 on GB10 gate workloads: correctness passes; immutable `3f256ab` binds at **55/124** with c1→c32 total ratios 0.993504/0.954464/0.966438/0.980678/1.027889/1.039417× and host PSS/RSS red. W3-E/W3-F/W3-G earn no speed credit. W3-H `c498a413` passes status `84d15970…6e66`; FA2 main is only the third positive mapped residual behind fused and normal FP4 production. No attention speed credit or 35B performance follows. Broader coverage remains in `kernel-matrix.md` |
 | **GDN backend**: metadata segmentation (prefill/decode/spec) | `v1/attention/backends/gdn_attn.py` | T0 ✅ `370ddaf` (GDNAttentionMetadata decode/prefill split + has_initial_state mask + prefill rebasing; spec segments + align col-gather deferred; GDN-state zeroing = caller obligation, see state.md) |
-| GDN chunked-scan prefill kernel (chunk gated delta rule) | `layers/fla/ops/chunk.py` (Triton ref), `flashinfer.gdn_prefill` (Blackwell) | T0 🚧 `ead59d6` seeded a correctness-grade SEQUENTIAL recurrence; M2.3 then landed the chunked WY decomposition on **CUDA only** (`cuda_gdn.cu:6117`, default on, `VT_GDN_CHUNKED=0` falls back). Tenstorrent is chunked; **CPU, ROCm and Vulkan are still sequential**, which upstream never runs for prefill — `qwen_gdn_linear_attn.py:1424-1450` has no sequential branch. The gap is measured (`2.29e-04` out / `2.25e-03` state from the exact recurrence, and it is 100% the bf16 intermediates, not the reassociation) and owned by `KERNEL-GDN-CHUNKED-MIRROR` (`.agents/specs/gdn-chunked-mirror.md`, [#2612](https://github.com/mudler/vllm.cpp/issues/2612)); the retained sequential arm becomes one tracked §9 exception when that row lands. |
+| GDN chunked-scan prefill kernel (chunk gated delta rule) | `layers/fla/ops/chunk.py` (Triton ref), `flashinfer.gdn_prefill` (Blackwell) | T0 🚧 `ead59d6` seeded a correctness-grade SEQUENTIAL recurrence; M2.3 then landed the chunked WY decomposition on **CUDA only** (`cuda_gdn.cu:6117`, default on, `VT_GDN_CHUNKED=0` falls back). `KERNEL-GDN-CHUNKED-MIRROR` then landed it on **CPU** and made the choice one shared, dtype-conditioned predicate on every backend (`vt::GdnUseChunkedPrefill`); the retained sequential arm is §9 exception 19. Tenstorrent is chunked; **ROCm and Vulkan are still sequential**, which upstream never runs for prefill — `qwen_gdn_linear_attn.py:1424-1450` has no sequential branch. The gap is measured (`2.29e-04` out / `2.25e-03` state from the exact recurrence, and it is 100% the bf16 intermediates, not the reassociation) and owned by `KERNEL-GDN-CHUNKED-MIRROR` (`.agents/specs/gdn-chunked-mirror.md`, [#2612](https://github.com/mudler/vllm.cpp/issues/2612)); the retained sequential arm becomes one tracked §9 exception when that row lands. |
 | GDN fused sigmoid-gating decode recurrence (mixed/spec and packed-disabled fallback) | `layers/fla/ops/fused_sigmoid_gating.py` | T0 ✅ `ead59d6` correctness-grade decomposed recurrence; exact mixed/spec breadth remains under its engine rows |
 | GDN packed pure non-spec decode (default-on FP16/BF16/F32 path) | `layers/fla/ops/fused_recurrent.py:255-478`; Qwen dispatch `qwen_gdn_linear_attn.py:1286-1298,1644-1695` | T0 🚧 `KERNEL-GDN-PACKED-DECODE` `ACTIVE`: clean `f344dec` closes W1D2/G2 for exact dispatch, rollback and safety; `7ff713e` + `24cea4f` close exact structure. Clean `d82d282` passed model gates/all c2 legs, then failed incomplete at c16 packed r1 with 96/96 HTTP 500 responses and no marker. Partial legs earn no speed credit |
 | GDN post-conv prep (q,k,v,g,beta + L2 norm) + causal conv1d fn/update | `layers/fla/ops/fused_gdn_prefill_post_conv.py`, `layers/mamba/ops/causal_conv1d.py` | T0 ✅ prefill/mixed path; pure decode bypasses materialized q/k/g/beta only after the packed row gates |
@@ -1834,6 +1834,38 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     call, taken for the same reason. Consequence (d): the layer is unreached
     debt, W4 owns the wiring and the seam extension, and spec `## Owed` names
     both.
+
+19. **Retained sequential GDN prefill (`KERNEL-GDN-CHUNKED-MIRROR`, 2026-09-03,
+    [#2612](https://github.com/mudler/vllm.cpp/issues/2612)):** vLLM runs the
+    chunked WY decomposition for ALL GDN prefill, and after this row so do we by
+    default, on CPU as well as CUDA and Tenstorrent
+    (`cpu_ops.cpp GdnChunkedHeadPrefill`, `cuda_gdn.cu:6117`). The exact
+    SEQUENTIAL recurrence (`cpu_ops.cpp GdnHeadTokenStep`) is retained behind
+    `VT_GDN_CHUNKED=0` and on f32 inputs, as ONE tracked exception covering every
+    backend — the same predicate (`vt::GdnUseChunkedPrefill`), the same kernel
+    family, the same reason.
+
+    The reason: the sequential form is not an alternative implementation of
+    vLLM's prefill. It is the recurrence vLLM's prefill is a reassociation of —
+    reproduced at f64 to `2.428613e-17` — and it is measurably nearer the exact
+    answer, `1.15e-08` against `2.29e-04`. It is retained for two jobs no mirror
+    can do. It is the reference an implementation error in the chunked arm is
+    caught by, because a chunked arm cannot check itself against another chunked
+    arm. And it is the only gated delta rule upstream will run on f32 inputs, on
+    EITHER of its two implementations — the Triton wrapper asserts
+    (`chunk.py:213-215`) and the CPU kernel type-checks bf16 only
+    (`csrc/cpu/sgl-kernels/fla.cpp:2205-2207`) — so on that dtype it IS the
+    mirror. It is off by default wherever upstream's own kernel would run, and it
+    is not an ABI surface.
+
+    **This row also moved CUDA's f32 default.** `ChunkedPrefillEnabled()` carried
+    no dtype term, so an f32 CUDA `GdnPrefill` took the chunked arm before this
+    row and takes the sequential scan after it.
+
+    ROCm and Vulkan still run the sequential recurrence and are NOT yet on the
+    chunked arm; the shared predicate reaches them, the kernel does not. That is
+    named under the spec's `## Owed`, not here, because it is unfinished work
+    rather than a deviation.
 
 ## 10. E2E test suites (T0 deliverable)
 

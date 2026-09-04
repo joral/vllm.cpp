@@ -289,11 +289,27 @@ int main(int argc, char** argv) {
       // the INSTANT, which is the only thing an out-of-process observer can
       // line its own samples up against. Reporting a duration from the wall
       // clock, or an instant from the monotonic one, would each be wrong.
+      // THE SPECULATIVE COUNTERS EITHER SIDE OF THE LEG (#2832). They run for
+      // the life of the handle and --repeat keeps ONE handle for every leg, so
+      // the raw value is a running total and only the difference belongs to
+      // this leg. `spec_ok` is both reads succeeding: a partial pair would make
+      // the difference meaningless, and a benchmark reading a meaningless
+      // number is worse than one reading none.
+      //
+      // OUTSIDE BOTH CLOCKS, deliberately. The first read is taken before `w0`
+      // and the second after `w1`, so neither the duration nor the leg span
+      // this instrument annotates contains the instrument.
+      vllm_spec_acceptance spec_before{};
+      vllm_spec_acceptance spec_after{};
+      bool spec_ok =
+          vllm_engine_spec_acceptance(engine, &spec_before) == VLLM_OK;
       const auto w0 = std::chrono::system_clock::now();
       const auto t0 = std::chrono::steady_clock::now();
       st = vllm_complete(engine, args.prompt.c_str(), &sp, &out);
       const auto t1 = std::chrono::steady_clock::now();
       const auto w1 = std::chrono::system_clock::now();
+      spec_ok = spec_ok &&
+                vllm_engine_spec_acceptance(engine, &spec_after) == VLLM_OK;
       const double secs =
           std::chrono::duration<double>(t1 - t0).count();
       if (st != VLLM_OK) {
@@ -330,6 +346,41 @@ int main(int argc, char** argv) {
                    r + 1, args.repeat,
                    std::chrono::duration<double>(w0.time_since_epoch()).count(),
                    std::chrono::duration<double>(w1.time_since_epoch()).count());
+      // THE LEG'S SPECULATIVE ACCEPTANCE (#2832). A third line, for the reason
+      // the second one is a line of its own: the timing line is parsed by
+      // evidence and readers that predate this marker, so its bytes do not
+      // move.
+      //
+      // UNITS, because the two reference engines disagree on one of them:
+      // spec_drafts_accepted EXCLUDES the bonus token a verify step always
+      // emits, exactly as vLLM's `spec_decode_num_accepted_tokens` does, so
+      // accepted/proposed is the acceptance RATE and
+      // 1 + accepted/drafted_request_steps is vLLM's `mean_acceptance_length`,
+      // which DOES include that token. It is NOT SGLang's `accept_length`,
+      // whose numerator also carries the prefill token; see `vllm.h`.
+      //
+      // AND THE THIRD COUNT IS PER (REQUEST, STEP), NOT PER FORWARD PASS, which
+      // is why it is not called a verify-step count: at concurrency 8 one verify
+      // forward over 8 drafted requests adds 8. Both oracles count it the same
+      // way, so the comparison is exact; a reader who takes it for a forward
+      // count is wrong by the batch size.
+      //
+      // NOT PRINTED AT ALL when either read failed. A silent line is a refusal
+      // in the harness that reads it; a line of zeroes would be a measurement
+      // of an engine that accepted nothing.
+      if (spec_ok) {
+        std::fprintf(stderr,
+                     "vllm-cli: run=%d/%d spec_drafts_proposed=%lld "
+                     "spec_drafts_accepted=%lld "
+                     "spec_drafted_request_steps=%lld\n",
+                     r + 1, args.repeat,
+                     static_cast<long long>(spec_after.drafts_proposed -
+                                            spec_before.drafts_proposed),
+                     static_cast<long long>(spec_after.drafts_accepted -
+                                            spec_before.drafts_accepted),
+                     static_cast<long long>(spec_after.drafted_request_steps -
+                                            spec_before.drafted_request_steps));
+      }
       std::fflush(stderr);
       vllm_completion_free(&out);
     }

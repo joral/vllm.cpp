@@ -3673,3 +3673,428 @@ TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (u
     dev.DestroyQueue(q);
   }
 }
+
+// ---------------------------------------------------------------------------
+// MLA/DSA campaign W1 (BACKEND-ROCM, #2715). Four ops that served from the
+// portable CPU reference tier on gfx1151, so GLM-5.3 ran them on the host.
+//
+// READ THIS BEFORE LOOSENING ANY ASSERTION HERE. The reference tier computes the
+// SAME ANSWER as a native kernel — it IS the CPU oracle, running on the host
+// against device memory the backend reports host-addressable. So an
+// oracle-equality assertion is GREEN on a backend with no kernel at all, and it
+// was green here before any of these four existed. The assertion that can tell
+// the two apart is `vt::OpRegistered`, which is a NATIVE-ONLY probe by design
+// (src/vt/op_provider.cpp:788-806) and deliberately excludes the tier. That is
+// why the registration case below is separate, unconditional on ROCm, and is the
+// one that goes red when a RegisterOp line is deleted.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ROCm registers the W1 MLA ops natively rather than serving them from the tier") {
+  // #2715: eight MLA/DSA ops had no ROCm registration, so every one of them
+  // installed a host kernel on gfx1151 and docs/ROCM.md:60-61 disqualified any
+  // performance result from the run. These four are the W1 slice.
+  //
+  // This case is NOT `if (!OpAvailable) continue`. The harness header says a
+  // device that has not registered an op is skipped rather than failed, and that
+  // is right for a partial backend in general — but it is exactly the polarity
+  // that let these eight sit unregistered while every numeric arm stayed green.
+  // Here the missing registration IS the defect under test.
+  bool rocm_built = false;
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt == DeviceType::kROCM) rocm_built = true;
+  }
+  if (!rocm_built) return;  // not a ROCm build — nothing to assert about ROCm
+
+  CHECK(vt::OpRegistered(vt::OpId::kBatchedMatmul, DeviceType::kROCM));
+  CHECK(vt::OpRegistered(vt::OpId::kConcatAndCacheMla, DeviceType::kROCM));
+  CHECK(vt::OpRegistered(vt::OpId::kConcatMlaNopeRope, DeviceType::kROCM));
+  CHECK(vt::OpRegistered(vt::OpId::kGatherMlaCache, DeviceType::kROCM));
+
+  // The three that are STILL owed after this wave (spec § Owed). Asserting their
+  // absence would be a lock on the next wave, so this only records them: the
+  // GLM-5.3 speed axis stays VOID while any of them is false, and the campaign's
+  // W2/W3 flip them.
+  const std::string owed =
+      std::string("W2/W3 still owed on ROCm (#2715) — kDsaIndexerLogits=") +
+      (vt::OpRegistered(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM) ? "1" : "0") +
+      " kDsaTopkSelect=" +
+      (vt::OpRegistered(vt::OpId::kDsaTopkSelect, DeviceType::kROCM) ? "1" : "0") +
+      " kMlaDecodeAttention=" +
+      (vt::OpRegistered(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM) ? "1" : "0") +
+      " — the GLM-5.3 speed axis stays VOID while any of these is 0";
+  MESSAGE(owed);
+}
+
+TEST_CASE("ConcatAndCacheMla writes the concatenated MLA entry BIT-EXACTLY") {
+  // Upstream cache_kernels.cu:401-442. Geometry is DeepSeek/GLM-shaped but
+  // small; `kRank` is deliberately NOT a multiple of the 512-thread launch block
+  // so the strided copy's tail runs rather than dividing away.
+  constexpr int64_t kTokens = 11, kRank = 37, kPe = 8, kBlocks = 5, kBlockSize = 4;
+  constexpr int64_t kWidth = kRank + kPe;
+  constexpr int64_t kCacheN = kBlocks * kBlockSize * kWidth;
+
+  // GUARD BANDS, and they are not decoration. The padded-token skip
+  // (`slot < 0`, upstream cache_kernels.cu:419-422) is the one guarantee in this
+  // op whose removal writes OUTSIDE the cache rather than inside it: `slot == -1`
+  // gives `block = -1/4 = 0` and `offset = -1%4 = -1`, so the entry address is
+  // NEGATIVE and a kernel that dropped the skip scribbles BEFORE the buffer. A
+  // test that allocated exactly the cache would compare only in-range words,
+  // find them all correct, and report that mutation as killed when it was not —
+  // measured: the first version of this case passed 46/46 with the skip removed.
+  // The tensor therefore points at the MIDDLE of a wider allocation and both
+  // bands are asserted untouched.
+  constexpr int64_t kGuard = 64;
+  const std::vector<float> kv_c = RandomVec(kTokens * kRank, 27101);
+  const std::vector<float> k_pe = RandomVec(kTokens * kPe, 27102);
+  // The pre-seed is what a kernel that writes nothing has to overwrite, and it
+  // is also what a PADDED slot must still be holding at the end.
+  const std::vector<float> seed(kCacheN, -13.25f);
+  std::vector<float> seed_padded(static_cast<size_t>(kCacheN + 2 * kGuard), 88.125f);
+  // A plain loop rather than std::copy: this file does not include <algorithm>
+  // and picking one up transitively from a libstdc++ header is not portable to
+  // the ROCm toolchain's libc++.
+  for (int64_t i = 0; i < kCacheN; ++i) {
+    seed_padded[static_cast<size_t>(kGuard + i)] = seed[static_cast<size_t>(i)];
+  }
+
+  // Slots are shuffled across blocks, not ascending: a kernel that walked the
+  // cache linearly instead of through the slot map passes on an identity map.
+  // Two slots are -1 — upstream's padded token (`:419-422`), which must be
+  // SKIPPED, leaving the seed value in place. Nothing else may be touched.
+  std::vector<int64_t> slots(kTokens);
+  const int64_t pattern[kTokens] = {7, 0, -1, 13, 3, 18, 11, -1, 5, 16, 9};
+  for (int64_t i = 0; i < kTokens; ++i) slots[static_cast<size_t>(i)] = pattern[i];
+
+  std::vector<float> ref(seed);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> a = kv_c, b = k_pe;
+    std::vector<int64_t> sm = slots;
+    Tensor tkv = T2(a.data(), cd, kTokens, kRank);
+    Tensor tpe = T2(b.data(), cd, kTokens, kPe);
+    Tensor tc = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kBlocks, kBlockSize, kWidth});
+    Tensor ts = Tensor::Contiguous(sm.data(), DType::kI64, cd, {kTokens});
+    vt::ConcatAndCacheMla(cq, tkv, tpe, tc, ts);
+    cpu.DestroyQueue(cq);
+  }
+  // The oracle must actually have moved the buffer, or "equal" means nothing.
+  REQUIRE(ref != seed);
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kConcatAndCacheMla, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+
+    DevBuf dkv(dev, q, kTokens * kRank), dpe(dev, q, kTokens * kPe),
+        dc(dev, q, static_cast<size_t>(kCacheN + 2 * kGuard));
+    dkv.Upload(kv_c);
+    dpe.Upload(k_pe);
+    dc.Upload(seed_padded);
+    // The cache the op is handed starts kGuard floats into the allocation.
+    void* cache_ptr = static_cast<void*>(static_cast<float*>(dc.ptr()) + kGuard);
+    void* ds = dev.Alloc(kTokens * sizeof(int64_t));
+    dev.Copy(q, ds, slots.data(), kTokens * sizeof(int64_t));
+    dev.Synchronize(q);
+
+    Tensor tkv = T2(dkv.ptr(), d, kTokens, kRank);
+    Tensor tpe = T2(dpe.ptr(), d, kTokens, kPe);
+    Tensor tc = Tensor::Contiguous(cache_ptr, DType::kF32, d, {kBlocks, kBlockSize, kWidth});
+    Tensor ts = Tensor::Contiguous(ds, DType::kI64, d, {kTokens});
+
+    const unsigned long long hits_before = vt::GetReferenceTierHits();
+    vt::ConcatAndCacheMla(q, tkv, tpe, tc, ts);
+    dev.Synchronize(q);
+    const std::vector<float> got = dc.Download();
+    // A pure copy has no reassociation, so the bar is EQUALITY, not NMSE.
+    CHECK(std::vector<float>(got.begin() + kGuard, got.begin() + kGuard + kCacheN) == ref);
+    // Both guard bands, which is what makes the padded-token skip checkable.
+    CHECK(std::vector<float>(got.begin(), got.begin() + kGuard) ==
+          std::vector<float>(static_cast<size_t>(kGuard), 88.125f));
+    CHECK(std::vector<float>(got.begin() + kGuard + kCacheN, got.end()) ==
+          std::vector<float>(static_cast<size_t>(kGuard), 88.125f));
+    // If this moved, the call above ran on the host, not on the device — the
+    // same quantity docs/ROCM.md:60-61 disqualifies a speed result on.
+    CHECK(vt::GetReferenceTierHits() == hits_before);
+
+    dev.Free(ds);
+    dev.DestroyQueue(q);
+  }
+}
+
+TEST_CASE("ConcatMlaNopeRope concatenates BIT-EXACTLY, broadcast rope head and per-head") {
+  // Upstream cache_kernels.cu:1572-1584 (decode q, per-head rope) and
+  // mla_attention.py:2063-2092 (prefill k, ONE shared rope head broadcast over
+  // every q head). Both arms run: a kernel that ignores the broadcast flag is
+  // green on the per-head arm alone.
+  constexpr int64_t kTokens = 6, kHeads = 5, kDn = 19, kDr = 7;
+
+  for (bool broadcast : {false, true}) {
+    CAPTURE(broadcast);
+    const int64_t rope_heads = broadcast ? 1 : kHeads;
+    const std::vector<float> nope = RandomVec(kTokens * kHeads * kDn, 27201);
+    const std::vector<float> rope = RandomVec(kTokens * rope_heads * kDr, 27202);
+    const std::vector<float> seed(kTokens * kHeads * (kDn + kDr), 41.5f);
+
+    std::vector<float> ref(seed);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> a = nope, b = rope;
+      Tensor to =
+          Tensor::Contiguous(ref.data(), DType::kF32, cd, {kTokens, kHeads, kDn + kDr});
+      Tensor tn = Tensor::Contiguous(a.data(), DType::kF32, cd, {kTokens, kHeads, kDn});
+      Tensor tr = Tensor::Contiguous(b.data(), DType::kF32, cd, {kTokens, rope_heads, kDr});
+      vt::ConcatMlaNopeRope(cq, to, tn, tr);
+      cpu.DestroyQueue(cq);
+    }
+    REQUIRE(ref != seed);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kConcatMlaNopeRope, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dn(dev, q, static_cast<size_t>(kTokens * kHeads * kDn)),
+          dr(dev, q, static_cast<size_t>(kTokens * rope_heads * kDr)),
+          dout(dev, q, static_cast<size_t>(kTokens * kHeads * (kDn + kDr)));
+      dn.Upload(nope);
+      dr.Upload(rope);
+      dout.Upload(seed);
+
+      Tensor to =
+          Tensor::Contiguous(dout.ptr(), DType::kF32, d, {kTokens, kHeads, kDn + kDr});
+      Tensor tn = Tensor::Contiguous(dn.ptr(), DType::kF32, d, {kTokens, kHeads, kDn});
+      Tensor tr = Tensor::Contiguous(dr.ptr(), DType::kF32, d, {kTokens, rope_heads, kDr});
+
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::ConcatMlaNopeRope(q, to, tn, tr);
+      dev.Synchronize(q);
+      CHECK(dout.Download() == ref);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("GatherMlaCache gathers through the block table BIT-EXACTLY, with and without seq_starts") {
+  // Upstream cache_kernels.cu:992-1064. Two requests of unequal length, a block
+  // table whose page ids are shuffled, and a `seq_starts` arm — the chunked
+  // prefill offset (`:1027-1029`) a kernel that ignores it is green without.
+  constexpr int64_t kBatch = 2, kBlocks = 8, kBlockSize = 4, kHeadDim = 13;
+  constexpr int64_t kMaxBlocks = 4, kTotal = 9;  // 5 + 4
+
+  const std::vector<float> cache =
+      RandomVec(static_cast<size_t>(kBlocks * kBlockSize * kHeadDim), 27301);
+  const std::vector<float> seed(static_cast<size_t>(kTotal * kHeadDim), -3.75f);
+
+  // Shuffled page ids: a kernel that read block `i` for logical block `i`
+  // passes on an identity table.
+  const std::vector<int32_t> block_table = {6, 1, 4, 0,   //
+                                            3, 7, 2, 5};
+  const std::vector<int32_t> cu_seq_lens = {0, 5, 9};
+  const std::vector<int32_t> token_to_seq = {0, 0, 0, 0, 0, 1, 1, 1, 1};
+
+  for (bool with_starts : {false, true}) {
+    CAPTURE(with_starts);
+    const std::vector<int32_t> starts = {2, 1};
+
+    std::vector<float> ref(seed);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> c = cache;
+      std::vector<int32_t> bt = block_table, cs = cu_seq_lens, t2s = token_to_seq,
+                           st = starts;
+      Tensor td = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kTotal, kHeadDim});
+      Tensor tc =
+          Tensor::Contiguous(c.data(), DType::kF32, cd, {kBlocks, kBlockSize, kHeadDim});
+      Tensor tb = Tensor::Contiguous(bt.data(), DType::kI32, cd, {kBatch, kMaxBlocks});
+      Tensor tq = Tensor::Contiguous(cs.data(), DType::kI32, cd, {kBatch + 1});
+      Tensor tt = Tensor::Contiguous(t2s.data(), DType::kI32, cd, {kTotal});
+      Tensor ts = Tensor::Contiguous(st.data(), DType::kI32, cd, {kBatch});
+      vt::GatherMlaCache(cq, td, tc, tb, tq, tt, with_starts ? &ts : nullptr, kTotal);
+      cpu.DestroyQueue(cq);
+    }
+    REQUIRE(ref != seed);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kGatherMlaCache, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dc(dev, q, static_cast<size_t>(kBlocks * kBlockSize * kHeadDim)),
+          dd(dev, q, static_cast<size_t>(kTotal * kHeadDim));
+      dc.Upload(cache);
+      dd.Upload(seed);
+      void* dbt = dev.Alloc(block_table.size() * sizeof(int32_t));
+      void* dcs = dev.Alloc(cu_seq_lens.size() * sizeof(int32_t));
+      void* dt2 = dev.Alloc(token_to_seq.size() * sizeof(int32_t));
+      void* dst = dev.Alloc(starts.size() * sizeof(int32_t));
+      dev.Copy(q, dbt, block_table.data(), block_table.size() * sizeof(int32_t));
+      dev.Copy(q, dcs, cu_seq_lens.data(), cu_seq_lens.size() * sizeof(int32_t));
+      dev.Copy(q, dt2, token_to_seq.data(), token_to_seq.size() * sizeof(int32_t));
+      dev.Copy(q, dst, starts.data(), starts.size() * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor td = Tensor::Contiguous(dd.ptr(), DType::kF32, d, {kTotal, kHeadDim});
+      Tensor tc =
+          Tensor::Contiguous(dc.ptr(), DType::kF32, d, {kBlocks, kBlockSize, kHeadDim});
+      Tensor tb = Tensor::Contiguous(dbt, DType::kI32, d, {kBatch, kMaxBlocks});
+      Tensor tq = Tensor::Contiguous(dcs, DType::kI32, d, {kBatch + 1});
+      Tensor tt = Tensor::Contiguous(dt2, DType::kI32, d, {kTotal});
+      Tensor ts = Tensor::Contiguous(dst, DType::kI32, d, {kBatch});
+
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::GatherMlaCache(q, td, tc, tb, tq, tt, with_starts ? &ts : nullptr, kTotal);
+      dev.Synchronize(q);
+      CHECK(dd.Download() == ref);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+
+      dev.Free(dbt);
+      dev.Free(dcs);
+      dev.Free(dt2);
+      dev.Free(dst);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("BatchedMatmul matches the CPU oracle within NMSE <= 5e-4, dense and strided") {
+  // vt::BatchedMatmul is `torch.bmm` at mla_attention.py:789 (W_UK absorption)
+  // and :1034 (W_UV up-projection). BOTH upstream call sites pass TRANSPOSED
+  // views, which is why the wrapper constrains only the innermost stride — so a
+  // strided `a` runs here too, and a kernel that assumed a dense batch stride
+  // is green on the dense arm alone.
+  constexpr int64_t kG = 3, kM = 5, kK = 9, kN = 7;
+
+  const std::vector<float> a0 = RandomVec(static_cast<size_t>(kG * kM * kK), 27401);
+  const std::vector<float> b0 = RandomVec(static_cast<size_t>(kG * kK * kN), 27402);
+  // `a` is viewed with a PADDED row stride: kK + 3 elements between rows, so the
+  // batch stride is kM * (kK + 3) and neither is the shape.
+  constexpr int64_t kARowStride = kK + 3;
+  const std::vector<float> a_pad = RandomVec(static_cast<size_t>(kG * kM * kARowStride), 27403);
+
+  for (bool strided : {false, true}) {
+    CAPTURE(strided);
+    std::vector<float> ref(static_cast<size_t>(kG * kM * kN), 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> a = strided ? a_pad : a0, b = b0;
+      Tensor to = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kG, kM, kN});
+      Tensor tb = Tensor::Contiguous(b.data(), DType::kF32, cd, {kG, kK, kN});
+      // The padded-row view. `Contiguous` on [G, M, kARowStride] already carries
+      // strides {M*kARowStride, kARowStride, 1}; narrowing the last extent to kK
+      // leaves those strides in place, which is exactly the transposed-view
+      // shape upstream passes. There is no Tensor::Strided factory.
+      Tensor ta = Tensor::Contiguous(a.data(), DType::kF32, cd,
+                                     {kG, kM, strided ? kARowStride : kK});
+      ta.shape[2] = kK;
+      vt::BatchedMatmul(cq, to, ta, tb);
+      cpu.DestroyQueue(cq);
+    }
+    double mag = 0.0;
+    for (float v : ref) mag += std::fabs(static_cast<double>(v));
+    REQUIRE(mag > 1.0);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kBatchedMatmul, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      const size_t an = strided ? static_cast<size_t>(kG * kM * kARowStride)
+                                : static_cast<size_t>(kG * kM * kK);
+      DevBuf da(dev, q, an), db(dev, q, static_cast<size_t>(kG * kK * kN)),
+          dout(dev, q, static_cast<size_t>(kG * kM * kN));
+      da.Upload(strided ? a_pad : a0);
+      db.Upload(b0);
+      dout.Upload(std::vector<float>(static_cast<size_t>(kG * kM * kN), -9.5f));
+
+      Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {kG, kM, kN});
+      Tensor tb = Tensor::Contiguous(db.ptr(), DType::kF32, d, {kG, kK, kN});
+      Tensor ta = Tensor::Contiguous(da.ptr(), DType::kF32, d,
+                                     {kG, kM, strided ? kARowStride : kK});
+      ta.shape[2] = kK;
+
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::BatchedMatmul(q, to, ta, tb);
+      dev.Synchronize(q);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("what an unregistered ROCm op actually does on this board: tier, or refusal") {
+  // #2715 says the eight MLA/DSA ops "do not refuse; they install CPU host
+  // kernels and run" on gfx1151, so the damage is speed. That was TRUE of the
+  // tree it was written against and this case exists because it may no longer
+  // be. `6b97a6800` (#2511, "stop giving migratable memory to a part that
+  // cannot fault and recover") narrowed the managed-allocation branch to
+  // `PageableMemoryAccess == 1`, and made the unified claim FOLLOW the
+  // allocator (include/vt/rocm/rocm_arch.h:180-195). gfx1151 reports
+  // `PageableMemoryAccess = 0`. On a tree carrying that commit the tier is
+  // therefore WITHDRAWN on this board, and a missing op is a REFUSAL, not a
+  // slow path — which would make W2 and W3 blocking for GENERATION, not only
+  // for measurement.
+  //
+  // This case does not decide that by reading the source. It asks the seam, on
+  // whatever board it runs on, and asserts the consequence EITHER WAY, so it is
+  // a measurement and not a restatement. `ReferenceTierEligible` is the public
+  // safety gate (include/vt/op_provider.h:248-252) and it is side-effect free.
+  bool rocm_built = false;
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt == DeviceType::kROCM) rocm_built = true;
+  }
+  if (!rocm_built) return;
+
+  vt::Backend& dev = vt::GetBackend(DeviceType::kROCM);
+  const bool eligible = vt::ReferenceTierEligible(DeviceType::kROCM);
+  // Built as one std::string first: MESSAGE expands to `mb * __VA_ARGS__`, so a
+  // multi-term `+` chain binds against the builder rather than the string.
+  const std::string tier =
+      std::string("ROCm reference tier: UnifiedMemory=") +
+      (dev.UnifiedMemory() ? "1" : "0") + " DeviceMemoryIsHostAddressable=" +
+      (dev.DeviceMemoryIsHostAddressable() ? "1" : "0") + " ReferenceTierEligible=" +
+      (eligible ? "1" : "0");
+  MESSAGE(tier);
+
+  // The probe op must be one ROCm does not register. `kMlaDecodeAttention` is
+  // that today and W3 is what changes it; when it does, there is nothing left
+  // to probe here and this case has no business failing for that reason.
+  if (vt::OpRegistered(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM)) {
+    MESSAGE("kMlaDecodeAttention is now registered on ROCm (W3 landed) — probe skipped");
+    return;
+  }
+
+  const unsigned long long before = vt::GetReferenceTierHits();
+  if (eligible) {
+    // The tier is live: the miss installs a host kernel and counts itself.
+    CHECK_NOTHROW((void)vt::GetOp(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+    CHECK(vt::GetReferenceTierHits() > before);
+    MESSAGE("VERDICT: the tier is LIVE here — the missing MLA ops are a SPEED cost");
+  } else {
+    // No tier: `GetOp` refuses by name rather than handing a host kernel a
+    // pointer the host may not dereference.
+    CHECK_THROWS((void)vt::GetOp(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+    CHECK(vt::GetReferenceTierHits() == before);
+    MESSAGE("VERDICT: the tier is WITHDRAWN here — the missing MLA ops are a REFUSAL, "
+            "so W2/W3 block GENERATION and not only measurement");
+  }
+}

@@ -4069,6 +4069,166 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+### The CPU-vs-CUDA TOKEN-IDENTITY objective is UNREACHABLE AS WRITTEN (#2831)
+
+**The position.** The standing objective — `qwen4_exp` emits the CPU control
+sequence `11751 13 15767 411 2029 11 1092 369` on a GPU, in the production
+configuration, on the released UD-IQ1_S checkpoint — **cannot be met while the
+CUDA arm mirrors vLLM.** The CUDA arm emits
+`11751 13 15767 411 1928 11 628 567`, **5 of 8** ids, indices 0,1,2,3,5
+([evidence](../../docs/bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md)
+§2, the token table).
+That is a property of how the objective was WRITTEN, not a measure of how far
+the work has got, and it does not soften into "not yet done": the objective asks
+the faithful arm to reproduce the unfaithful one.
+
+**RE-TESTED 2026-09-04, AND THE POSITION HOLDS WITH ITS REASON CHANGED**
+([ARMTOKENS evidence](../../docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904.md),
+[#2858](https://github.com/mudler/vllm.cpp/issues/2858)). The sentence above
+rests on the CPU arm being the unfaithful one. **Since [#2612](https://github.com/mudler/vllm.cpp/issues/2612)
+it is not**: the CPU GDN prefill runs vLLM's chunked decomposition too, by
+default, and that is measured rather than assumed — `VT_GDN_CHUNKED` moves
+decoder layer 0's block output by `3.702e-04` on one binary, and the CPU arm
+lands `1.772e-05` from CUDA where the sequential arm sat `3.525e-04` away.
+**Both arms now mirror vLLM and they still emit the same two sequences, still
+5 of 8**, byte-for-byte what PREFILLDIV published. So the objective is
+unreachable for a stronger reason than the one written above: it is not that one
+arm is faithful and the other is not. It is that two arms running the same
+algorithm on the same weights, differing only in device arithmetic, do not agree
+on an argmax over near-ties — and with the Gated DeltaNet term spent, what
+carries the remaining 3 ids is the undiagnosed MoE residue, which improved
+nothing (`moe` `1.269e-04` -> `2.289e-04` from an input 11.6x closer). A fifth
+wave must not re-derive this either.
+
+**Why this section exists at all.** The *cause* was already recorded (§Wave
+PREFILLDIV, and the evidence file above). The two dead-end *routes* were not, and
+a search of `.agents/` and `docs/` for the measured `3 of 8` result returns one
+evidence line and no spec position. Three separate waves each re-derived the same
+conclusion. A fourth must not.
+
+**1. The two arms run different algorithms, by design.** The CUDA arm runs
+vLLM's chunked WY decomposition (`src/vt/cuda/cuda_gdn.cu:6117`
+`GdnPrefillChunkedCuda`, selected by the predicate at `:6218`); the CPU arm runs
+an exact sequential recurrence (`src/vt/cpu/cpu_ops.cpp:1863` `GdnPrefillKernel`
+-> `:1812` `GdnHeadTokenStep`). vLLM runs the chunked one for **all** GDN
+prefill: `QwenGatedDeltaNetAttention._forward_core` dispatches
+`self.chunk_gated_delta_rule` with no sequential branch
+(`vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1436-1451`), and
+`forward_native` (`:267-295`) returns `fla_chunk_gated_delta_rule` rather than a
+torch fallback. So the CUDA arm mirrors upstream and the CPU arm does not
+([`gdn-chunked-mirror.md`](gdn-chunked-mirror.md) §Scope,
+[#2612](https://github.com/mudler/vllm.cpp/issues/2612)).
+
+**Upstream's CPU arm is chunked TOO, and no record in this tree said so.** The
+same layer selects `forward_cpu` on a CPU platform (`:376-382`), which calls
+`torch.ops.vllm.cpu_gdn_attention_core` (`:971`), whose prefill is
+`ops.chunk_gated_delta_rule_cpu`
+(`vllm/model_executor/layers/mamba/ops/cpu/gdn_attention.py:646`, also `:241`,
+`:589`; binding at `vllm/_custom_ops.py:3359`). vLLM ships a **chunked CPU GDN
+kernel**. Our sequential recurrence therefore mirrors upstream on *no* device,
+and "upstream has no CPU path, so ours is unconstrained" is not available as a
+defence. Read in the local checkout at `5559679229` — see the pin caveat below.
+
+**2. Route A, make the GPU sequential: MEASURED, and it is WORSE on the counted
+axis.** `VT_GDN_CHUNKED=0` routes CUDA to `GdnScanCuda` (`cuda_gdn.cu:6223`),
+the same sequential recurrence. On the identical binary, prompt and artifact it
+drops the first divergent tap — decoder layer 0's Gated DeltaNet block output —
+from `rel = 3.525e-04` to `1.062e-06`, a **332x** reduction, and emits
+`11751 13 15767 264 1103 314 5656 321`: **3 of 8**, indices 0,1,2. Fewer ids from
+a 332x closer hidden state
+(the same evidence file, §2 third row and §3). Agreement between our arms is an argmax over near-ties and is **not a
+monotone function of the distance between them** — a change that improves the
+numbers can lose ids. Route A also forfeits the mirror, which is the reason it
+would be refused even if it had won.
+
+**3. Route B, make the CPU chunked: mirror-correct, and it MOVES THE TARGET.**
+That repair is specified as `KERNEL-GDN-CHUNKED-MIRROR`
+([`gdn-chunked-mirror.md`](gdn-chunked-mirror.md),
+[#2612](https://github.com/mudler/vllm.cpp/issues/2612)) and it is the right
+change on the mirror criterion. It also **changes the CPU arm's output**: that
+spec's own §"The control token sequence" states "Flipping the CPU default to
+chunked changes it" and enumerates the fourteen tracked files that carry the
+sequence in three different spellings. The specific ids the objective names cease
+to exist. There is no ordering of A and B that leaves a target standing.
+
+**4. Therefore, and what WOULD achieve it.** Token identity between the two arms
+is achievable only by a CUDA sequential kernel bit-identical to the CPU's, which
+means matching its reduction order exactly, element for element. **That is
+rejected on two independent grounds**, either sufficient: it is not the
+production configuration (it is `VT_GDN_CHUNKED=0`, an A/B rollback flag —
+`cuda_gdn.cu:3265-3271`), and it is not a mirror of upstream, which runs the
+chunked algorithm on every device it supports. AGENTS.md §"vLLM is the reference"
+forbids moving the CUDA arm away from vLLM to make a local arm agree with it.
+
+**5. What the divergence is NOT, so nobody re-chases it.**
+
+- **NOT an unstable CUDA top-k tie-break.** Wave TIEBREAK
+  ([#2586](https://github.com/mudler/vllm.cpp/issues/2586), landed as
+  [#2595](https://github.com/mudler/vllm.cpp/pull/2595)) measured it on
+  `thor:gpu0`: **4652 assertions, 0 failed**, at the `E = 512` `k = 10` geometry
+  this model routes, byte-identical to the serial GPU oracle and to the CPU
+  reference at an exact bf16 tie, over 279 repeat and 2313 batch-position
+  comparisons (§Wave TIEBREAK §Outcome;
+  [evidence](../../docs/bench-evidence/qwen4exp-moe-tiebreak-stability-20260902.md)).
+- **NOT the chunked reassociation.** In `float64` the chunked decomposition
+  reproduces the sequential recurrence to `2.428613e-17` out and `1.110223e-16`
+  state — `1e-13` of the gap it was supposed to explain
+  ([evidence](../../docs/bench-evidence/gdn-chunked-decomposition-20260902.md), its
+  one-line result and the `chunk_f64` row of its table).
+- **It is bf16 intermediate storage, and the whole of it.** vLLM's kernel sits
+  `2.286426e-04` from the exact recurrence where ours sits `1.15e-08`; a numpy
+  replica given nothing but upstream's bf16 placement reproduces the real
+  kernel's distance to seven significant figures. At bf16 output width, chunked
+  with upstream's placement differs from vLLM's kernel in **62 / 8192** elements
+  while both an f32-intermediate chunked port and our sequential arm differ in
+  **4157 / 8192** ([`gdn-chunked-mirror.md`](gdn-chunked-mirror.md) §"The
+  measurement that decides the design").
+- **NOT fully attributed, in one term.** The MoE residue of `7.269e-05` per
+  layer that survives with the GDN source removed is named and undiagnosed, and
+  it is owed by [#2552](https://github.com/mudler/vllm.cpp/issues/2552) under
+  §"PREFILLDIV: the MoE second source" below. It does not reopen 1-4: the layer-0
+  tap is bit-identical on input, so the attribution above stands whatever the MoE
+  term turns out to be.
+
+**The pin caveat, and it is real.** Every upstream anchor above was read in the
+local checkout at `5559679229` — the **prior** parity pin. The pin advanced to
+`e126687a9a` on 2026-09-03 ([#2817](https://github.com/mudler/vllm.cpp/issues/2817)),
+`qwen_gdn_linear_attn.py` changed across that window, and the layer gained a
+`_resolve_gdn_prefill_backend` whose arms are `triton` and `cutedsl`
+([`../sync/2026-09-03-e126687-step6.md`](../sync/2026-09-03-e126687-step6.md)
+§3.2 item 2)
+— both chunked, so nothing above is expected to move. **Expected is not measured.**
+Re-anchoring this section's five upstream citations at `e126687a9a` is owed to
+[#2831](https://github.com/mudler/vllm.cpp/issues/2831), and no wave should quote
+them as "at the pin" until that runs.
+
+**What is owed is a WELL-POSED objective, and choosing it is the developer's.**
+This section retires a question; it proposes no plan. Three candidate
+replacements have been named in flow and **none is decided**:
+
+| candidate | what it would gate | what it costs |
+|---|---|---|
+| a prefill hidden-state gate | the layer-0 tap against a tolerance, which is continuous and not bimodal | needs a ratified tolerance, and it is a CPU-vs-CUDA gate rather than an oracle gate |
+| selection-set agreement with a tie-rate histogram | expert selection as a SET, with the tie population printed beside it | says nothing about ids, and MOEDIV already found a third of the boundaries are exact ties |
+| CUDA-vs-vLLM tokens | the faithful arm against the oracle, which is the comparison AGENTS.md actually asks for | needs an upstream that runs `qwen4_exp` on a fleet device, which §"Upstream's own QSA cannot launch on `thor:gpu0`" ([#2626](https://github.com/mudler/vllm.cpp/issues/2626)) says it cannot |
+
+[#2547](https://github.com/mudler/vllm.cpp/issues/2547) is left OPEN. Its
+measurement is accurate and its named candidate was falsified by PREFILLDIV, but
+whether the objective it serves is withdrawn or replaced is a developer decision
+and not a records repair.
+
+**`docs/USAGE.md` is already corrected and needs no further edit here.** The
+recommendation that used to read "`--device cpu` is the arm to use when the exact
+ids matter" is gone from the tree; `docs/USAGE.md:893` now reads "**`--device
+cuda` is the arm that MIRRORS vLLM; `--device cpu` is the arm that is more
+accurate**", with the two figures and both evidence links. The *further* rewrite
+— re-deriving the ids that cell records once both arms are chunked — belongs to
+[#2612](https://github.com/mudler/vllm.cpp/issues/2612) and is listed in
+[`gdn-chunked-mirror.md`](gdn-chunked-mirror.md) `## Records owed`, not here.
+That table still anchors the cell at `docs/USAGE.md:670`; the corrected text is
+at `:893` today, so the anchor drifted after it landed and the row that repairs
+it owns the fix.
+
 ### Upstream's own QSA cannot launch on `thor:gpu0` (#2626)
 
 Found by wave RUNHALF while measuring the run half of the `e126687a9a`

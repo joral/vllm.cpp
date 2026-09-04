@@ -27,8 +27,6 @@
 namespace vt::rocm {
 namespace {
 
-constexpr int kBlock = 256;
-
 inline void Check(hipError_t err, const char* what) {
   if (err != hipSuccess) {
     throw std::runtime_error(std::string("vt rocm: ") + what + ": " +
@@ -332,7 +330,6 @@ __global__ void PagedAttnOnline(TO* out, const TQ* query, const TKV* k_cache,
 // block sync. Grid (total_q, hq), block 256.
 // ===========================================================================
 constexpr int kDecWarps = 8;
-constexpr int kDecEpl = 8;  // 32 lanes * 8 = 256 head_dim
 
 // EPL elems/lane: 4 → d=128 (Qwen3/Llama-class GQA), 8 → d=256, 16 → d=512
 // (32 lanes). d=128 (#488, ROCM-DECODE-ATTN-D128): the kernel body below is
@@ -443,13 +440,6 @@ __device__ inline void StoreRowEplBf16(__hip_bfloat16* p, int64_t base, int lane
     u[lane] = *reinterpret_cast<const uint4*>(t0);
     u[lane + 32] = *reinterpret_cast<const uint4*>(t1);
   }
-}
-
-__device__ inline void LoadRow8Bf16(const __hip_bfloat16* p, int64_t base, int lane, float r[8]) {
-  LoadRowEplBf16<8>(p, base, lane, r);
-}
-__device__ inline void StoreRow8Bf16(__hip_bfloat16* p, int64_t base, int lane, const float r[8]) {
-  StoreRowEplBf16<8>(p, base, lane, r);
 }
 
 // BF16 Q/K/V/Out; EPL=4 → d=128, EPL=8 → d=256, EPL=16 → d=512. No per-key block sync
@@ -2298,9 +2288,9 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   }();
   if (decode_opt && decode_gqa4_f32q && total_q <= hq &&
       query.dtype == DType::kF32 && out.dtype == DType::kF32 &&
-      (k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16 ||
-       k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8 &&
-       args.kv_cache_dtype != Fp8KVCacheDataType::kAuto) &&
+      ((k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16) ||
+       (k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8 &&
+        args.kv_cache_dtype != Fp8KVCacheDataType::kAuto)) &&
       (d == 128 || d == 256) && hq == 16 && num_kv_heads == 4) {
     constexpr int kDecWarpsG = 8;
     constexpr int kQgG = 4;

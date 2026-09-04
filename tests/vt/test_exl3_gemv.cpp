@@ -181,19 +181,58 @@ TEST_CASE("exl3 gemv: the envelope's verdict at the #2495 checkpoint's real shap
     }
   }
 
-  // bits 4, cb 2 — 270 modules. NOT instantiated here (the arm is owed), but
-  // the envelope is upstream's and would admit them, so the thresholds are
-  // recorded now: they are what the (4, 2) port would be measured against.
-  // n = 1024 (34 modules) is admitted by ANY plausible occupancy.
-  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 5120, 1024, 4, 2, kMode, 32) == 0);
-  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 5120, 1024, 4, 2, kMode, 31) == -1);
-  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 6144, 5120, 4, 2, kMode, 160) == 0);
-  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 5120, 10240, 4, 2, kMode, 320) == 0);
-  // ... and that K == 4 does NOT hit the bits-3 early decline: with the
-  // narrow branch missed it falls to the wide-config band, which needs
-  // size_k <= 4096 and every k here is larger.
-  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 5120, 10240, 4, 2, kMode, 319) == -1);
+  // bits 4, cb 2 — 270 modules, the largest single population and the one #2570
+  // leads with. The arm is INSTANTIATED as of QUANT-EXL3-PERF slice B, so every
+  // shape below is a live admission decision rather than a record for later.
+  //
+  // ALL EIGHT SHAPES, both sides of each threshold. The census is
+  // {n=1024: 34, n=6144: 48, n=10240: 48, n=12288: 17, n=17408: 38,
+  //  n=5120: 64 + 1 + 20}, and `size_n / 32` is the only term that moves.
+  struct B4Shape {
+    int k, n, threshold, modules;
+  };
+  const B4Shape kB4[] = {
+      {5120, 1024, 32, 34},   {6144, 5120, 160, 64},    {10240, 5120, 160, 1},
+      {17408, 5120, 160, 20}, {5120, 6144, 192, 48},    {5120, 10240, 320, 48},
+      {5120, 12288, 384, 17}, {5120, 17408, 544, 38},
+  };
+  int total = 0;
+  for (const B4Shape& s : kB4) {
+    CAPTURE(s.k);
+    CAPTURE(s.n);
+    CHECK(s.n / 32 == s.threshold);
+    CHECK(vt::Exl3GemvSelectConfig(bw, 1, s.k, s.n, 4, 2, kMode, s.threshold) == 0);
+    CHECK(vt::Exl3GemvSelectConfig(bw, 1, s.k, s.n, 4, 2, kMode, s.threshold - 1) == -1);
+    total += s.modules;
+  }
+  CHECK(total == 270);
+
+  // AND THE PART THAT IS EASY TO GET BACKWARDS. K == 4 does not take the
+  // bits-3 early `return -1;`, so the door stays open one line longer — and on
+  // THIS checkpoint it leads nowhere. The next branch is the wide-config band
+  // `size_n >= 8192 && size_k <= 4096`, and the smallest 4-bit `k` in the
+  // artifact is 5120. So the wide config is NOT the escape from the narrow
+  // config's occupancy ceiling here, at any shape this checkpoint has; what
+  // bits 4 actually buys is LOWER thresholds (32 and 160 against the bits-3
+  // shapes' 160 and 544), not a second admitting branch.
+  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 5120, 17408, 4, 2, kMode, 543) == -1);  // not 1
+  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 5120, 10240, 4, 2, kMode, 319) == -1);  // not 1
+  // The band is real, and it is reachable only at a k this artifact does not
+  // have. Both sides of that boundary, so the claim above is a gate.
   CHECK(vt::Exl3GemvSelectConfig(bw, 1, 4096, 10240, 4, 2, kMode, 319) == 1);
+  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 4224, 10240, 4, 2, kMode, 319) == -1);
+
+  // The envelope is per-K, so `(4, 2)` inherits `(4, 1)`'s and `(4, 0)`'s
+  // exactly, the same way `(3, 2)` inherits `(3, 1)`'s. This is what makes
+  // "slice B adds no envelope change" a gate rather than a sentence.
+  for (const B4Shape& s : kB4) {
+    for (int nc : {0, s.threshold - 1, s.threshold, 1 << 20}) {
+      CHECK(vt::Exl3GemvSelectConfig(bw, 1, s.k, s.n, 4, 2, kMode, nc) ==
+            vt::Exl3GemvSelectConfig(bw, 1, s.k, s.n, 4, 1, kMode, nc));
+      CHECK(vt::Exl3GemvSelectConfig(bw, 1, s.k, s.n, 4, 2, kMode, nc) ==
+            vt::Exl3GemvSelectConfig(bw, 1, s.k, s.n, 4, 0, kMode, nc));
+    }
+  }
 
   // bits 5 and 6 have NO GEMV upstream either (`exl3_gemv.cu:110-111`), so the
   // one 5-bit tensor and the 6-bit lm_head falling to the regular shape table
@@ -207,6 +246,8 @@ TEST_CASE("exl3 gemv: the envelope's verdict at the #2495 checkpoint's real shap
   // measures the same path twice.
   CHECK(vt::Exl3GemvSelectConfig(bw, 1, 5120, 17408, 3, 2, 2, 0) == 1);
   CHECK(vt::Exl3GemvSelectConfig(bw, 1, 17408, 5120, 3, 2, 2, 0) == 0);
+  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 5120, 17408, 4, 2, 2, 0) == 1);
+  CHECK(vt::Exl3GemvSelectConfig(bw, 1, 6144, 5120, 4, 2, 2, 0) == 0);
 }
 
 TEST_CASE("exl3 gemv: the env knobs parse exactly as upstream's do") {
@@ -243,46 +284,93 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
   vt::Backend& cb_be = vt::GetBackend(vt::DeviceType::kCUDA);
   vt::Queue hq = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
 
-  const int64_t m = 1, k = kW2K, n = kW2N;
-  Exl3Fixture f = MakeFixture(k, n, 3, 0x5EEDu);
-  std::vector<uint16_t> a(static_cast<size_t>(m * k));
-  Rng rng;
-  for (auto& v : a) v = vt::F32ToF16(rng.next(1.0f));
+  const int64_t m = 1;
 
-  // Both codebooks' device outputs are kept, because they MUST differ: (3, 1)
-  // and (3, 2) are the confusable pair. Same width, same `dq8` route, same tile
-  // shapes, and a `cb` threaded wrongly between them neither fails to compile
-  // nor changes a shape — it decodes with the other codebook's tail and yields a
-  // weight with the right DISTRIBUTION and no correlation to the true one. A
-  // per-arm tolerance alone cannot see that; the cross-arm check below can.
-  std::vector<std::vector<uint16_t>> per_arm;
-
+  // EVERY INSTANTIATED ARM, and both CONFIGS of the envelope.
+  //
   // (3, 1) is the SparkInfer DeepSeek-V4 artifact's arm. (3, 2) is 137 of the
   // 409 trellis modules of `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` — every MLP
-  // projection quantized at the low end of its 3.5 bpw average, and the single
-  // largest population in that checkpoint that this arm can reach
-  // (QUANT-EXL3-PERF, #2570).
-  for (int codebook : {1, 2}) {
-    CAPTURE(codebook);
+  // projection quantized at the low end of its 3.5 bpw average. (4, 2) is the
+  // other 270, the largest single population in that checkpoint and the one
+  // #2570 leads with (QUANT-EXL3-PERF slice B).
+  //
+  // `force_gemv` drives the envelope at mode 2, whose whole rule is
+  // `size_n <= 8192 ? 0 : 1` (`exl3_gemv.cu:54`). So n picks the config, and
+  // the bits-4 arm is gated at BOTH: the narrow config (512 threads, WNT 2,
+  // LSTRIDE 32, PF 4, FOLD 4) and the wide one (256 threads, WNT 4, PF 2,
+  // FOLD 2). Those are different compiled kernels with different geometry, and
+  // gating one of them would leave the other measured by nothing. The wide
+  // config is upstream's own `K == 4` band (`:69`) and is the one arm of this
+  // port that the #2495 checkpoint's shapes cannot reach, because its smallest
+  // 4-bit `k` is 5120 and that band needs `size_k <= 4096`.
+  struct Arm {
+    int bits, cb;
+    int64_t k, n;
+    // `std::string`, NOT `const char*`. Under doctest 2.5.2 a `const char*`
+    // streamed into `MESSAGE` or `CAPTURE` decays to BOOL and prints `1`, so a
+    // parameterised suite's per-arm diagnostic silently stops naming the arm --
+    // and every number read off it is then attributed by assumed loop order.
+    // That has already rotated three measured values across three axes in this
+    // tree. The label is what the lease's evidence is read by, so it is typed
+    // to print.
+    std::string what;
+  };
+  const Arm kArms[] = {
+      {3, 1, kW2K, kW2N, "(3,1) narrow"},
+      {3, 2, kW2K, kW2N, "(3,2) narrow"},
+      {4, 2, kW2K, kW2N, "(4,2) narrow"},
+      {4, 2, 2048, 8320, "(4,2) wide"},
+  };
+
+  // The (3,1)/(3,2) device outputs are kept for the cross-arm check below.
+  std::vector<std::vector<uint16_t>> bits3_per_cb;
+
+  for (const Arm& arm : kArms) {
+    CAPTURE(arm.what);
+    CAPTURE(arm.bits);
+    CAPTURE(arm.cb);
+    const int64_t k = arm.k, n = arm.n;
+    const int64_t tile_bytes = 32 * arm.bits;
+    Exl3Fixture f = MakeFixture(k, n, arm.bits, 0x5EEDu);
+    std::vector<uint16_t> a(static_cast<size_t>(m * k));
+    Rng rng;
+    for (auto& v : a) v = vt::F32ToF16(rng.next(1.0f));
+
     vt::Queue dq = cb_be.CreateQueue();
 
     // The reference is the CPU arm, which `test_exl3_gemm` already gates against
-    // the f64 chain at tier 3. Comparing against it rather than re-deriving f64
-    // here keeps ONE reference for both device arms.
-    std::vector<uint16_t> ref(static_cast<size_t>(m * n), 0), got(static_cast<size_t>(m * n), 0);
+    // the f64 chain at tier 3, and which decodes EVERY width and codebook.
+    // Comparing against it rather than re-deriving f64 here keeps ONE reference
+    // for every device arm.
+    //
+    // `sibling` is the SAME width decoded with the OTHER codebook. It is what
+    // makes the tolerance mean something: a `cb` threaded wrongly neither fails
+    // to compile nor changes a shape, so it yields a weight with the right
+    // DISTRIBUTION and no correlation to the true one. The assertion is that
+    // the device output is close to its OWN codebook's reference and FAR from
+    // the sibling's. That generalises to any arm, including one whose confusable
+    // partner is not instantiated on the device at all — which is exactly
+    // `(4, 2)`, whose partner `(4, 1)` this tree deliberately does not compile.
+    const int sibling_cb = arm.cb == 2 ? 1 : 2;
+    std::vector<uint16_t> ref(static_cast<size_t>(m * n), 0);
+    std::vector<uint16_t> sib(static_cast<size_t>(m * n), 0);
+    std::vector<uint16_t> got(static_cast<size_t>(m * n), 0);
     std::vector<uint16_t> a_had_h(static_cast<size_t>(m * k), 0);
     vt::Exl3GemmArgs ha;
-    ha.bits = 3;
-    ha.codebook = codebook;
-    {
+    ha.bits = arm.bits;
+    ha.codebook = arm.cb;
+    for (int which = 0; which < 2; ++which) {
+      vt::Exl3GemmArgs hargs = ha;
+      hargs.codebook = which == 0 ? arm.cb : sibling_cb;
+      uint16_t* out = which == 0 ? ref.data() : sib.data();
       vt::Tensor ta = vt::Tensor::Contiguous(a.data(), vt::DType::kF16, hq.device, {m, k});
       vt::Tensor tah = vt::Tensor::Contiguous(a_had_h.data(), vt::DType::kF16, hq.device, {m, k});
-      vt::Tensor tc = vt::Tensor::Contiguous(ref.data(), vt::DType::kF16, hq.device, {m, n});
+      vt::Tensor tc = vt::Tensor::Contiguous(out, vt::DType::kF16, hq.device, {m, n});
       vt::Tensor tb = vt::Tensor::Contiguous(f.trellis.data(), vt::DType::kI8, hq.device,
-                                             {k / 16, n / 16, 32 * 3});
+                                             {k / 16, n / 16, tile_bytes});
       vt::Tensor tsuh = vt::Tensor::Contiguous(f.suh.data(), vt::DType::kF16, hq.device, {k});
       vt::Tensor tsvh = vt::Tensor::Contiguous(f.svh.data(), vt::DType::kF16, hq.device, {n});
-      vt::Exl3Gemm(hq, tc, ta, tb, tsuh, tsvh, tah, ha);
+      vt::Exl3Gemm(hq, tc, ta, tb, tsuh, tsvh, tah, hargs);
     }
 
     void* d_a = cb_be.Alloc(a.size() * 2);
@@ -299,7 +387,7 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
     vt::Tensor dah = vt::Tensor::Contiguous(d_ah, vt::DType::kF16, dq.device, {m, k});
     vt::Tensor dc = vt::Tensor::Contiguous(d_c, vt::DType::kF16, dq.device, {m, n});
     vt::Tensor db =
-        vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device, {k / 16, n / 16, 32 * 3});
+        vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device, {k / 16, n / 16, tile_bytes});
     vt::Tensor dsuh = vt::Tensor::Contiguous(d_suh, vt::DType::kF16, dq.device, {k});
     vt::Tensor dsvh = vt::Tensor::Contiguous(d_svh, vt::DType::kF16, dq.device, {n});
     vt::Exl3GemmArgs da_args = ha;
@@ -309,17 +397,60 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
     cb_be.Copy(dq, got.data(), d_c, got.size() * 2);
     cb_be.Synchronize(dq);
 
-    double sq = 0.0, rq = 0.0, worst = 0.0;
+    // NOTHING LANDS DEAD. Everything above is FORCED, and a forced arm proves
+    // the kernel works, never that anything reaches it. This second call leaves
+    // `force_gemv` at its `Exl3GemmArgs` DEFAULT of -1 — exactly what a model's
+    // linear method passes through `ModelRegistry::Forward` — so the envelope
+    // decides at mode 1, on this device, with no test-only lever anywhere.
+    //
+    // At `k == 2048, n == 4096` the branch `size_k <= 2048 && size_n <= 8192`
+    // (`exl3_gemv.cu:67`) fires on EVERY compute-capability bucket and takes NO
+    // occupancy input, so this is the one shape whose default-mode verdict is a
+    // constant rather than a device query. `arm.n == kW2N` selects it and the
+    // wide leg, at n = 8320, is excluded because its verdict is not.
+    //
+    // The assertion is BYTE equality with the forced result, and that is what
+    // makes it a reachability check rather than a second tolerance: the regular
+    // shape-table kernel accumulates in f32 where this one accumulates in fp16,
+    // so a fall-through would agree to tier 3c and disagree here. Deleting the
+    // `Exl3GemvTryLaunch` call site turns this from equal to unequal.
+    if (arm.n == kW2N) {
+      std::vector<uint16_t> unforced(static_cast<size_t>(m * n), 0);
+      void* d_c2 = cb_be.Alloc(unforced.size() * 2);
+      vt::Tensor dc2 = vt::Tensor::Contiguous(d_c2, vt::DType::kF16, dq.device, {m, n});
+      vt::Exl3GemmArgs prod = ha;  // force_gemv stays -1, force_shape_idx stays 0
+      CHECK(prod.force_gemv == -1);
+      CHECK(vt::Exl3GemvSelectConfig(vt::Exl3Cc::kBlackwell, static_cast<int>(m),
+                                     static_cast<int>(k), static_cast<int>(n), arm.bits, arm.cb,
+                                     /*mode=*/1, /*narrow_coresident=*/0) == 0);
+      vt::Exl3Gemm(dq, dc2, da, db, dsuh, dsvh, dah, prod);
+      cb_be.Synchronize(dq);
+      cb_be.Copy(dq, unforced.data(), d_c2, unforced.size() * 2);
+      cb_be.Synchronize(dq);
+      size_t same = 0;
+      for (size_t i = 0; i < got.size(); ++i)
+        if (unforced[i] == got[i]) ++same;
+      MESSAGE(arm.what, " reached UNFORCED at mode 1: ", same, " of ", got.size(),
+              " outputs byte-equal to the forced launch");
+      CHECK(same == got.size());
+      cb_be.Free(d_c2);
+    }
+
+    double sq = 0.0, rq = 0.0, worst = 0.0, sq_sib = 0.0;
     for (size_t i = 0; i < got.size(); ++i) {
       const double r = vt::F16ToF32(ref[i]);
+      const double s = vt::F16ToF32(sib[i]);
       const double g = vt::F16ToF32(got[i]);
       sq += (g - r) * (g - r);
+      sq_sib += (g - s) * (g - s);
       rq += r * r;
       worst = std::max(worst, std::fabs(g - r));
     }
     const double rms_ref = std::sqrt(rq / static_cast<double>(got.size()));
     const double rel = std::sqrt(sq / static_cast<double>(got.size())) / rms_ref;
-    MESSAGE("cb ", codebook, " tier 3c: relative RMS ", rel, ", worst elementwise ", worst);
+    const double rel_sib = std::sqrt(sq_sib / static_cast<double>(got.size())) / rms_ref;
+    MESSAGE(arm.what, " tier 3c: relative RMS ", rel, ", worst elementwise ", worst,
+            ", relative RMS against codebook ", sibling_cb, " ", rel_sib);
     // `## W2cd design` W2c-3. NOT tier 3's 1.0e-3: this arm accumulates in fp16.
     // A NEW arm INHERITS this bound; it is never widened to admit one.
     CHECK(rel <= 6.0e-3);
@@ -328,8 +459,15 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
     // and could still pass a tolerance against a reference that is also near
     // zero. It cannot pass this.
     CHECK(rms_ref > 0.0);
+    // THE DISCRIMINATION CHECK, per arm. Two decodes of the same bits under
+    // different codebooks are uncorrelated, so the distance to the sibling is
+    // O(1) relative and the distance to the truth is O(1e-4). A hundredfold
+    // margin below is not a tuned constant: it sits three orders of magnitude
+    // above the measured `rel` and two below the measured `rel_sib`, so it
+    // cannot be met by an arm that decoded with the wrong codebook.
+    CHECK(rel_sib > 100.0 * 6.0e-3);
 
-    per_arm.push_back(got);
+    if (arm.bits == 3) bits3_per_cb.push_back(got);
 
     cb_be.Free(d_a);
     cb_be.Free(d_ah);
@@ -340,16 +478,17 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
     cb_be.DestroyQueue(dq);
   }
 
-  // THE DISCRIMINATION CHECK. The two codebooks are different decodes of the
-  // same bits, so on the same trellis they must produce different numbers. If
-  // they agree the case is measuring one arm twice and its tolerances mean
-  // nothing — which is the spec's stop condition, not a tolerance to widen.
-  REQUIRE(per_arm.size() == 2);
+  // THE CROSS-ARM CHECK, kept from slice A. `(3, 1)` and `(3, 2)` are both
+  // compiled here, so the two DEVICE outputs can be compared directly rather
+  // than each against a host reference. If they agree the case is measuring one
+  // arm twice and its tolerances mean nothing — which is the spec's stop
+  // condition, not a tolerance to widen.
+  REQUIRE(bits3_per_cb.size() == 2);
   size_t differing = 0;
-  for (size_t i = 0; i < per_arm[0].size(); ++i)
-    if (per_arm[0][i] != per_arm[1][i]) ++differing;
-  MESSAGE("(3,1) vs (3,2) differ in ", differing, " of ", per_arm[0].size(), " outputs");
-  CHECK(differing > per_arm[0].size() / 2);
+  for (size_t i = 0; i < bits3_per_cb[0].size(); ++i)
+    if (bits3_per_cb[0][i] != bits3_per_cb[1][i]) ++differing;
+  MESSAGE("(3,1) vs (3,2) differ in ", differing, " of ", bits3_per_cb[0].size(), " outputs");
+  CHECK(differing > bits3_per_cb[0].size() / 2);
 
   vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);
 }

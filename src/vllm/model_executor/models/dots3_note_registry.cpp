@@ -35,6 +35,7 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/gguf_reader.h"  // IsDots3NoteGguf
 #include "vllm/model_executor/models/dense_attn_block.h"  // MakeTensor
 #include "vllm/model_executor/models/dots3_note.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::ApplyDeviceTokenIds
@@ -116,14 +117,14 @@ std::unique_ptr<LoadedModel> LoadDots3NoteForCausalLM(
     // The GGUF k-quant arm is OWED, not optional (AGENTS.md, porting-a-model.md
     // §2) — and for this row it is the only arm that could ever fit a host we
     // own (spec §6.2: 576.89 GB bf16 / 298.67 GB fp8, decimal GB, against a
-    // 122 GiB ceiling).
-    // llama.cpp has no `dots3_note` architecture, so the converter is ours to
-    // write. W9. Refusing by name beats a silent dequantize.
-    throw std::runtime_error(
-        "Dots3NoteForCausalLM: GGUF k-quants are not ported yet (W9 owes both "
-        "the converter and the loader — llama.cpp has no dots3_note "
-        "architecture, so there is no upstream converter to reuse). See "
-        ".agents/specs/dots3-note.md and issue #699.");
+    // 122 GiB ceiling), which is also the only route this row has to an
+    // end-to-end run and to a quant-matched llama.cpp denominator.
+    //
+    // The TEXT lives in `Dots3NoteGgufRefusal` because the entrypoint's GGUF
+    // architecture dispatch throws the SAME string strictly EARLIER (W9a,
+    // #2882): a real `dots3note` file is refused at the door it actually
+    // arrives at, and this guard still covers a direct `Kind::kGguf` caller.
+    throw std::runtime_error(Dots3NoteGgufRefusal());
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");
@@ -210,14 +211,21 @@ MmEncoderOutput EncodeAudioDots3Note(Dots3NoteLoadedModel& d3,
                " wide (`whisper_adapter_out_dim`, nvidia/audio.py:33-35 @ "
                "9035151d6)");
 
-  // The PADDED mel, the waveform's OWN length and the placeholder span, exactly
-  // as the processor produced them. `num_samples` and `num_tokens` are two
-  // different numbers and neither is derivable from the other — see
-  // `Dots3NoteAudioForward`'s own note.
+  // The STACKED padded mels and the PER-CHUNK lengths, exactly as the processor
+  // produced them (W7b, #2797). `chunk_num_samples[i]` and
+  // `chunk_num_tokens[i]` are two different numbers and neither is derivable
+  // from the other — see `Dots3NoteAudioForward`'s own note — and they are
+  // per-chunk because upstream's `encode_waveform` carries them that way
+  // (`audio_sample_lens` / `token_lens`, nvidia/audio.py:217-218 @ 9035151d6).
+  // A one-chunk item takes exactly W7a's path through the same call.
   const multimodal::AudioKwargs& mel = *item.audio_data;
-  const std::vector<float> tower = Dots3NoteAudioForward(
-      mel.input_features, mel.num_samples, mel.num_tokens, /*hop_length=*/160,
-      w.audio, a, vt::GetBackend(queue.device.type));
+  VT_CHECK(!mel.chunk_num_tokens.empty(),
+           "Dots3NoteForCausalLM encoder: the multimodal item carries mel "
+           "features with no per-chunk lengths. `Dots3NoteAudioProcessor::"
+           "ProcessWaveform` fills both vectors for every waveform it accepts.");
+  const std::vector<float> tower = Dots3NoteAudioForwardChunks(
+      mel.input_features, mel.chunk_num_samples, mel.chunk_num_tokens,
+      /*hop_length=*/160, w.audio, a, vt::GetBackend(queue.device.type));
 
   const int64_t rows =
       width > 0 ? static_cast<int64_t>(tower.size()) / width : 0;
@@ -493,6 +501,48 @@ const ModelFactory kDots3NoteFactory{
 };
 
 }  // namespace
+
+// The GGUF-side half of the arch entry points. Kept in THIS TU, next to the
+// factory guard that throws the same string, so the refusal has one owner and
+// the entrypoint's dispatch borrows it instead of restating it.
+bool IsDots3NoteGguf(const GgufFile& gguf) {
+  const GgufValue* arch = gguf.FindKv("general.architecture");
+  if (arch == nullptr || arch->TypeId() != kGgufString) return false;
+  return std::get<std::string>(arch->v) == kDots3NoteGgufArch;
+}
+
+// WHAT THIS SENTENCE HAD TO STOP SAYING. Until W9a (#2882) this message told
+// the operator that llama.cpp has no `dots3_note` architecture and that there
+// is therefore no upstream converter to reuse. Both halves are false, and this
+// is PRODUCT OUTPUT rather than a record: it is what a user reads on stderr.
+// Verified in a `ggml-org/llama.cpp` clone at `origin/master` = `0ef4d560e`
+// (2026-09-04): `LLM_ARCH_DOTS3NOTE -> "dots3note"` at `src/llama-arch.cpp:114`,
+// merged by `5a32f7b66ef6cfb3e60deea26e3454cc6ad3438c` ("model: add
+// dots3-note", #27060, 2026-08-21, +1412/-9 over 20 files, converter
+// `conversion/dots3.py`) and `54ee5ee643f29abba6852903ddfdb688c2361b5b`
+// ("mtmd: support dots3-note vision+audio", #27524, 2026-08-22), both ancestors
+// of `master`.
+//
+// It also does NOT oversell the new position. Whether this build can READ such
+// a file is W9b/W9c's question and the answer today is no — llama.cpp splits
+// our fused `kv_b_proj` into `attn_k_b`/`attn_v_b`, among other deltas — so the
+// last sentence says exactly that. A refusal that overstates is the same class
+// of defect as one that understates.
+std::string Dots3NoteGgufRefusal() {
+  return
+      "Model architecture Dots3NoteForCausalLM does not support GGUF weights "
+      "yet: the GGUF k-quant arm is OWED to W9 -- both a loader arm and, for "
+      "an artifact that needs one, a converter. Row "
+      "MODEL-MM-dots3-note-dots3-note-for-causal-lm, spec "
+      ".agents/specs/dots3-note.md section 4.19. llama.cpp DOES define this "
+      "architecture -- LLM_ARCH_DOTS3NOTE -> \"dots3note\" in "
+      "ggml-org/llama.cpp src/llama-arch.cpp, merged as "
+      "5a32f7b66ef6cfb3e60deea26e3454cc6ad3438c (\"model: add dots3-note\", "
+      "2026-08-21) and 54ee5ee643f29abba6852903ddfdb688c2361b5b (\"mtmd: "
+      "support dots3-note vision+audio\", 2026-08-22), and published dots3note "
+      "GGUF artifacts exist -- so a file reaching this refusal is a real one. "
+      "This build cannot read it yet.";
+}
 
 REGISTER_VLLM_MODEL(dots3_note, "Dots3NoteForCausalLM", kDots3NoteFactory,
                     kDots3NoteInfo)

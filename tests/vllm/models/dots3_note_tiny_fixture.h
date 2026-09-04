@@ -279,6 +279,31 @@ inline constexpr int64_t kAudioSamples = 8000;
 inline constexpr int64_t kAudioTokens = 7;
 inline constexpr int64_t kAudioStemFrames = 13;
 
+// ── W7b (#2797): the MULTI-CHUNK geometry ──────────────────────────────────
+//
+// The default `a_chunk_seconds = 1` above CANNOT carry a multi-chunk case, and
+// that is a property of the arithmetic rather than of the fixture: 16000 is not
+// a whole number of 1280-sample token strides, so the tower's per-segment sum
+// `sum_i ceil(seg_i / 1280)` and the prompt side's one `ceil(total / 1280)`
+// disagree past one chunk (spec §4.15.3) and the port refuses BY NAME. Two
+// seconds is the smallest chunk that divides — `16000 * cs % 1280 == 0` iff
+// `cs` is EVEN — and it is what the multi-chunk cases set.
+//
+//   chunk = 32000 samples = 200 mel frames = 25 stem rows = 25 token strides
+//   clip  = 80000 samples = 5 s = 2.5 chunks -> 32000, 32000, 16000
+//   rows  = 25, 25, 13 = 63 = ceil(80000 / 1280)
+//
+// THREE chunks so a reversal is not a swap of two halves, and a SHORT last one
+// so the truncation back to `token_len` and the temporal mask on a partly
+// padded chunk are both exercised. A clip that were an exact multiple of the
+// chunk would mask nothing on its last chunk and truncate nothing.
+inline constexpr int64_t kAudioLongChunkSeconds = 2;
+inline constexpr int64_t kAudioLongSamples = 80000;
+inline constexpr int64_t kAudioLongChunks = 3;
+inline constexpr int64_t kAudioLongTokens = 63;
+inline constexpr int64_t kAudioLongFullChunkTokens = 25;
+inline constexpr int64_t kAudioLongLastChunkTokens = 13;
+
 // ── deterministic values ────────────────────────────────────────────────────
 inline uint64_t Mix(uint64_t x) {
   x += 0x9E3779B97F4A7C15ULL;
@@ -879,13 +904,46 @@ inline std::vector<int16_t> FixtureAudioPcm16(int variant) {
   return pcm;
 }
 
-// The same clip as a canonical little-endian PCM16 MONO RIFF/WAVE buffer, which
-// is the ONE container this port decodes (`DecodeWavPcm16Mono`).
-// `sample_rate` and `channels` are parameters so a case can build a
-// deliberately non-conformant file and assert the refusal names W7c.
-inline std::vector<uint8_t> FixtureAudioWav(int variant, int sample_rate = 16000,
-                                            int channels = 1) {
-  const std::vector<int16_t> pcm = FixtureAudioPcm16(variant);
+// The MULTI-CHUNK clip (W7b, #2797): `n` samples of a signal whose content
+// changes across the whole clip, so two different chunks of it are two
+// different waveforms and a concatenation in the wrong ORDER cannot alias with
+// the right one.
+//
+// A SEPARATE GENERATOR rather than a longer `FixtureAudioPcm16`, deliberately:
+// that one's chirp sweeps 200 Hz -> 3200 Hz over ITS 0.5 s, so stretching it to
+// 5 s would either change the 0.5 s clip every W7a case is gated on or sweep
+// past Nyquist. This one scales the sweep to the clip it is asked for.
+inline std::vector<int16_t> FixtureAudioPcm16Long(int variant, int64_t n) {
+  std::vector<int16_t> pcm(static_cast<size_t>(n));
+  const double dur = static_cast<double>(n) / 16000.0;
+  for (int64_t i = 0; i < n; ++i) {
+    const double t = static_cast<double>(i) / 16000.0;
+    double v;
+    if (variant == 0) {
+      // A linear chirp, 200 Hz -> 3200 Hz over the WHOLE clip, so every chunk
+      // sits in a different band.
+      const double f = 200.0 + 3000.0 * t / dur;
+      v = 0.6 * std::sin(2.0 * 3.14159265358979323846 * f * t);
+    } else {
+      // The sweep run the other way, plus a fixed tone: a genuinely different
+      // signal in every chunk and not a shifted copy of variant 0.
+      const double f = 3200.0 - 3000.0 * t / dur;
+      v = 0.4 * std::sin(2.0 * 3.14159265358979323846 * f * t) +
+          0.3 * std::sin(2.0 * 3.14159265358979323846 * 261.63 * t);
+    }
+    const double clipped = v < -1.0 ? -1.0 : (v > 0.999 ? 0.999 : v);
+    pcm[static_cast<size_t>(i)] =
+        static_cast<int16_t>(std::lround(clipped * 32767.0));
+  }
+  return pcm;
+}
+
+// Any PCM16 buffer as a canonical little-endian MONO RIFF/WAVE file. Factored
+// out of `FixtureAudioWav` below by W7b so the multi-chunk clip reaches the
+// served path through the SAME writer, byte for byte, rather than a second one.
+inline std::vector<uint8_t> FixtureWavFromPcm16(const std::vector<int16_t>& pcm,
+                                                int sample_rate = 16000,
+                                                int channels = 1) {
   const uint32_t data_bytes = static_cast<uint32_t>(pcm.size() * 2);
   std::vector<uint8_t> out;
   const auto put_str = [&out](const char* s4) {
@@ -916,11 +974,140 @@ inline std::vector<uint8_t> FixtureAudioWav(int variant, int sample_rate = 16000
   return out;
 }
 
+// The 0.5 s clip as that same container, which is the ONE this port decodes
+// (`DecodeWavPcm16Mono`). `sample_rate` and `channels` are parameters so a case
+// can build a deliberately non-conformant file and assert the refusal names
+// W7c.
+inline std::vector<uint8_t> FixtureAudioWav(int variant, int sample_rate = 16000,
+                                            int channels = 1) {
+  return FixtureWavFromPcm16(FixtureAudioPcm16(variant), sample_rate, channels);
+}
+
+// The MULTI-CHUNK clip as the same container (W7b, #2797).
+inline std::vector<uint8_t> FixtureAudioWavLong(int variant, int64_t n) {
+  return FixtureWavFromPcm16(FixtureAudioPcm16Long(variant, n));
+}
+
+// ── the SAME clip at ANOTHER sample rate (W7c-2, #2828) ─────────────────────
+//
+// `FixtureAudioPcm16` samples its chirp at 16000 for `kAudioSamples` frames,
+// which is 0.5 s. This samples THE SAME CONTINUOUS SIGNAL, from the same
+// closed form, at `sample_rate` for the same 0.5 s — so `sample_rate` frames
+// per second of the identical waveform and NOT a stretched or shifted copy.
+//
+// WHY THE DURATION IS HELD AND NOT THE FRAME COUNT. The resampled length is
+// `ceil(n * 16000 / sample_rate)`, and holding the duration makes that exactly
+// `kAudioSamples` for every rate that divides evenly into the 0.5 s — 44100
+// gives 22050 frames and `ceil(22050 * 160 / 441) == 8000`. So a resampled
+// request expands the SAME 7-token placeholder span as the mono clip every
+// other audio case serves, and the served case can compare the two directly.
+//
+// THAT TOKEN COUNT IS THE ASSERTION A NO-OP RESAMPLE CANNOT SURVIVE: an
+// unresampled 22050-frame waveform expands `ceil(22050 / 1280)` = 18
+// placeholders, not 7, and it does so without any reference to the resampler's
+// values.
+inline std::vector<int16_t> FixtureAudioPcm16AtRate(int variant,
+                                                    int sample_rate) {
+  const int64_t n = kAudioSamples * sample_rate / 16000;
+  std::vector<int16_t> pcm(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    const double t = static_cast<double>(i) / static_cast<double>(sample_rate);
+    double v;
+    if (variant == 0) {
+      const double f = 200.0 + 6000.0 * t;
+      v = 0.6 * std::sin(2.0 * 3.14159265358979323846 * f * t);
+    } else {
+      v = 0.35 * std::sin(2.0 * 3.14159265358979323846 * 440.0 * t) +
+          0.35 * std::sin(2.0 * 3.14159265358979323846 * 523.25 * t);
+    }
+    const double clipped = v < -1.0 ? -1.0 : (v > 0.999 ? 0.999 : v);
+    pcm[static_cast<size_t>(i)] =
+        static_cast<int16_t>(std::lround(clipped * 32767.0));
+  }
+  return pcm;
+}
+
+// That clip as a PCM16 RIFF/WAVE file whose `fmt ` chunk DECLARES the rate,
+// through the same writer every other audio case uses.
+inline std::vector<uint8_t> FixtureAudioWavAtRate(int variant, int sample_rate) {
+  return FixtureWavFromPcm16(FixtureAudioPcm16AtRate(variant, sample_rate),
+                             sample_rate, 1);
+}
+
+// ...and as the decoder would produce it, `int16 / 32768.0`.
+inline std::vector<float> FixtureAudioF32AtRate(int variant, int sample_rate) {
+  const std::vector<int16_t> pcm = FixtureAudioPcm16AtRate(variant, sample_rate);
+  std::vector<float> out(pcm.size());
+  for (size_t i = 0; i < pcm.size(); ++i)
+    out[i] = static_cast<float>(pcm[i]) / 32768.0f;
+  return out;
+}
+
+// ── the STEREO clip (W7c-1, #2813) ──────────────────────────────────────────
+//
+// TWO GENUINELY DIFFERENT CHANNELS WHOSE MEAN IS EXACTLY VARIANT 0. Left is
+// `m + d` and right is `m - d`, where `m` is `FixtureAudioPcm16(0)` — the chirp
+// every W7a case already serves — and `d` is a QUARTER of the two-tone beat of
+// variant 1. So `(L[i] + R[i]) / 2 == m[i]` for every i, with no rounding at
+// all: the sum is `2 * m[i]`, an even integer.
+//
+// WHY THAT CONSTRUCTION AND NOT TWO ARBITRARY SIGNALS. The mean of two
+// arbitrary int16 channels is not an int16, so it could not be fed back through
+// a WAV to compare against. This one makes the EXPECTED mono waveform a clip
+// the suite already knows how to send, which turns "the mean is right" into an
+// equality between two SERVED requests rather than into a tolerance.
+//
+// NO CLIPPING IS POSSIBLE, which matters because a clip would break the
+// equality silently: |m| <= 0.6 * 32767 = 19660 and |d| <= 0.7 * 32767 / 4 =
+// 5734, so |m +- d| <= 25394, well inside int16.
+inline void FixtureAudioPcm16StereoChannels(std::vector<int16_t>* left,
+                                            std::vector<int16_t>* right) {
+  const std::vector<int16_t> m = FixtureAudioPcm16(0);
+  const std::vector<int16_t> beat = FixtureAudioPcm16(1);
+  left->resize(m.size());
+  right->resize(m.size());
+  for (size_t i = 0; i < m.size(); ++i) {
+    const int d = static_cast<int>(beat[i]) / 4;
+    (*left)[i] = static_cast<int16_t>(static_cast<int>(m[i]) + d);
+    (*right)[i] = static_cast<int16_t>(static_cast<int>(m[i]) - d);
+  }
+}
+
+// Those two channels INTERLEAVED, which is the frame order a `data` chunk
+// carries: L0 R0 L1 R1 ... The buffer is 2N int16 for N frames, so the file has
+// the SAME frame count as the mono clip and expands to the same placeholders.
+inline std::vector<int16_t> FixtureAudioPcm16StereoInterleaved() {
+  std::vector<int16_t> l, r;
+  FixtureAudioPcm16StereoChannels(&l, &r);
+  std::vector<int16_t> out(l.size() * 2);
+  for (size_t i = 0; i < l.size(); ++i) {
+    out[2 * i] = l[i];
+    out[2 * i + 1] = r[i];
+  }
+  return out;
+}
+
+// The stereo clip as a 2-channel PCM16 RIFF/WAVE file, through the SAME writer
+// every other audio case uses.
+inline std::vector<uint8_t> FixtureAudioWavStereo() {
+  return FixtureWavFromPcm16(FixtureAudioPcm16StereoInterleaved(), 16000,
+                             /*channels=*/2);
+}
+
 // The clip as the DECODER would produce it: `int16 / 32768.0`. Used by the
 // tower gate so its reference is driven from the same quantized samples the
 // served path sees, rather than from the float signal before rounding.
 inline std::vector<float> FixtureAudioF32(int variant) {
   const std::vector<int16_t> pcm = FixtureAudioPcm16(variant);
+  std::vector<float> out(pcm.size());
+  for (size_t i = 0; i < pcm.size(); ++i)
+    out[i] = static_cast<float>(pcm[i]) / 32768.0f;
+  return out;
+}
+
+// The MULTI-CHUNK clip as the decoder would produce it (W7b, #2797).
+inline std::vector<float> FixtureAudioLongF32(int variant, int64_t n) {
+  const std::vector<int16_t> pcm = FixtureAudioPcm16Long(variant, n);
   std::vector<float> out(pcm.size());
   for (size_t i = 0; i < pcm.size(); ++i)
     out[i] = static_cast<float>(pcm[i]) / 32768.0f;

@@ -29,6 +29,8 @@ RejectionSamplerDeviceOutput::RejectionSamplerDeviceOutput(
       target_argmax_(other.target_argmax_),
       num_reqs_(other.num_reqs_),
       width_(other.width_),
+      verify_q_(other.verify_q_),
+      copy_q_(other.copy_q_),
       draft_(std::move(other.draft_)),
       cu_(std::move(other.cu_)) {
   other.backend_ = nullptr;
@@ -37,6 +39,9 @@ RejectionSamplerDeviceOutput::RejectionSamplerDeviceOutput(
   other.target_argmax_ = nullptr;
   other.num_reqs_ = 0;
   other.width_ = 0;
+  // The moved-from object owns nothing, so it must not drain either.
+  other.verify_q_ = nullptr;
+  other.copy_q_ = nullptr;
 }
 
 RejectionSamplerDeviceOutput& RejectionSamplerDeviceOutput::operator=(
@@ -50,6 +55,8 @@ RejectionSamplerDeviceOutput& RejectionSamplerDeviceOutput::operator=(
   target_argmax_ = other.target_argmax_;
   num_reqs_ = other.num_reqs_;
   width_ = other.width_;
+  verify_q_ = other.verify_q_;
+  copy_q_ = other.copy_q_;
   draft_ = std::move(other.draft_);
   cu_ = std::move(other.cu_);
   other.backend_ = nullptr;
@@ -58,11 +65,27 @@ RejectionSamplerDeviceOutput& RejectionSamplerDeviceOutput::operator=(
   other.target_argmax_ = nullptr;
   other.num_reqs_ = 0;
   other.width_ = 0;
+  other.verify_q_ = nullptr;
+  other.copy_q_ = nullptr;
   return *this;
 }
 
 void RejectionSamplerDeviceOutput::Release() {
   if (backend_ != nullptr) {
+    // DRAIN BEFORE FREE, and the header says why at length. Short version: the
+    // five owned buffers are read and written by kernels and copies that are
+    // still queued when `verify` returns, so freeing them is only safe after the
+    // caller has waited. Nothing in the type system makes a caller wait, and the
+    // one caller that matters destroys this object in a block scope
+    // (`GPUModelRunner::sample_tokens_async`) whose wait A2-4 is about to move
+    // out. So the destructor waits for the object's OWN work: the queue the
+    // accept walk was issued on, plus the queue of the last `CopyToHost` when
+    // that is a different one. A caller that already waited pays a drain on an
+    // idle queue; a caller that did not pays a real one instead of emitting a
+    // wrong accept prefix that no token gate in this tree can see (#1366).
+    // On CPU both calls are the base no-op, so this changes nothing here.
+    if (verify_q_ != nullptr) backend_->Synchronize(*verify_q_);
+    if (copy_q_ != nullptr && copy_q_ != verify_q_) backend_->Synchronize(*copy_q_);
     if (sampled_ != nullptr) backend_->Free(sampled_);
     if (num_sampled_ != nullptr) backend_->Free(num_sampled_);
     // The argmax scratch is freed HERE and nowhere else. It was a process-global
@@ -73,6 +96,8 @@ void RejectionSamplerDeviceOutput::Release() {
   sampled_ = nullptr;
   num_sampled_ = nullptr;
   target_argmax_ = nullptr;
+  verify_q_ = nullptr;
+  copy_q_ = nullptr;
   // The staging goes with them: it is only alive because the kernel reads it.
   draft_.reset();
   cu_.reset();
@@ -81,6 +106,9 @@ void RejectionSamplerDeviceOutput::Release() {
 void RejectionSamplerDeviceOutput::CopyToHost(vt::Queue& q, int32_t* sampled_out,
                                               int32_t* num_sampled_out) const {
   if (num_reqs_ == 0 || backend_ == nullptr) return;
+  // Recorded so the destructor can drain this queue too when the caller frees
+  // the object before waiting (see Release).
+  copy_q_ = &q;
   // Two copies, NO drain (SPEC-DFLASH2 W8 #1837 kept the single-drain property;
   // A2-2 moves the drain itself out to the caller). Both buffers come off the
   // same kernel on the same queue, so ONE wait — wherever the caller puts it —
@@ -154,6 +182,7 @@ RejectionSamplerDeviceOutput RejectionSampler::verify(
       vt::Tensor::Contiguous(dev_out.num_sampled_, vt::DType::kI32, dev, {num_reqs});
   vt::Tensor target_argmax_t =
       vt::Tensor::Contiguous(dev_out.target_argmax_, vt::DType::kI32, dev, {num_logits});
+  dev_out.verify_q_ = &q;
   vt::GreedyRejectionSample(q, sampled_t, num_sampled_t, target_argmax_t, logits,
                             dev_out.draft_->tensor(), dev_out.cu_->tensor());
   // NOTHING is copied and NO queue is waited on here. That is the whole split,

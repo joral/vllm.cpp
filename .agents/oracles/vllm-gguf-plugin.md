@@ -7,10 +7,13 @@ GGUF support was deprecated in vLLM (`vllm-project/vllm#39583`) and migrated to
 where GGUF support went, `:12` gives the install line and `:19` the serve
 recipe. So a GGUF path that this plugin **serves** is a path the PRIMARY oracle
 serves, and `AGENTS.md` §"When vLLM has no implementation" would not admit a
-secondary oracle for it. That consequence is conditional on the serving, and
-this record does not yet establish it: `gateable = no` below, no token, and
-`llama-cpp` remains the admissible denominator for the Q4_K_M arm until it
-does. See "What this record does NOT license".
+secondary oracle for it. That consequence is conditional on the serving, and it
+is now established on exactly one device and no other: see "It has emitted
+tokens, on gfx1151" below. `gateable = no` stays as recorded, because the
+registry value is one flag for the whole oracle and the CUDA measurement
+[#2624](https://github.com/mudler/vllm.cpp/issues/2624) owes is still owed.
+`llama-cpp` remains the admissible denominator for the Q4_K_M arm. See "What
+this record does NOT license".
 
 ```oracle-pin
 id = vllm-gguf-plugin
@@ -274,10 +277,38 @@ The measurement is owed by
 [#2624](https://github.com/mudler/vllm.cpp/issues/2624) and the method is in
 [`../specs/oracle-vllm-gguf-qwen35.md`](../specs/oracle-vllm-gguf-qwen35.md).
 
+## It has emitted tokens, on gfx1151
+
+This record was written while no leg of this plugin had produced a token, and
+that is no longer true. On 2026-09-03, inside `rc` leases on `strix:gpu0`
+(`gfx1151`, RDNA 3.5), this plugin at **this exact pin**
+`d4c1f0d082fc7cd4350da56689109a01c1f29d6c`, under the pinned vLLM
+`5559679229`, loaded the gated 17,106,775,008-byte Qwen3.8-27B Q4_K_M GGUF and
+generated 48 greedy tokens for each of the six gate prompts, in four legs, two
+per configuration, byte-identical within each configuration. Evidence:
+[`../../docs/bench-evidence/oracle-vllm-gfx1151-20260903.md`](../../docs/bench-evidence/oracle-vllm-gfx1151-20260903.md),
+issue [#2740](https://github.com/mudler/vllm.cpp/issues/2740).
+
+Read the scope narrowly. It says the plugin serves this checkpoint on one AMD
+board. It says nothing about `thor:gpu0` or `dgx:gpu0`: the CUDA question, the
+`cudaErrorNoKernelImageForDevice` attribution above, and the token #2624 owes
+are all untouched by an AMD run, and `gateable` stays `no` until that
+measurement exists.
+
 ## What this record does NOT license
 
 It does not move the Q4_K_M arm's token gate off llama.cpp. That gate reads
 `FAIL` against `b10451` ([#2534](https://github.com/mudler/vllm.cpp/issues/2534),
 `docs/bench-evidence/qwen38-27b-q4km-token-gate-20260823.md`) and stays exactly
-as recorded until this oracle is gateable and a paired run exists. A denominator
-that has never emitted a token cannot replace one that has.
+as recorded. Nothing in #2740 rescores it, and nothing here does either.
+
+The gfx1151 tokens above do not by themselves re-declare that gate. What they
+remove is one argument for keeping it: a denominator that has never emitted a
+token cannot replace one that has, and on this one device that objection no
+longer applies. Re-declaring the gate is a spec-and-fresh-review job and belongs
+to [#2546](https://github.com/mudler/vllm.cpp/issues/2546). It is worth stating
+plainly what #2740 measured and what it did not: on the same board, the same
+artifact and the same six prompts, the pinned vLLM diverges from llama.cpp
+`b10451` on 3 of 6 compiled and 4 of 6 eager, against our own ROCm arm's 3 of 6.
+Two engines disagreeing with a third shows the third is not ground truth. It
+does not show either of the two is right.
