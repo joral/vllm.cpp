@@ -79,8 +79,9 @@
 #include <string>
 #include <vector>
 
-#include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
+#include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor, Fp8BlockWeight
 #include "vt/backend.h"
+#include "vt/device.h"  // vt::DeviceType
 
 namespace vllm {
 
@@ -142,6 +143,25 @@ struct Dots3NoteVisionParams {
   std::string router_scoring_func = "sigmoid";
   double router_scale = 1.0;
 
+  // `enable_fp8_moe` (`vision.py:69` @ `9035151d6`), the key that chooses
+  // between upstream's TWO pyramid-MoE classes:
+  //
+  //   mlp_cls = MoESwiGLUFFNFP8 if config.enable_fp8_moe else MoESwiGLUFFN
+  //                                                        (`vision.py:369`)
+  //
+  // TRUE is `DotsMoEVitConfig.__init__`'s own default, and it is the default
+  // here for that reason and no other. The RELEASED `vision_config` does not
+  // carry the key -- verified on `dots-studio/dots3-note-prev`, on the `-fp8`
+  // sibling, and in this repo's committed fixture -- so the default applies and
+  // upstream selects the FP8 class on the checkpoint this tree already serves.
+  // W6b ported the OTHER class and nothing here read the key at all; #2881 is
+  // that finding.
+  //
+  // Reading it is NOT the same as taking that branch, because upstream's FP8
+  // class cannot execute on the released geometry -- see
+  // `ResolveDots3NoteVisionMoeArm`, which is where that is decided and said.
+  bool enable_fp8_moe = true;
+
   // The adapter (`vision.py:419-496`). `patch_merger` is the arm the released
   // checkpoint selects; `pixel_shuffle_mlp` is a DIFFERENT token order from the
   // same pixels AND a different state dict, and W6b implements it too.
@@ -188,6 +208,88 @@ struct Dots3NoteVisionParams {
   }
   int64_t num_moe_blocks() const { return num_hidden_layers - num_dense_blocks(); }
 };
+
+// WHICH pyramid-MoE class this tower runs, and WHY -- `vision.py:363-374` @
+// `9035151d6` asked here rather than at every use site.
+//
+// Upstream's selection is one line (`mlp_cls = MoESwiGLUFFNFP8 if
+// config.enable_fp8_moe else MoESwiGLUFFN`, `:369`), and it is not the whole
+// answer, because the class it names by default DOES NOT RUN on the released
+// checkpoint. `MoESwiGLUFFNFP8.forward` calls `note_vision_fused_moe_fp8`,
+// whose second activation quantization is over a width of
+// `moe_intermediate_size` (`vision_moe.py:70-75`, :119-123`, and `:47` where
+// `intermediate_size` is `w13.shape[1]` = twice the expert width because
+// `vision.py:258` concatenates fc1 and fc3), in groups of `_BLOCK_SHAPE[1]`
+// = 128 (`vision_moe.py:22`), and `per_token_group_quant_fp8` opens with
+//
+//   assert x.shape[-1] % group_size == 0     (fp8_utils.py:563-566 @ 9035151d6)
+//
+// The released `moe_intermediate_size` is 2112 and `2112 % 128 == 64`, so
+// upstream raises before its first GEMM. The FIRST quantization in the same
+// function is safe -- it quantizes at `embed_dim` 1536 -- so the failure is
+// specific to the expert width.
+//
+// THREE STATES, NEVER A FOURTH:
+//   `enable_fp8_moe` false                  -> bf16, `upstream_raises` empty.
+//       Upstream's own other branch, and W6b's arm, unchanged.
+//   true, a width not a multiple of 128     -> bf16, `upstream_raises` set.
+//       A RECORDED DIVERGENCE and not a silent fallback: upstream raises here
+//       and this tree answers. `MaterializeDots3NoteVision` writes the notice
+//       to stderr once, the gate asserts its text for the released config, and
+//       reversing the polarity is a one-line edit in one function.
+//   true, both widths 128-aligned           -> fp8.
+//
+// The two widths are `embed_dim` (the FIRST quantization, and the K of the
+// gate/up GEMM) and `moe_intermediate_size` (the SECOND, and the K of the down
+// GEMM). Both are checked because both reach a `QuantFp8Group` whose K must
+// divide the group, which is upstream's own asymmetry mirrored:
+// `MatmulFp8BlockScaledD` tiles the WEIGHT with cdiv and demands divisibility
+// of the ACTIVATION.
+struct Dots3NoteVisionMoeArm {
+  // `MoESwiGLUFFNFP8` was selected AND can execute here.
+  bool fp8 = false;
+  // Non-empty exactly when `enable_fp8_moe` selected the FP8 class and this
+  // tower runs the bf16 one anyway. Names the width, the assertion and the
+  // anchor.
+  std::string upstream_raises;
+};
+
+Dots3NoteVisionMoeArm ResolveDots3NoteVisionMoeArm(
+    const Dots3NoteVisionParams& v);
+
+// `_per_block_cast_to_fp8_padded` (`vision.py:225-239` @ `9035151d6`) over
+// `per_block_cast_to_fp8` (`vllm/utils/deep_gemm.py:660-681`, itself DeepGEMM's
+// `deep_gemm/utils/math.py`), as a WEIGHT-side caster.
+//
+// `w` is a raw-NK `[N, K]` bf16 torch Linear weight. The result is upstream's
+// pair: `packed` the e4m3fn bytes sliced back to `[N, K]`, `scale` the f32
+// `[cdiv(N,128), cdiv(K,128)]` grid, `block_n`/`block_k` both 128. It is an
+// `Fp8BlockWeight` because that is what `layers::Fp8BlockLinearMethod` and
+// `dense_fp8_block::MatmulFp8BlockScaledD` consume, so the FP8 arm rides the
+// shared block-FP8 seams rather than a caster-specific path.
+//
+// THE THREE CONSTANTS THAT ARE NOT `vt::QuantFp8Group`'s, because a reader who
+// assumes the two quantizers agree will get all three wrong:
+//   * the amax floor is `clamp(1e-4)` (`deep_gemm.py:674`), NOT the `1e-10` the
+//     ACTIVATION quantizer seeds its reduction with (`per_token_group_quant.cu
+//     :47`). Two different upstream kernels, two different constants.
+//   * the scaling is a RECIPROCAL MULTIPLY, `x * (1.0 / sf)`
+//     (`deep_gemm.py:678`), where `QuantFp8Group` ships a DIVIDE and
+//     `include/vt/ops.h` says at length not to "correct" that divide into a
+//     multiply. The polarity is reversed here, for the same reason: mirror what
+//     upstream ships at THIS site.
+//   * `use_ue8m0` is FALSE (`vision.py:237`), so the scales are FP32 and are
+//     never rounded onto the e8m0 lattice.
+//
+// THE PADDING CANNOT MOVE A SCALE and is ported anyway. `x_padded` is
+// zero-filled and amax is a max of absolute values, so a padded lane never
+// raises a block's amax; the caster is therefore numerically identical to a
+// straight cdiv-tiled cast of the unpadded weight. It is written as upstream
+// writes it because reading the pad as droppable is one edit away from also
+// dropping the `cdiv` that owns the ragged final block, which is not
+// droppable: the released expert width 2112 has a final block of 64 rows.
+Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
+                                           int64_t k);
 
 // Resolve + validate `config.json`'s `vision_config`. Returns `present=false`
 // when the key is absent. Throws (VT_CHECK) naming the key on a value this arm
@@ -268,6 +370,38 @@ struct Dots3NoteVisionMoeWeights {
   std::vector<OwnedTensor> expert_gate;  // num_routed x fc1 [Im, E]
   std::vector<OwnedTensor> expert_up;    // num_routed x fc3 [Im, E]
   std::vector<OwnedTensor> expert_down;  // num_routed x fc2 [E, Im]
+
+  // ── the FP8 ARM's operands (W9d, #2881) ──────────────────────────────────
+  // `MoESwiGLUFFNFP8.process_weights_after_loading` (`vision.py:245-283` @
+  // `9035151d6`) casts the bf16 experts to block FP8 AT LOAD and then
+  // `del self.experts`. Both halves are mirrored: these are populated only when
+  // `Dots3NoteVisionMoeArm::fp8`, and the three bf16 vectors above are CLEARED
+  // in the same step, so the FP8 tower does not carry two copies of 608
+  // experts. On the bf16 arm these stay empty and nothing above moves.
+  //
+  // UPSTREAM'S `w13` IS A MERGE, AND IT RIDES THE MERGED SEAM RATHER THAN A
+  // HAND-BUILT OPERAND. `process_weights_after_loading` casts fc1 and fc3
+  // SEPARATELY and then `torch.cat((w1, w3), dim=0)` (`vision.py:255-259`), so
+  // the arm runs ONE `[2Im, E]` GEMM and a SwiGLU tail. That is exactly
+  // `layers::Fp8BlockMlpGateUpMethod` over `vt::kFp8BlockGateUpSwiGLU`, which
+  // is `MlpGateUpMethodBase` and `MergedGemmGroup` -- the two seams AGENTS.md
+  // names for a mergeable MLP pair. The shards are therefore kept SPLIT here
+  // and `dense_fp8_block::ResidentFp8BlockMerged` concatenates them once,
+  // lazily, on the device; nothing concatenates fp8 bytes by hand.
+  //
+  // The order matters and is upstream's: cast each half, then merge. A merged
+  // bf16 operand cast as one piece is a DIFFERENT scale grid whenever `Im` is
+  // not a multiple of `block_n`, because a block scale is indexed by
+  // `n / block_n`. The merged seam refuses exactly that case by name
+  // (`dense_fp8_block::CheckFp8BlockMergeable`), and `MoESwiGLUFFNFP8` never
+  // reaches it here because `ResolveDots3NoteVisionMoeArm` already sent a
+  // non-128 `moe_intermediate_size` to the bf16 class.
+  std::vector<Fp8BlockWeight> expert_gate_fp8;  // num_routed x fc1 [Im, E]
+  std::vector<Fp8BlockWeight> expert_up_fp8;    // num_routed x fc3 [Im, E]
+  std::vector<Fp8BlockWeight> expert_down_fp8;  // num_routed x fc2 [E, Im]
+  // The lazily-built merged `gate_up` device operand, one per expert. Mutable
+  // state on a const weight, exactly as `Fp8BlockWeight::d_packed` is.
+  std::vector<Fp8BlockMergedResident> expert_gateup_merged;
 };
 
 struct Dots3NoteVisionBlockWeights {
@@ -300,6 +434,10 @@ struct Dots3NoteVisionBlockWeights {
 
 struct Dots3NoteVisionWeights {
   bool present = false;
+  // Which MoE class this tower runs (`vision.py:369`), resolved ONCE at
+  // materialization from the params so the forward cannot ask a different
+  // question than the loader answered.
+  Dots3NoteVisionMoeArm moe_arm;
   OwnedTensor patch_proj_w;  // [E, C*tp*p*p]  (on disk [E, C, p, p])
   OwnedTensor patch_proj_b;  // [E]
   OwnedTensor patch_norm;    // [E]
@@ -370,6 +508,17 @@ struct Dots3NoteVisionMoeRoute {
   std::vector<float> logits;    // [L, num_routed] f32, straight off the router GEMM
   std::vector<int32_t> ids;     // [L, top_k] the SELECTED expert ids
   std::vector<float> weights;   // [L, top_k] f32, post-renormalize, post-scale
+  // THE COMBINE'S DENOMINATOR, per token, and the reason this field exists:
+  // the two upstream classes divide by DIFFERENT things and no output
+  // tolerance separates them on a fixture where the two happen to agree.
+  // `MoESwiGLUFFN` accumulates `aggregated_gate` in the ACTIVATION dtype
+  // (`vision.py:188`, bf16) over addends already rounded to bf16 (`:200`) and
+  // adds `1e-9` (`:216`); `MoESwiGLUFFNFP8` takes `topk_weights.sum(-1)` in
+  // F32 and `clamp_min(1e-9)` (`:314`). Captured so the gate can assert WHICH
+  // one this arm took and print the margin between them.
+  std::vector<float> denominator;  // [L] f32
+  // True when this block ran `MoESwiGLUFFNFP8`.
+  bool fp8 = false;
 };
 
 // Optional intermediate capture, for the unit gate only. Production passes
