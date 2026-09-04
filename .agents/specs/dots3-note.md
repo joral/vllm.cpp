@@ -7920,6 +7920,254 @@ still true that no test here can verify a claim about another repository
 be gated by nothing. The measured statement is "the two doors that exist cannot
 drift", and it is now that sentence rather than the earlier one.
 
+### 4.20 W9d reads `enable_fp8_moe`, and finds the class upstream selects cannot run
+
+**Issue: [#2881](https://github.com/mudler/vllm.cpp/issues/2881). Brick: W9d,
+the VISION half of W9.** This slice does two things. It makes the tree read
+`vision_config.enable_fp8_moe` — the key that selects between upstream's two
+vision-MoE classes and which this tree had never read — and it ports the FP8
+class those two words select. It also corrects #2881's own premise, because
+running the port against the released geometry established something the issue
+could not: **on `dots-studio/dots3-note-prev` the class upstream selects
+by default cannot execute at all.** Both halves are below, the correction first,
+because it changes what the rest of the slice is for.
+
+#### 4.20.1 The finding, and its anchors
+
+`DotsMoEVitConfig.__init__` defaults `enable_fp8_moe` to **true**
+(`nvidia/vision.py:69` @ `9035151d6`, with the comment `# If True, use FP8 MoE
+implementation`), and `MoEVisionBlock.__init__` selects on it:
+
+```python
+# nvidia/vision.py:369 @ 9035151d6
+mlp_cls = MoESwiGLUFFNFP8 if config.enable_fp8_moe else MoESwiGLUFFN
+```
+
+The config is built from the raw `config.json` `vision_config` dict verbatim —
+`nvidia/multimodal.py:116` is `DotsMoEVitModel(DotsMoEVitConfig(**vision_config_dict))`,
+with no key rewritten and nothing padded. The released `vision_config` does not
+carry `enable_fp8_moe` (verified again here against the committed fixture
+`tests/vllm/models/fixtures/dots3_note_prev/config.json`), so the constructor
+default applies and upstream builds `MoESwiGLUFFNFP8` for all 17 pyramid blocks.
+That much is #2881's finding and it is confirmed.
+
+**What #2881 could not say is what that class does when it runs.** It runs
+`note_vision_fused_moe_fp8` (`nvidia/vision_moe.py:25-149`), whose second
+activation quantization is
+
+```python
+# nvidia/vision_moe.py:119-123 @ 9035151d6
+quantized_activated, activated_scale = per_token_group_quant_fp8(
+    activated, _BLOCK_SHAPE[1], use_ue8m0=False,
+)
+```
+
+`activated` is `[num_tokens * topk, intermediate_size // 2]`
+(`vision_moe.py:70-75`), and `intermediate_size` is `w13.shape[1]`
+(`vision_moe.py:47`), which is `2 * moe_intermediate_size` because
+`process_weights_after_loading` concatenates `fc1` and `fc3` along dim 0
+(`vision.py:258`). So the quantized width is exactly `moe_intermediate_size`.
+`_BLOCK_SHAPE` is `[128, 128]` (`vision_moe.py:22`), and
+`per_token_group_quant_fp8` opens with
+
+```python
+# vllm/model_executor/layers/quantization/utils/fp8_utils.py:563-566 @ 9035151d6
+assert x.shape[-1] % group_size == 0, (
+    f"the last dimension of `x` {x.shape[-1]} must be divisible "
+    f"by `group_size` {group_size}"
+)
+```
+
+The released `vision_config` sets `moe_intermediate_size = 2112`, and
+`2112 % 128 == 64`. **Upstream's default vision MoE therefore raises
+`AssertionError` at the first routed block of the first image**, before any
+GEMM. The first quantization in the same function is safe — it quantizes
+`hidden_states` at `embed_dim = 1536`, and `1536 % 128 == 0` — so the failure is
+specific to the expert width and to nothing else in the config.
+
+This is **source-derived, not run**. §6.4 option B stands: no oracle for this
+model runs on any hardware this project owns, and the vLLM import chain in the
+local clone does not resolve here either (`ModuleNotFoundError: No module named
+'zmq'` on `vllm.model_executor`), so `per_token_group_quant_fp8` was not
+executed on either side. What is established is the assertion's text, the width
+that reaches it, and the arithmetic `2112 % 128 == 64`. None of those needs a
+run, and none of them is a parity claim.
+
+**What follows for W6b.** #2881 reads as "W6b may have ported the wrong class".
+On the released checkpoint the answer is no: the class W6b ported,
+`MoESwiGLUFFN`, is upstream's own `enable_fp8_moe=False` branch and it is the
+only one of the two that computes anything on this geometry. R5 and §7's W9
+entry were wrong about WHY the FP8 formula is out of reach — they said the
+checkpoint carries no scale tensors, and #2881 correctly answered that the
+formula is selected by a config default rather than by the checkpoint's
+tensors — but the conclusion they reached is right for a reason neither
+document had. §8's R5 is corrected in place below rather than deleted, because
+the memory-format obligation it names is undiminished.
+
+#### 4.20.2 What W9d ships
+
+1. **The config key.** `Dots3NoteVisionParams::enable_fp8_moe`, default `true`,
+   which is `vision.py:69`'s own default and not a value chosen here. Every
+   load of every dots3-note checkpoint now reads it.
+
+2. **The class selection, as a resolved value.**
+   `ResolveDots3NoteVisionMoeArm` answers `vision.py:369` and, when the answer
+   is the FP8 class, whether this build can execute what that class does. It
+   returns three states and never a fourth:
+   - `enable_fp8_moe` false → the bf16 class, no notice. This is upstream's
+     other branch and W6b's arm, unchanged byte for byte.
+   - `enable_fp8_moe` true and `embed_dim` or `moe_intermediate_size` not a
+     multiple of 128 → the bf16 class, **with a notice naming
+     `fp8_utils.py:563-566` and the width that fails it.** This is the released
+     checkpoint's state.
+   - `enable_fp8_moe` true and both widths 128-aligned → the FP8 class.
+
+   The middle state is a **recorded divergence and not a silent fallback**: it
+   is a value on the weights, the served checkpoint's notice text is asserted
+   verbatim by the gate, and it is written to `stderr` once at materialization
+   so an operator sees it without reading this file. It is a divergence because
+   upstream raises there and this tree answers; the alternative is to refuse an
+   image request that W6b serves correctly today, which trades a working
+   capability for an upstream defect. Whoever disagrees with that polarity
+   should reverse it in one place — `ResolveDots3NoteVisionMoeArm` — and the
+   gate will tell them what moved.
+
+3. **The weight-side caster.** `Dots3NoteVisionBlockCastFp8` is
+   `_per_block_cast_to_fp8_padded` (`vision.py:225-239`) over
+   `per_block_cast_to_fp8` (`vllm/utils/deep_gemm.py:660-681`, itself a copy of
+   DeepGEMM's `deep_gemm/utils/math.py`), in upstream's own order and with
+   upstream's own constants: zero-pad both axes up to a multiple of 128, amax
+   over each `128x128` block in **f32**, `clamp(1e-4)`, `sf = amax / 448`,
+   **multiply by the reciprocal** `x * (1.0 / sf)` rather than divide, round
+   once to e4m3fn, and return the packed bytes sliced back to the unpadded
+   `[N, K]` beside an f32 `[cdiv(N,128), cdiv(K,128)]` scale grid.
+
+   Three of those are places a plausible rewrite would differ and the byte gate
+   would not forgive: the `1e-4` amax floor is not `QuantFp8Group`'s `1e-10`
+   (that is the ACTIVATION quantizer and a different upstream kernel); the
+   reciprocal multiply is not the divide `QuantFp8Group` ships, and this file's
+   own note on that op says why a divide there must not be "corrected" into a
+   multiply — here upstream ships the multiply and the polarity is reversed;
+   and the padding cannot be dropped even though it provably cannot move a
+   scale, because reading it as droppable is one edit away from also dropping
+   the `cdiv` that owns the ragged final block.
+
+   `use_ue8m0` is **false** at this call site and at both `vision_moe.py` sites
+   (`vision.py:237`, `vision_moe.py:80`, `:122`), so no e8m0 rounding is applied
+   anywhere in this arm. §4.20.5 corrects the `## Owed` entry that said
+   otherwise.
+
+4. **The forward.** `MoESwiGLUFFNFP8.forward` (`vision.py:285-315`) with the
+   expert GEMMs on the shared block-FP8 seams — `layers::Fp8BlockLinearMethod`
+   over `dense_fp8_block::MatmulFp8BlockScaledD` — and the combine's
+   **`clamp_min` denominator**, which is the one arithmetic difference from the
+   bf16 arm that no shared-helper comparison can fake. §4.20.3 measures it.
+
+5. **The refusals.** A device with no block-scaled GEMM is refused by name
+   through the shared `RefuseUnrunnableFp8BlockWeight`, which now also names the
+   arch cell that decides it. The LANGUAGE blockwise arm and the AUDIO FP8 arm
+   are refused permanently and by name, with their unblocking conditions
+   (§4.20.6).
+
+#### 4.20.3 The three instruments, and what none of them is
+
+There is no oracle. Nothing below is compared against vLLM, nothing was run on
+either side, and the numeric size of any divergence between the two upstream
+classes is **unmeasured**. What the three instruments establish is that the port
+takes upstream's class and upstream's arithmetic, and that each defect they were
+built for is detected.
+
+**G1 — a dtype and memory-format assertion, not a value one.** The remedy
+[porting.md](../porting.md) names for exactly this shape. The caster's output is
+asserted as bytes: weight scales f32 with shape `[cdiv(N,128), cdiv(K,128)]`,
+activation scales f32 `[T, K/128]`, the packed weight exactly `N*K` bytes, and
+**no e8m0 rounding anywhere** — every scale is checked against the e8m0 lattice
+and required NOT to sit on it beyond what chance allows. `tests/vt/
+test_ops_quant_fp8_group_cpu.cpp` G1 is the in-tree model for the form. A value
+gate cannot see an inserted e8m0 round; this one can, and the mutation table
+proves it.
+
+**G2 — an independent double-precision reference**, `ref_vision_fp8`, of
+`_per_block_cast_to_fp8_padded` and of `note_vision_fused_moe_fp8`'s two-GEMM
+body, sharing no helper with the implementation. It is read by the **existing**
+run-time independence instrument rather than a second one: W9d extends
+`QualifiedNamesIn` to its namespace, for the same reason W7b, W7c-2 and W8a
+extended it to theirs — reference code the instrument does not read is reference
+code whose independence nothing measures. Its counts are printed and asserted.
+
+**G3 — the discriminating A/B, and the load-bearing case.** The two upstream
+forwards divide by different things:
+
+| | denominator | accumulated in |
+|---|---|---|
+| `MoESwiGLUFFN` (`vision.py:215-217`) | `aggregated_gate + 1e-9` | **bf16** — `torch.zeros(num_tokens, dtype=x.dtype)` at `:188`, and the addends are `(routed_weights * router_scale).to(x_flat.dtype)` at `:200` |
+| `MoESwiGLUFFNFP8` (`vision.py:314`) | `topk_weights.sum(-1).clamp_min(1e-9)` | **f32** — `topk_weights` is never cast |
+
+At `router_scale = 1` the two agree to the last bf16 bit on almost any weights,
+because a normalized top-2 pair sums to 1.0 and bf16's ULP at 1.0 is `2^-7`,
+which swallows the rounding of both addends. The two therefore separate only at
+a `router_scale` whose bf16 accumulation lands off the f32 sum, and the fixture
+searches for one rather than assuming it: at `router_scale = 2.05` a `0.65/0.35`
+split gives `D_bf16 = 2.0625` against `D_f32 = 2.05`, a **6.10e-3 relative**
+gap. The gate REQUIREs the measured margin to exceed its own tolerance by a
+stated factor before it asserts anything, so a fixture that stopped
+discriminating fails loudly instead of passing vacuously.
+
+The case then asserts that the FP8 arm's output matches the reference computed
+with the **f32 `clamp_min`** denominator and differs from the reference computed
+with the **bf16** one. That is the guarantee a shared-helper comparison cannot
+fake, and it is what mutation M2 below moves.
+
+#### 4.20.4 Reachability
+
+The production entry point is `ApiServer::handle_chat_completions` on the
+default configuration.
+
+- The **released geometry** reaches the parse, the resolution, the notice and
+  the bf16 arm on every served image. Its served answer is unchanged from W6b's,
+  which is asserted rather than assumed.
+- The **FP8 arm** is reached from the same entry point on a served checkpoint
+  whose vision tower is 128-aligned. No published checkpoint is, so the gate
+  builds one, exactly as every other brick on this row gates its arm on a
+  synthetic tower served through the real `ApiServer`.
+
+Each mutation below is RED-first, restored byte for byte, and reported with the
+binary sha AND the case counts — a changed sha alone does not prove a mutation
+reached the code, and this row has had a failed build read as a pass and an
+inert mutation read as one the tests survived.
+
+#### 4.20.5 Two record corrections
+
+**R5's owner and its reason.** R5 said the vision MoE's FP32 activation scales
+are out of W6's reach because the released checkpoint ships no scale tensors.
+#2881 answered that the FP8 formula is selected by a config default and not by
+the checkpoint's tensors, which is correct. W9d adds the part neither had: on
+the released `moe_intermediate_size` the selected class raises. The risk is
+**not waived** — its memory-format obligation binds this brick, and G1 is how
+W9d discharges it — but its owner is now W9d and its reason is §4.20.1.
+
+**`use_ue8m0` does NOT bite the vision arm.** The `## Owed` entry recorded at W5
+says it "probably does bite at W9, because upstream's blockwise-FP8 MoE routes
+through DeepGEMM with e8m0 scales". That is wrong for the vision arm and the
+entry now says so: upstream passes `use_ue8m0=False` at all three vision call
+sites (`vision.py:237`, `vision_moe.py:80`, `:122`), and
+`note_vision_fused_moe_fp8`'s own docstring states the point of the function is
+that this encoder keeps FP32 scales instead of rounding to E8M0.
+`vt::QuantFp8Group` is already that FP32-scale form. The LANGUAGE MoE's DeepGEMM
+path is a separate and still unresolved question, and the entry is narrowed to
+it rather than deleted.
+
+#### 4.20.6 What W9d refuses, permanently and by name
+
+- **The LANGUAGE blockwise-FP8 arm.** No host here holds 298.67 GB (§6.2), and
+  no `vt` grouped block-FP8 MoE op exists, so there is neither a checkpoint to
+  read nor an op to route it through. Refused by name; the unblocking condition
+  is a `vt` grouped block-FP8 MoE op AND a host that can hold the checkpoint,
+  and until both exist this is a permanent `## Owed` refusal rather than a
+  schedulable slice.
+- **The AUDIO FP8 arm.** Nothing published ships one — the released audio tower
+  is all BF16 (§4.14) — so there is no artifact to gate against.
+
 ---
 
 ## 5. Gates
@@ -8488,15 +8736,22 @@ dispatchable in order, under the constraints that answer imposes.
   `scripts/check-surface-coverage.py`. It must serve Qwen3-VL as well or it is
   a per-model ABI, so it is a tree-wide row and not a dots3-note brick.
 - **W9 — quantized arms.** Blockwise FP8 and the owed GGUF k-quant arm +
-  converter. **The vision MoE's FP32-scale FP8 formula belongs HERE, not to W6**
-  (moved 2026-09-01 with W6a, [#2512](https://github.com/mudler/vllm.cpp/issues/2512)).
-  The evidence that moved it is the row's own W2 census: the released bf16
-  `dots-studio/dots3-note-prev` carries 37944 BF16 + 62 F32 tensors and NO scale
-  tensors at all (§4.4), so there is no FP8 formula anywhere in the arm W6
-  loads; `MoESwiGLUFFNFP8.process_weights_after_loading` (`vision.py:245-283` @
-  `9035151d6`) CASTS bf16 experts to block-FP8 at load, which is a quantized
-  path this port does not take, and the `-fp8` sibling that ships those scales
-  is already refused BY NAME as W9. **R5 moved with it** (§8).
+  converter. **W9a DONE** (#2882): the GGUF refusal is reachable and true.
+  **W9d DONE** (#2881, §4.20): the tree reads `vision_config.enable_fp8_moe`,
+  ports `MoESwiGLUFFNFP8` onto the shared block-FP8 seams, and records the
+  finding that the class upstream selects by default RAISES on the released
+  `moe_intermediate_size` of 2112 (`fp8_utils.py:563-566` @ `9035151d6`).
+  **This paragraph's earlier reasoning is superseded and is kept only as the
+  history of the correction.** It said the FP32-scale FP8 formula belongs to W9
+  rather than W6 because the released bf16 checkpoint ships no scale tensors at
+  all. The premise is true (§4.4: 37944 BF16 + 62 F32, no scale tensor) and the
+  inference is not: #2881 showed the class is selected by a CONFIG DEFAULT, and
+  `MoESwiGLUFFNFP8.process_weights_after_loading` (`vision.py:245-283` @
+  `9035151d6`) casts bf16 experts to block FP8 at load, so no scale tensor is
+  needed to reach it. The conclusion survives its reason, for the reason §4.20.1
+  gives instead. **R5 moved with it and is corrected in place** (§8). Still
+  owed: W9b/W9c/W9e/W9f (the GGUF slices) and the permanently refused LANGUAGE
+  blockwise and AUDIO FP8 arms (§4.20.6).
 - **W10 — MTP.** `Dots3NoteMTPModel` over the existing speculator seam.
 - **W11 — gates.** Whatever §6.4 permits: full SACRED if A, the recorded-gap
   form if B.
@@ -8518,15 +8773,20 @@ dispatchable in order, under the constraints that answer imposes.
 - **R5 — the vision MoE's FP32 activation scales** (§2.4) are the exact shape of
   a too-wide/too-narrow dtype defect that a token gate cannot see. Check the
   memory format against upstream explicitly, per
-  [porting.md](../porting.md). **FILED AGAINST W9, not W6** (moved 2026-09-01
-  with W6a, [#2512](https://github.com/mudler/vllm.cpp/issues/2512)). It was
-  filed against W6 when this section was written, and the row's own W2 census
-  (§4.4) contradicts that: the released bf16 checkpoint ships 37944 BF16 + 62
-  F32 tensors and no scale tensor at all, so W6's arm has no activation scale to
-  get wrong, while the `-fp8` sibling that does ship them is refused BY NAME as
-  W9. The RISK is unchanged and is not waived; only its owner moved. The
-  memory-format obligation it names still binds every brick, and W6a discharged
-  its own share of it in §4.11.4.
+  [porting.md](../porting.md). **OWNED BY W9d, and its REASON is corrected**
+  (2026-09-04, §4.20.5, [#2881](https://github.com/mudler/vllm.cpp/issues/2881)).
+  It was filed against W6, then moved to W9 on the argument that the released
+  bf16 checkpoint ships no scale tensor at all so W6's arm has none to get
+  wrong. That argument is FALSE as a reason: #2881 established that upstream
+  selects the FP8 class from a config DEFAULT (`enable_fp8_moe`,
+  `vision.py:69`) and not from the checkpoint's tensors, and
+  `MoESwiGLUFFNFP8.process_weights_after_loading` casts bf16 experts to block
+  FP8 at load, so the FP32 activation scales are reachable on the artifact W6b
+  already loads. W9d then established the part neither document had: on the
+  released `moe_intermediate_size` of 2112 the selected class RAISES before any
+  GEMM (§4.20.1). The RISK is unchanged and is not waived; W9d's G1 is where
+  this row discharges the memory-format obligation for the FP8 arm, and W6a
+  discharged its own share of it in §4.11.4.
 - **R6 — no llama.cpp comparison** for the GGUF arm, so the quantized floor has
   no external reference. **FALSIFIED as written, 2026-09-04 (W9a, §4.19.2).**
   llama.cpp defines `dots3note` (`LLM_ARCH_DOTS3NOTE`, merged
@@ -9035,17 +9295,23 @@ Carried openly under option B (§6.4), not waived:
   exactly needs an op whose store dtype is the caller's. Owner: this row. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 
-- **`vt::QuantFp8Group` has no `use_ue8m0` rounding, and it is owed against
-  W9** (recorded at W5, #699). It does NOT bite at W5: it is the ACTIVATION
-  quantizer and W5 is entirely on the bf16 path, so nothing in that brick calls
-  it. It probably does bite at W9, because upstream's blockwise-FP8 MoE routes
-  through DeepGEMM with e8m0 scales
-  (`vllm/models/dots3_note/nvidia/vision_moe.py`'s own docstring names the
-  sibling trap on the vision side: "the native NOTE encoder keeps dynamic
-  activation scales as FP32 instead of rounding them to E8M0"). A port that
-  quantizes activations with plain scaling there disagrees with the kernel
-  upstream runs, and the disagreement is numerically silent. Recorded here with
-  the reason so W9 does not re-derive it.
+- **`vt::QuantFp8Group` has no `use_ue8m0` rounding, and it is owed against the
+  LANGUAGE MoE only** (recorded at W5, #699; **NARROWED 2026-09-04 by W9d**,
+  §4.20.5, [#2881](https://github.com/mudler/vllm.cpp/issues/2881)). It does NOT
+  bite at W5: it is the ACTIVATION quantizer and W5 is entirely on the bf16
+  path, so nothing in that brick calls it. **It does NOT bite the VISION arm
+  either, and this entry used to say it probably would.** Upstream passes
+  `use_ue8m0=False` at all three vision call sites (`vision.py:237`,
+  `vision_moe.py:80`, `:122`), and `note_vision_fused_moe_fp8`'s own docstring
+  states the point of the function is that "the native NOTE encoder keeps
+  dynamic activation scales as FP32 instead of rounding them to E8M0" — which
+  is exactly the form `vt::QuantFp8Group` already has. The entry was reading
+  that docstring as a warning when it is a statement that the trap does not
+  apply here. What remains owed is the LANGUAGE MoE's DeepGEMM path, where
+  upstream may round to e8m0 and a port that quantizes with plain scaling would
+  disagree with the kernel upstream runs, silently. That question is unresolved
+  and no brick has looked at it; the language blockwise arm is itself a
+  permanent refusal below, so nothing schedulable is blocked on it.
 - **The blockwise-FP8 arm itself is owed to W9**, and it is now refused BY NAME
   rather than by a bare tensor miss (W5a). `dots-studio/dots3-note-prev-fp8` @
   `7c14222e22423d6df6848eb0d1c5c3a88a00311a` carries
@@ -9136,6 +9402,22 @@ Carried openly under option B (§6.4), not waived:
   W9. Tracked here rather than as four issues, per AGENTS.md's "an issue you do
   not fix in the same flow has to say who owns it".
 
+- **The LANGUAGE blockwise-FP8 arm is a PERMANENT refusal, not a slice**
+  (W9d, §4.20.6, [#2881](https://github.com/mudler/vllm.cpp/issues/2881)). Two
+  things are missing at once and neither is schedulable here. No host this
+  project reaches holds the 298.67 GB `dots-studio/dots3-note-prev-fp8` (§6.2),
+  and no `vt` grouped block-FP8 MoE op exists — the block-FP8 seams this tree
+  owns are DENSE (`layers::Fp8BlockLinearMethod`,
+  `dense_fp8_block::MatmulFp8BlockScaledD`), and a 256-expert MoE routed through
+  them one expert at a time is not the arm upstream runs. The unblocking
+  condition is BOTH: a `vt` grouped block-FP8 MoE op, and a host that can hold
+  the checkpoint. Until both exist this is visible debt rather than an owed
+  brick, and `Dots3NoteVisionRefusal`'s blockwise branch keeps naming it.
+- **The AUDIO FP8 arm is a PERMANENT refusal for want of an artifact** (W9d,
+  §4.20.6). Nothing published ships one: the released audio tower is all BF16
+  (§4.14), so there is no checkpoint to load and nothing to gate against. The
+  unblocking condition is a published FP8 audio tower for this architecture.
+
 ## 9. Stop conditions
 
 - Any brick whose only available comparison is a shared helper stops and says so
@@ -9148,6 +9430,21 @@ Carried openly under option B (§6.4), not waived:
   for both arms on identical workloads.
 
 ## Now
+
+**W9d LANDED (#2881, §4.20): the tree reads `enable_fp8_moe`, and the class
+upstream selects by default turns out not to run on the released checkpoint.**
+`DotsMoEVitConfig` defaults `enable_fp8_moe` to true (`vision.py:69` @
+`9035151d6`) and the released `vision_config` omits it, so upstream builds
+`MoESwiGLUFFNFP8` for all 17 pyramid blocks — and that class quantizes an
+activation of width `moe_intermediate_size = 2112` in groups of 128, which
+`fp8_utils.py:563-566` asserts against. W9d ports the class onto
+`layers::Fp8BlockLinearMethod`, ports `_per_block_cast_to_fp8_padded` as a
+weight-side caster, mirrors the `clamp_min` denominator, and REPORTS the
+released checkpoint's state rather than either pretending or refusing an image
+W6b serves correctly. Nothing here is compared against vLLM: §6.4 option B
+stands and the size of the divergence between the two upstream classes is
+unmeasured. R5 and the `use_ue8m0` `## Owed` entry are corrected in place
+(§4.20.5).
 
 **W8a LANDED (#2860): ONE dots3-note request now carries TWO `mm_features`, the
 first request in this repository to carry more than one.** The two sequential
