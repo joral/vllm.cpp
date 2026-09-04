@@ -934,6 +934,24 @@ class GPUModelRunner final : public ModelRunnerBase {
     int32_t* seq_lens = nullptr;         // [max_num_reqs]
     int32_t* input_ids = nullptr;        // [max_num_batched_tokens]
     int32_t* ops = nullptr;              // [4 * max_num_reqs] structural replay
+    // SPEC-DFLASH2 A2-3 (#2911): the device mirror of
+    // `InputBatch::draft_tokens`, [max_num_reqs * draft_stride] ROW-MAJOR per
+    // req_state slot. Null and zero-strided without a speculator.
+    //
+    // OWNERSHIP AND LIFETIME, stated together because they are two claims and
+    // this row has been bitten by conflating them. `AsyncDeviceInputs` OWNS every
+    // pointer in this struct, including this one. WHEN they may be freed is the
+    // separate question: only in `~GPUModelRunner`, which is the sole `Free` site
+    // and where the runner and therefore its queue are going away. They are
+    // allocated once on first use and are never per-step, never block-scoped, and
+    // never released by a scope exit. That is deliberate. A2-4 exists to move the
+    // verify wait past the propose, and a buffer whose free is tied to a scope
+    // the wait can move out of is a use-after-free pre-installed for that wave:
+    // the kernel is still queued against it, the read returns garbage drafts, and
+    // because verify is lossless the emitted tokens stay correct and NOTHING
+    // raises. Moving a wait cannot move a free here, because no wait frees this.
+    int32_t* draft_tokens = nullptr;
+    int32_t draft_stride = 0;            // == InputBatch::num_speculative_steps
     int64_t input_ids_capacity = 0;      // elements in `input_ids`
     int32_t max_reqs = 0;
   };
@@ -1123,7 +1141,28 @@ class GPUModelRunner final : public ModelRunnerBase {
   }
   // The drafts produced this step, pending pull by EngineCore::post_step. Empty
   // (nullopt) on the default path.
+  //
+  // SPEC-DFLASH2 A2-3 (#2911): this is NO LONGER the drafts' residence, only the
+  // out-of-band delivery to the scheduler. `take_draft_token_ids` MOVES it out,
+  // so it cannot be what the next step's placeholder fill or the combine's
+  // scatter read. Their residence is `input_batch_.draft_tokens`, which survives
+  // the pull. Upstream has the same pair for the same reason: the device
+  // `req_states.draft_tokens` for the workers, and the `DraftTokensHandler`'s
+  // host copy for the scheduler (model_runner.py:1548 and :1553-1556).
   std::optional<DraftTokenIds> pending_drafts_;
+  // SPEC-DFLASH2 A2-3 (#2911): the ONE producer seam for both residences.
+  // Scatters `drafts` into `input_batch_.draft_tokens` by req_state slot and
+  // stashes it in `pending_drafts_` for the out-of-band pull — upstream's
+  // `req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens` followed by
+  // `draft_tokens_handler.set_draft_tokens(...)`, in one place so a propose arm
+  // cannot write one and forget the other. Every `propose_drafts*` arm ends here.
+  void set_draft_tokens(DraftTokenIds&& drafts);
+  // The no-drafts-this-step counterpart: clears the stash AND zeroes every slot's
+  // valid count, so a stale count cannot make the next fill read a row this step
+  // did not write. The row CONTENTS are deliberately left alone, exactly as
+  // upstream leaves `req_states.draft_tokens` untouched and governs with the
+  // valid count instead.
+  void clear_draft_tokens();
   // SPEC-MTP I5d acceptance telemetry (spec §5 gate: measured nonzero acceptance).
   // spec_drafts_proposed_ counts draft tokens VERIFIED, spec_drafts_accepted_ the
   // subset the rejection sampler accepted. accepted/proposed is the acceptance

@@ -265,10 +265,16 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   `sample_tokens` does at `runner.cpp:2797`. This is the wave that closes
   reason B. The CPU tier can gate the ROUTING and the token identity; it
   cannot gate the overlap.
-- **A2-3 — device-resident propose.** `pending_drafts_` becomes a device
-  buffer the combine reads, and the placeholder fill at `runner.cpp:1815-1847`
-  stops needing host drafts. This is the wave that makes A2-1's draft scatter
-  reachable.
+- **A2-3 — device-resident propose. LANDED** (#2911). `pending_drafts_` stops
+  being the drafts' residence and becomes only the out-of-band delivery to the
+  scheduler; the residence is `InputBatch::draft_tokens`, a per-req_state
+  `[max_num_reqs, k]` buffer that both the combine and the placeholder fill read,
+  written through the single `set_draft_tokens` seam. The fill no longer needs
+  host drafts, and it is REACHED and mutation-gated. It did NOT on its own make
+  A2-1's draft scatter reachable, and the `## Owed` entries say why: the scatter
+  needs a step that arrives with `num_logits > 1`, and only A2-5's veto flip
+  produces one. The sentence that stood here predicted otherwise; the measurement
+  in `## Now` is what replaced the prediction.
 - **A2-4 — the optimistic correction.** `prev_num_draft_len` plus the deferred
   correction, replacing the structural rule W7 recorded at `runner.cpp:1760-1773`
   (which is correct precisely because our rejection result IS host-visible in
@@ -348,7 +354,48 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   scatter's bound intact has its corrupted slot rewritten by the scatter and is
   caught by another case instead. G2.2 is sound; the claim to make about it is
   that the case fires, not that a chosen line does.
-- **A2-1's draft lane is UNREACHED, and A2-2 plus A2-3 own the wiring.** The
+- **A2-3's two CUDA combine arms are WIRED and UNBUILT.** No `nvcc` on the CPU
+  box this wave ran on, and no `rc` lease was taken because the wave is
+  CPU-gateable in full and the fleet was needed for measurement. No `.cu` file is
+  edited — `LaunchCombineSampledAndDraftTokens` already took `draft_tokens` and
+  its stride, and A2-3 only stops passing null — so the unbuilt surface is the
+  two `#ifdef VLLM_CPP_CUDA` blocks in `runner.cpp`: the device mirror's
+  `draft_tokens` allocation, its per-step `stage_upload`, its entry in the
+  destructor's free list, and the host-array arm's pointer. The host arm below
+  them takes the identical buffer and IS built and gated, so the two device arms
+  are the same call with a different residence. Risk bounded to a compile
+  failure. Owner: row `SPEC-DFLASH2`, issue #2911.
+- **`sample_tokens_async`'s DECODE arm never proposes, and A2-5 is blocked on
+  it.** FOUND BY A2-3 (#2911), which is the first wave whose measurement could
+  see it. A2-2 gave the async sampler a verify arm and put
+  `propose_after_verify` inside it, so a step that DRAFTS proposes correctly. The
+  arm that runs when `StepRoutesToVerify` is false has no `spec_on()` branch at
+  all, where the synchronous `sample_tokens` ends its decode path with one
+  (`runner.cpp`, the `if (spec_on()) { ... propose_drafts(...); }` tail). That
+  arm is every spec engine's FIRST step, before any drafts exist, so with the
+  veto lifted a spec engine on the `AsyncLLM` front proposes nothing on step one
+  and the next step's placeholder fill refuses by name.
+
+  This is why mutation **M** is still red at the A2-3 head, and the refusal it
+  hits has moved again — from the combine to the fill. It is NOT a draft-buffer
+  gap: A2-3 wired the buffer and M no longer produces a single "async input
+  combine:" line. It is an unreached arm that was landed incomplete, and it is
+  out of A2-3's scope, which the dispatching brief drew around the draft buffer
+  and the fill. **A2-5 cannot flip the veto until this is closed**, and whichever
+  wave closes it owes the mixed-step coverage the fill's own rule now has.
+  Owner: row `SPEC-DFLASH2`, issue #2911.
+- **A2-1's draft lane is STILL UNREACHED after A2-3, and A2-5 owns the last
+  step.** A2-3 (#2911) made the scatter's `draft_tokens` argument REAL — every
+  call site now passes the per-req_state `InputBatch::draft_tokens` and its
+  stride, and the host arm passes the true per-request `step.cu_num_logits` — so
+  the buffer exists, is produced by one seam and is read by two consumers. What
+  the scatter still lacks is a step that ARRIVES with `num_logits > 1`, and only
+  lifting the `async_input_combine_` veto produces one. A2-3 was scoped not to
+  touch it. The disclosure AGENTS.md requires is carried by this entry, the
+  landing commit body and the pull request body. Owner: row `SPEC-DFLASH2`,
+  issue #2911.
+- **A2-1's draft lane was UNREACHED at the A2-1 head, and A2-2 plus A2-3 owned
+  the wiring.** HISTORICAL; superseded by the two entries above. The
   draft-aware halves of `combine_sampled_and_draft_tokens`
   (`src/vllm/v1/worker/gpu/prepare_inputs.cpp`) and of
   `vt::cuda::LaunchCombineSampledAndDraftTokens`
@@ -578,10 +625,51 @@ entry on the removable drain says what A2-4 and A2-5 have to do to move it.
 correct; nothing reaches it while the veto stands, exactly as A2-1's draft lane
 is unreached, and both `## Owed` entries say so. What A2-2 changed about the
 veto is that lifting it would no longer sample verify rows as decode rows — the
-half of reason B this wave owns. The other half is A2-3: `pending_drafts_` is
-still host-resident, `propose_drafts` still consumes host `num_sampled` /
-`num_rejected`, and the A2-3 `VT_CHECK` in `execute_model` still refuses a
-speculative step ahead of everything else.
+half of reason B this wave owns. The other half was A2-3's, and A2-3 has since
+landed: the paragraph that stood here said `pending_drafts_` was still
+host-resident and that the A2-3 `VT_CHECK` still refused every speculative step
+ahead of everything else, and neither is true at the head this file now ships
+with.
 
-A2-3 is the next wave. It is what makes both A2-1's draft scatter and A2-2's
-verify arm reachable.
+**A2-3 has landed** (#2911). `InputBatch` carries the drafts' residence: a
+per-req_state `draft_tokens` buffer of `[max_num_reqs, num_speculative_steps]`
+row-major, with a `num_valid_draft_tokens` count beside it, mirroring
+`RequestStates.draft_tokens` (states.py:71-77) and upstream's
+`_num_valid_draft_tokens` (gpu_model_runner.py:883-895). It is zeroed for a slot
+at admission, moves with the request through `condense`, swaps through
+`swap_states`, and is sized by the req_state POOL rather than by `num_reqs` —
+which is the sizing that makes the CUDA scatter's unbounded row read safe, the
+choice this spec's `## Owed` told the wave to make. One producer writes it,
+`GPUModelRunner::set_draft_tokens`, which every `propose_drafts*` arm now ends
+in; it also keeps `pending_drafts_` for the out-of-band pull, exactly as upstream
+writes `req_states.draft_tokens` and the `DraftTokensHandler` together
+(model_runner.py:1548,1553-1556).
+
+Two consumers read it. The async placeholder fill is REACHED and gated: it
+stopped reading `pending_drafts_` (which `take_draft_token_ids` moves out, so it
+could never be a residence two in-step readers share) and now applies
+`FillDraftsForRow`, the fill's rule stated once in `prepare_inputs.h`. All three
+combine call sites pass the buffer and its stride, so A2-1's scatter has a real
+argument for the first time.
+
+**What was mutated, because a claim without one is a reading.** Deleting the
+producer's write reds `test_mtp_depth` (5 of 10 cases, exit 1) and
+`test_dflash2_runner_reach` (9 of 10, exit 1), both throwing the fill's refusal
+by name at `prepare_inputs.cpp` — the fill is reached from `execute_model` and
+the gate can see it. Sizing the buffer by one row instead of the pool reds the
+sizing case in `test_input_batch` on `CHECK( 3 == 24 )` and leaves
+`test_mtp_depth` GREEN, which is the `num_reqs == 1` blindness made executable
+and the reason that assertion is on the SIZE and not on behaviour. Taking the
+fill's width from the stride instead of the placeholder count reds two
+`test_draft_fill` cases, one of them the MIXED `num_reqs == 3` step.
+
+**The draft scatter is still UNREACHED, and A2-5 is the wave that reaches it.**
+A2-3 supplied the buffer; it did not lift the veto, which it was scoped not to
+touch. Mutation **M** at this head is red for a THIRD reason, and the move is the
+result worth recording: `test_mtp_depth` goes to 9 of 10 passed / 118 assertions
+(against 5 of 10 failed / 29 assertions at the A2-2 head), `async input combine:`
+does not appear in the output at all, and the single failure is the fill
+refusing because `sample_tokens_async`'s DECODE arm never proposes. The combine
+now accepts a verify step. Both remaining gaps are `## Owed` entries above.
+
+A2-4 is the next wave, and the decode-arm gap above is what A2-5 is blocked on.

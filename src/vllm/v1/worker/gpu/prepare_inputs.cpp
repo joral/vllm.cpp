@@ -408,6 +408,57 @@ std::vector<int32_t> combine_sampled_and_draft_tokens(
   return logits_indices;
 }
 
+// SPEC-DFLASH2 A2-3 (#2911). The async placeholder fill's per-request rule; see
+// prepare_inputs.h for what it reads, why the count comes from the placeholders
+// rather than from the stride, and why each refusal is a refusal.
+//
+// The row arithmetic is `combine_sampled_and_draft_tokens`' own, deliberately:
+// both read the same buffer for the same request, and the whole point of A2-3 is
+// that the fill and the scatter can no longer disagree about what was drafted.
+std::vector<int32_t> FillDraftsForRow(const std::vector<int32_t>& draft_tokens,
+                                      int draft_tokens_stride, int req_state_idx,
+                                      int num_valid, int num_placeholders,
+                                      const std::string& req_id) {
+  // The non-speculative path and every plain decode row on a mixed step. Nothing
+  // to fill, nothing to substantiate, and no refusal to make.
+  if (num_placeholders <= 0) return {};
+
+  VT_CHECK(req_state_idx >= 0,
+           "async draft fill: request '" + req_id +
+               "' has no req_state slot, so its drafts cannot be located");
+  VT_CHECK(draft_tokens_stride > 0,
+           "async draft fill: request '" + req_id + "' was scheduled " +
+               std::to_string(num_placeholders) +
+               " draft placeholders on a runner with no draft buffer "
+               "(num_speculative_steps == 0)");
+  // The pre-A2-3 pair of refusals, restated on the buffer. num_valid == 0 with
+  // placeholders scheduled is "placeholders scheduled without a matching
+  // propose"; a positive but short count is the fill's own mismatch.
+  VT_CHECK(num_valid >= num_placeholders,
+           "async draft fill: request '" + req_id + "' proposed " +
+               std::to_string(num_valid) +
+               " drafts but the scheduler placed " +
+               std::to_string(num_placeholders) + " placeholders");
+  // THE BOUND THE CUDA SCATTER DOES NOT HAVE. See the header: the buffer is
+  // sized by the req_state POOL so this cannot fire, and it fires loudly rather
+  // than reading past the allocation if it ever is not.
+  const size_t row = static_cast<size_t>(req_state_idx) *
+                     static_cast<size_t>(draft_tokens_stride);
+  VT_CHECK(row + static_cast<size_t>(num_placeholders) <= draft_tokens.size(),
+           "async draft fill: the draft buffer holds no row for request '" +
+               req_id + "' at req_state slot " + std::to_string(req_state_idx) +
+               " (buffer is sized by the req_state pool, so a miss here means it "
+               "was sized by num_reqs instead)");
+
+  // The count is the PLACEHOLDER count, never the stride: the stride is the
+  // speculator's max draft length and pads every shorter row, so filling from it
+  // would write the pad over a position the scheduler never reserved.
+  return std::vector<int32_t>(
+      draft_tokens.begin() + static_cast<std::ptrdiff_t>(row),
+      draft_tokens.begin() + static_cast<std::ptrdiff_t>(row) +
+          static_cast<std::ptrdiff_t>(num_placeholders));
+}
+
 // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710). The OR over the batch of the row
 // predicate the combine applies, and nothing else: see the header for why this
 // may not become a per-request answer.

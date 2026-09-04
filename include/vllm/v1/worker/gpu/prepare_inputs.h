@@ -251,14 +251,19 @@ StepInputs prepare_inputs(InputBatch& input_batch,
 // upstream keeps input prep ahead of the decode graph replay), so it is
 // capture-safe by construction.
 //
-// REACHABILITY, stated once: the draft lane below is UNREACHED on `main`. The
-// only production caller is GPUModelRunner::execute_model behind
-// `async_input_combine_`, and that flag is vetoed for every speculative engine at
-// BOTH GPUModelRunner constructors — src/vllm/v1/worker/gpu/runner.cpp:480 and
-// :553, which are the two `async_input_combine_ = ...` assignments and not the
-// comment blocks that precede them — so no production step reaches this function
-// with num_logits > 1. Row `SPEC-DFLASH2` owns the wiring (waves A2-2 and A2-3),
-// issue #2644 tracks it, and the row's spec lists it under `## Owed`.
+// REACHABILITY, stated once: the draft lane below is STILL UNREACHED on `main`,
+// and A2-3 (#2911) changed WHY rather than fixing it. Its `draft_tokens` argument
+// is now real — every call site passes the per-req_state `InputBatch::draft_tokens`
+// with its stride, and the host arm passes the true per-request
+// `step.cu_num_logits` — so the buffer this scatter reads exists and is
+// maintained. What still keeps `num_logits > 1` from arriving is the veto on
+// `async_input_combine_` at BOTH GPUModelRunner constructors (the two
+// `async_input_combine_ = ...` assignments, not the comment blocks that precede
+// them), which wave A2-5 lifts and which this wave was explicitly scoped not to
+// touch. A2-3 measured what lifting it now does: the combine ACCEPTS the verify
+// step and no combine refusal fires; one unrelated gap remains in
+// `sample_tokens_async`'s decode arm. Row `SPEC-DFLASH2` owns the wiring, issue
+// #2911 tracks it, and the row's spec lists both under `## Owed`.
 std::vector<int32_t> combine_sampled_and_draft_tokens(
     std::vector<int32_t>& input_token_ids,
     const std::vector<int32_t>& idx_mapping,
@@ -351,6 +356,65 @@ inline bool StepRoutesToVerify(int32_t step_num_draft_tokens) {
 inline bool RowCarriesDraftTokens(int32_t row_num_draft_tokens) {
   return row_num_draft_tokens > 0;
 }
+
+// SPEC-DFLASH2 A2-3 (#2911): THE ASYNC PLACEHOLDER FILL'S PER-REQUEST RULE.
+//
+// Under async scheduling the scheduler ships `-1` placeholders for a verify
+// step's draft positions (async_scheduler.py:43-45), because it schedules step
+// N+1 before step N's drafts exist. `GPUModelRunner::execute_model` patches a
+// LOCAL copy of `scheduled_spec_decode_tokens` with the drafts this runner
+// actually proposed, exactly as upstream's worker-side scatter leaves the
+// scheduler's own copy untouched (gpu_input_batch.py:520-523).
+//
+// This returns request `req_state_idx`'s drafts for that patch, read from the
+// SAME per-req_state buffer `combine_sampled_and_draft_tokens` scatters from
+// (`InputBatch::draft_tokens`, mirroring `RequestStates.draft_tokens`,
+// states.py:71-77). Before A2-3 the fill read `pending_drafts_` — a host, ragged,
+// req_id-keyed structure with no relation to the scatter's buffer — so the two
+// consumers of "what did this runner draft" had two sources. One residence, one
+// producer, two readers is upstream's shape and is what this function exists to
+// keep true.
+//
+// WHY IT IS A NAMED FUNCTION. The row arithmetic (`req_state_idx * stride + b`)
+// is written by the host combine, by the CUDA kernel, and now by the fill. One
+// rule with three expressions is how the predicate split shipped here before
+// (#2710), so the fill's reading is stated once and the call site APPLIES it
+// rather than agreeing with it by inspection.
+//
+// THE REFUSALS ARE REFUSALS AND NOT CLAMPS. A placeholder the worker cannot fill
+// would otherwise embed a literal `-1` in the model's input ids.
+//
+//   * `num_valid < num_placeholders` — the runner proposed fewer drafts than the
+//     scheduler reserved positions for, which is a bookkeeping defect on either
+//     side. `num_valid == 0` with placeholders scheduled is the case the
+//     pre-A2-3 fill named "placeholders scheduled without a matching propose".
+//   * the row must lie inside the buffer — THE BOUND THE CUDA SCATTER LACKS.
+//     `LaunchCombineSampledAndDraftTokens` reads
+//     `draft_tokens[req_state_idx * stride + b]` with nothing checking it, so a
+//     row past the allocation is an unchecked device read. Its loud outcome is
+//     an illegal access and its quiet one is garbage in the draft slots, which
+//     costs acceptance and NOTHING ELSE because speculative decoding is
+//     lossless. Sizing `InputBatch::draft_tokens` by the req_state pool is what
+//     makes that read safe; this refusal is what says so out loud if some future
+//     caller sizes it by `num_reqs` instead.
+//
+// `num_placeholders == 0` returns empty and refuses nothing, because that is the
+// non-speculative path and every decode row on a mixed step.
+//
+//   draft_tokens         [>= (max req_state + 1) * stride] ROW-MAJOR per req_state
+//   draft_tokens_stride  the speculator's MAX draft length; a shorter row is
+//                        PADDED, so the fill count comes from num_placeholders
+//                        and never from the stride (the combine draws the same
+//                        distinction with num_draft_tokens)
+//   req_state_idx        the request's req_state slot, NOT its batch row
+//   num_valid            how many of that row this runner actually proposed
+//   num_placeholders     how many positions the scheduler reserved this step
+//   req_id               named in the refusal only; a refusal that cannot say
+//                        which request is worse than one that can
+std::vector<int32_t> FillDraftsForRow(const std::vector<int32_t>& draft_tokens,
+                                      int draft_tokens_stride, int req_state_idx,
+                                      int num_valid, int num_placeholders,
+                                      const std::string& req_id);
 
 }  // namespace vllm::v1
 
