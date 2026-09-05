@@ -192,6 +192,26 @@ a baseline taken before the first mutation.
 | M3 | remove the bf16 round trip T3's claim rests on (`logits_bf16 = logits_f32`) | RED — the SET-difference count falls to `0/4096`, so the 34 is caused by the store and by nothing else |
 | M4 | make T2's second arm f32 as well | RED — `0/16` seeds differ, `worst 0`, so T2's comparison is not vacuous |
 
+### Preflight
+
+`scripts/agent-preflight.sh --staged` exits 1 with two failing gates, and neither
+is caused by this change.
+
+* `test_cpu_x86_llamacpp_floor` — `test_a_contended_leg_is_discarded_and_never_summarised`
+  expects rc 2 and got 4 while the box was at `load=75.28 76.77 62.18` from other
+  sessions' builds; the harness discarded the contended leg and ran out of
+  retries. Re-run standalone on this same tree: `Ran 10 tests ... OK`.
+* `tools suites` — `test_oracle_pin.test_metadata_and_runtime_strings_differ_on_the_pin`
+  asserts `VLLM_DISTRIBUTION_VERSION != VLLM_ORACLE_VERSION`, and both now read
+  `0.28.1rc1.dev132+ge126687a9`. Those constants come from `.agents/upstream-sync.md`
+  through `tools/bench/serve_low_common.py:107-108`, and this change touches
+  neither, so the failure is a property of `origin/main`. Already open and owned
+  as [#2931](https://github.com/mudler/vllm.cpp/issues/2931).
+
+Five gates SKIP for want of a cross-compiler, a CUDA toolkit or a CI-only input.
+`check-pr-size.py` is one of them and was run by hand: `OK: every explicit path
+class is within its review budget.`
+
 ### Regression
 
 Run on the repaired tree; `DeepseekV2ForCausalLM` is byte-identical because
