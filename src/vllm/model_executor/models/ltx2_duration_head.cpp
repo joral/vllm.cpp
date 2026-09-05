@@ -221,12 +221,20 @@ std::vector<float> Ltx2DurationAttentionPool(const Ltx2DurationHeadConfig& confi
 
   vt::Queue q{vt::Device{}, nullptr};
   const vt::DType arm = weights.dtype;
-  // The module boundary. Identity when `Ltx2DurationPredict` calls in, because
-  // the concatenated stream it hands over was already stored at bf16 -- which is
-  // what upstream's own `torch.cat` of two bf16 tensors is.
-  const std::vector<float> narrowed_tokens =
-      NarrowedInput(arm, tokens, static_cast<size_t>(batch * token_count * hidden));
-  tokens = narrowed_tokens.data();
+  // NO NARROWING OF `tokens` HERE, AND THAT IS A MUTATION FINDING RATHER THAN AN
+  // OMISSION. `AttentionPooler` is a SUBMODULE: upstream hands it whatever the
+  // enclosing forward stored, and `torch.cat` of two bf16 tensors is bf16
+  // because the projections stored bf16 -- not because the pooler re-narrowed.
+  // An entry narrowing here stood for one round and it MASKED R2 exactly: with
+  // the rounding after the modality-embedding add deleted, this call re-rounded
+  // the same values and the whole suite stayed green, 5051 of 5051. A narrowing
+  // upstream does not do is the same class of defect as one it does, and this is
+  // what that costs when it lands on top of a real store point.
+  //
+  // The contract that replaces it: on the bf16 arm `tokens` are the caller's
+  // STORED activations and are already bf16-representable, which
+  // `Ltx2DurationPredict` guarantees by storing at the projection and again
+  // after the embedding add.
   const WeightRef in_proj_weight_ref(weights, p + "cross_attn.in_proj_weight");
   const WeightRef in_proj_bias_ref(weights, p + "cross_attn.in_proj_bias");
   const std::vector<float>& in_proj_weight = *in_proj_weight_ref;
