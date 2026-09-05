@@ -490,7 +490,15 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
   // (only 16 of 32 lanes filled one row each). Spreading the same total work
   // over all 32 lanes across all 16 groups removes both costs in one change.
   __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16][16];
-  __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][16][16];
+  // raw_tile now holds kGroupGemmBatch groups' raw WMMA tiles at once, so a
+  // whole batch's compute+store is one barrier and its scale-fold is another,
+  // rather than a barrier per single group each way. 16 KiB (w_stage) + 16
+  // KiB (this, at batch 4) = 32 KiB/block, comfortably under the 64 KiB LDS
+  // budget this project's other WMMA kernels stay inside
+  // (rocm_paged_attn.hip's own BM=16 BN=64 d=256 note).
+  constexpr int kGroupGemmBatch = 2;
+  static_assert(16 % kGroupGemmBatch == 0, "16 scale-groups must divide evenly into batches");
+  __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][kGroupGemmBatch][16][16];
 
   const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ6_K);
   const BlockQ6_K* w_row_base[16];
@@ -524,24 +532,36 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
     }
     __syncthreads();
 
-    for (int grp = 0; grp < 16; ++grp) {
-      fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
-      fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
-      fragment<accumulator, 16, 16, 16, int32_t> acc;
-      fill_fragment(acc, 0);
-      const int8_t* a_ptr = a_row0[sb].qs + grp * 16;
-      const long a_ld = static_cast<long>(nsb) * static_cast<long>(sizeof(BlockQ8_K));
-      load_matrix_sync(a_frag, a_ptr, a_ld);
-      load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
-      mma_sync(acc, a_frag, b_frag, acc);
-      store_matrix_sync(&raw_tile[wy][0][0], acc, 16, mem_row_major);
+    // A batch of kGroupGemmBatch groups: every WMMA op in the batch computes
+    // and stores to its OWN slice of raw_tile before the batch's single
+    // barrier, and every group's scale-fold reads back before the batch's
+    // other barrier — replacing what was a barrier PER GROUP each way.
+    for (int gb = 0; gb < 16; gb += kGroupGemmBatch) {
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+        const int grp = gb + gi;
+        fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+        fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
+        fragment<accumulator, 16, 16, 16, int32_t> acc;
+        fill_fragment(acc, 0);
+        const int8_t* a_ptr = a_row0[sb].qs + grp * 16;
+        const long a_ld = static_cast<long>(nsb) * static_cast<long>(sizeof(BlockQ8_K));
+        load_matrix_sync(a_frag, a_ptr, a_ld);
+        load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
+        mma_sync(acc, a_frag, b_frag, acc);
+        store_matrix_sync(&raw_tile[wy][gi][0][0], acc, 16, mem_row_major);
+      }
       __syncthreads();
 
 #pragma unroll
-      for (int c = 0; c < 8; ++c) {
-        const int cell = lane + c * 32;
-        const int ii = cell / 16, jj = cell % 16;
-        isum[c] += raw_tile[wy][ii][jj] * static_cast<int32_t>(xb_cur[jj]->scales[grp]);
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+        const int grp = gb + gi;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          const int cell = lane + c * 32;
+          const int ii = cell / 16, jj = cell % 16;
+          isum[c] += raw_tile[wy][gi][ii][jj] * static_cast<int32_t>(xb_cur[jj]->scales[grp]);
+        }
       }
       __syncthreads();
     }

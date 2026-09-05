@@ -202,18 +202,55 @@ fills all 16 groups' tiles once per superblock, spread over all 32 lanes, and
 removes those 16 barriers down to 1. That single change bought a further
 ~2.3-2.7x on top of v1's already-measured 4.5-7.2x, and the WMMA arm now
 EXCEEDS this card's own Q8_0 scalar dp4a ceiling (1258-1339 GFLOP/s) — a
-result v1 did not reach. Both v1 and v2 passed the same hardware correctness
-and mutation-proof evidence above; v2 superseded v1 in the same wave, before
-either was proposed as the row's closing state, so only v2 is carried forward.
+result v1 did not reach.
 
-Not yet closed: gate (c) (`rocprofv3` total kernel time on the Ornith-1.5-9B-
-Q4_K_M trace workload, target <= 20,000 ms) is still unmeasured — this
-device lacks `rocprofv3` and the exact checkpoint, and the op-level GFLOP/s
-above is evidence toward that gate, not a substitute for it. The remaining
-per-group shared-memory round trip (store the raw WMMA tile, sync, fold the
-scale, sync) is a smaller, not-yet-attempted next lever, but the return an
-easy win produced here is not a reason to assume there is a comparable
-amount left — the DIRECTION is recorded, not a size for it. Q4_K/Q5_K and the
-M/N tail remain `## Owed`, as scoped above. W2 (launch-site replacement)
-refers to the scalar arm's retirement once every format is covered; today
-both arms coexist by design.
+**Batching the remaining per-group store-sync-fold-sync round trip, same
+tool and shapes, RX 9060 XT, best-of-6:**
+
+| Batch width | N=3072 K=2048 | N=12288 K=2048 | N=2048 K=6144 |
+|---|---|---|---|
+| 1 (v2, above) | 1439.55 GFLOP/s | 1514.70 GFLOP/s | 1467.55 GFLOP/s |
+| 2 | 1709.58 GFLOP/s (+18.8%) | 1995.02 GFLOP/s (+31.7%) | 1689.45 GFLOP/s (+15.1%) |
+| 4 | 1335.06-1347.51 GFLOP/s (-6-7%) | 1408.20-1409.09 GFLOP/s (-7%) | 1419.29-1424.70 GFLOP/s (-3%) |
+| 8 | 768.51 GFLOP/s (-47%) | 888.49 GFLOP/s (-41%) | 791.03 GFLOP/s (-46%) |
+
+Batching 2 groups' WMMA compute+store per barrier (instead of 1) is a real
+further win on top of v2; batching 4 or 8 REGRESSES relative to 2, and 8 is
+worse than not batching at all. Widening `raw_tile` to hold more groups grows
+shared-memory occupancy pressure faster than it saves barriers — the
+regression at 4 and 8 is evidence for that shape, not measured to a specific
+cause. **v3 (batch=2) is the row's current state**, RED-before-GREEN mutation-
+proven and `ctest`-clean identically to v1/v2 above; batch=4 and batch=8 were
+measured, rejected, and are not carried forward — this table is why, so the
+same two shapes are not retried without new evidence.
+
+Total measured gain over the original scalar arm on this card: **11.7x to
+16.3x** (1689-1995 GFLOP/s vs 115-122 GFLOP/s), depending on shape.
+
+**First real-model measurement, `rocprofv3 --kernel-trace --stats`, the
+actual `Ornith-1.5-9B-Q4_K_M.gguf` checkpoint, RX 9060 XT, `vllm-cli --device
+auto --max-tokens 1`, a 288-token prompt (16-aligned, so every layer's Q6_K
+prefill call takes the WMMA arm), same prompt both legs, `VT_ROCM_QUANT_WMMA`
+the only variable:**
+
+| | scalar (`=0`) | WMMA (v3, batch=2) | ratio |
+|---|---:|---:|---:|
+| `KQuantGemmK<uint16_t, 2>` / `KQuantGemmKWmmaQ6K` (20 calls, this row's kernel) | 4322.5 ms | 201.3 ms | **21.5x** |
+| Total kernel time, whole forward pass | 11973.9 ms | 7795.1 ms | **1.54x** |
+
+This is the row's own kernel, isolated by same-prompt/same-tool/only-the-
+env-toggle-differs A/B, at the exact production call site (`MatmulBTQuant`
+reached through the model's real forward pass, not a synthetic harness). It
+is NOT yet the issue's own gate (c) recipe: that recipe is `-n 128 -ngl 99`
+against a longer, differently-shaped prompt (llama.cpp's own pp512/tg128
+convention) whose absolute totals (108,817 ms scalar / 18,812 ms oracle) are
+a different workload and are not directly comparable to the 11973.9/7795.1 ms
+above — reporting the two side by side would compare different quantities.
+The 1.54x total-kernel-time reduction is strong, additional, real-model
+evidence toward gate (c); replicating the issue's own exact recipe (its
+prompt, its `-n 128 -ngl 99`, and the oracle side) is the remaining step to
+close it and is not done in this paragraph.
+
+Not yet closed: Q4_K/Q5_K and the M/N tail remain `## Owed`, as scoped above.
+W2 (launch-site replacement) refers to the scalar arm's retirement once every
+format is covered; today both arms coexist by design.
