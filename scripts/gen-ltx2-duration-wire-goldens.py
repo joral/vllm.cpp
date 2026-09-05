@@ -258,6 +258,28 @@ def bf16_fill(up, head, amplitude: float) -> None:
             param.copy_(values.reshape(param.shape).to(param.dtype))
 
 
+def bf16_fnv1a(up, tensors, seed: int = 0xCBF29CE484222325) -> int:
+    """FNV-1a over the little-endian bf16 WORDS of each tensor, in order.
+
+    THE TWO SIDES HAVE TO AGREE ON THE WEIGHTS BEFORE THEY AGREE ON THE ANSWER.
+    The C++ gate rebuilds this closed form with glibc's `sin`, and torch's float64
+    `sin` is NOT bit-equal to it -- about one f64 result in a thousand differs.
+    Measured over all 7,798,713 values this table draws, ZERO of those survive the
+    f32-then-bf16 narrowing, so the form IS reproducible; but that is a
+    measurement with a libm and a torch version attached, not a guarantee. This
+    digest is what turns a future disagreement about the WEIGHTS into a named
+    refusal instead of an unexplained value mismatch.
+    """
+    torch = up.torch
+    h = seed
+    for t in tensors:
+        words = t.to(torch.bfloat16).contiguous().view(torch.uint16).flatten().tolist()
+        for w in words:
+            for byte in (w & 0xFF, (w >> 8) & 0xFF):
+                h = ((h ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
 def bf16_tokens(up, count: int, width: int, phase: float, scale: float):
     torch = up.torch
     idx = torch.arange(count * width, dtype=torch.float64)
@@ -546,6 +568,15 @@ def cpp_lines(up) -> list[str]:
     add("    int64_t queries; int64_t heads; int64_t mlp_hidden;")
     add("    int64_t video_tokens; int64_t audio_tokens;")
     add("    double amplitude; double token_scale;")
+    add("    // FNV-1a over the little-endian bf16 WORDS of the fifteen parameters")
+    add("    // in named_parameters() order, and of the video-then-audio tokens.")
+    add("    // The C++ gate rebuilds this closed form with glibc `sin`, which is")
+    add("    // NOT bit-equal to torch's float64 `sin` -- so these say the two")
+    add("    // sides hold the same weights BEFORE they are asked to agree on the")
+    add("    // answer. A libm that ever moved one bf16 word reds here, by name,")
+    add("    // instead of arriving as an unexplained value mismatch.")
+    add("    uint64_t weight_digest;")
+    add("    uint64_t token_digest;")
     add("    // Upstream's own bf16 answer, and the seven rejected rules beside it")
     add("    // in the order kLtx2DurBf16RuleNames gives.")
     add("    float upstream;")
@@ -597,8 +628,11 @@ def cpp_lines(up) -> list[str]:
             coverage[r] += 1
         emitted += 1
         values = ", ".join(f"{rejected[r]:.9g}f" for r in BF16_RULES)
+        wdigest = bf16_fnv1a(up, [params[name] for name, _ in head.named_parameters()])
+        tdigest = bf16_fnv1a(up, [t for t in (video, audio) if t is not None])
         add(f"    {{{vdim}, {adim}, {hidden}, {queries}, {heads}, {mlp}, "
-            f"{v_count}, {a_count}, {amp!r}, {tscale!r}, {answer:.9g}f, "
+            f"{v_count}, {a_count}, {amp!r}, {tscale!r}, "
+            f"0x{wdigest:016x}ULL, 0x{tdigest:016x}ULL, {answer:.9g}f, "
             f"{{{values}}}}},  // separates {len(separating)}: "
             f"{','.join(separating) or 'NOTHING (the funnel control)'}")
     add("};")

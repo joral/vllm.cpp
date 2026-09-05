@@ -54,6 +54,7 @@
 #include "vllm.h"
 #include "vt/backend.h"
 #include "vt/device.h"
+#include "vt/dtype.h"
 #include "vllm/multimodal/video_engine.h"
 #include "vllm/multimodal/render_phase_log.h"
 
@@ -13631,6 +13632,42 @@ TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
   CHECK(res.frame_count == trace.duration_frames);
   // Every count this path emits sits on the causal temporal grid.
   CHECK((trace.duration_frames - 1) % 8 == 0);
+
+  // ── THE HEAD'S TWO WIDTHS (A24 wave 6, row LTX25-A24-DURATION-HEAD-BF16,
+  //    issue #2955) ─────────────────────────────────────────────────────────
+  //
+  // Upstream resolves ONE pipeline dtype and it is bfloat16 (distilled.py:109),
+  // handed to the head at :163-165. Everything above this point -- the frame
+  // count, the grid, the trace, the render -- was green while this tree ran the
+  // head at f32, because a frame count is an integer either arm produces and
+  // `duration_seconds` is one scalar. These are the two lines that can see it,
+  // and they claim DIFFERENT things on purpose.
+  //
+  // STORAGE: the resident bag's bytes over its parameter count. `Load` asks for
+  // `kBF16` at both call sites; this is what says the file agreed. Reverting
+  // EITHER call site alone reds it.
+  const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+  INFO("duration head weights: " << trace.duration_head_weight_bytes << " bytes over "
+                                 << trace.duration_head_weight_elems << " parameters");
+  REQUIRE(trace.duration_head_weight_elems > 0);
+  CHECK(trace.duration_head_weight_bytes == trace.duration_head_weight_elems * bf16_bytes);
+
+  // ARITHMETIC: how many values the head PRODUCED that could not have come out
+  // of a bf16 store. Zero on this arm; `duration_head_values` is the control
+  // that the counter looked at anything, because a counter over nothing also
+  // reports zero and would make the line above it read as a pass.
+  INFO("duration head produced " << trace.duration_head_values << " values, "
+                                 << trace.duration_head_not_bf16 << " wider than bf16");
+  REQUIRE(trace.duration_head_values > 0);
+  CHECK(trace.duration_head_not_bf16 == 0);
+  // AND THE PREDICTED SECONDS IS ITSELF A bf16 WORD -- R4, the last rounding and
+  // the only one a user sees. Swept across the head's output bias at 25 fps on
+  // the shipped widths, 10 of 1000 samples FLIP THE FRAME COUNT by eight frames
+  // on the 8k+1 grid, so this is the store point that decides how much video
+  // gets rendered. A discrete selection has bimodal error, which is why the
+  // frame count above is asserted as an equality and never as a band.
+  const float seconds = static_cast<float>(trace.duration_seconds);
+  CHECK(seconds == vt::BF16ToF32(vt::F32ToBF16(seconds)));
 
   // AND IT IS NOT THE RECIPE'S. The same request against an engine with no head
   // renders the recipe default; a predicted count that happened to equal it would

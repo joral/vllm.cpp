@@ -482,7 +482,7 @@ constexpr char kLtx2AutoDurationExtra[] = "auto_duration";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 680 682 1324 1420 1516 1532 1667 1671 1829 1865 2015 2133 2175 2217 2219
+// 680 682 1324 1420 1516 1532 1667 1671 1829 1865 2017 2135 2177 2219 2221
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -3038,6 +3038,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     im.trace.temporal_upsampler_weight_bytes =
         static_cast<int64_t>(im.temporal_upsampler_weights.Bytes());
   }
+  // THE DURATION HEAD'S STORAGE WIDTH (A24 wave 6, #2955), recorded the same way
+  // and for the same reason: `Load` asks for `kBF16` and this is the only thing
+  // that says the file agreed. Without it, reverting either loader call site
+  // leaves every assertion on this path green.
+  if (im.has_duration_head) {
+    im.trace.duration_head_weight_elems = VaeWeightElems(im.duration_head_weights);
+    im.trace.duration_head_weight_bytes =
+        static_cast<int64_t>(im.duration_head_weights.Bytes());
+  }
 
   if (!gen.prompt.empty()) {
     // W0: the phase #1269 and W4 are about. Split into the TOWER and the
@@ -3421,12 +3430,19 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // (duration_head.py:104-105) and the video path has both, so withholding one
     // would predict from half the signal the reference uses.
     float predicted_seconds = 0.0F;
+    // THE ARITHMETIC WIDTH, sampled on the ONE production route into the head
+    // (A24 wave 6, #2955). Not on a hand-constructed forward: a unit test that
+    // builds the head itself proves the class works and never that anything
+    // reaches it.
+    Ltx2DurationWidthCounts head_widths;
     frames = Ltx2DurationPredictFrames(
         im.duration_head_cfg, im.duration_head_weights, video_context, context_tokens,
         audio_context, context_tokens, fps, auto_duration.min_seconds,
-        auto_duration.max_seconds, factors_time_for_duration, &predicted_seconds);
+        auto_duration.max_seconds, factors_time_for_duration, &predicted_seconds, &head_widths);
     im.trace.duration_seconds = predicted_seconds;
     im.trace.duration_frames = frames;
+    im.trace.duration_head_not_bf16 = head_widths.not_bf16;
+    im.trace.duration_head_values = head_widths.values;
   }
   if (frames < 1) Fail("num_frames resolved to " + std::to_string(frames));
 
@@ -6327,12 +6343,18 @@ VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& g
     // the audio stream twice, or refusing here, would each be a different
     // prediction from the reference's.
     float predicted_seconds = 0.0F;
+    // The SECOND production route into the head, and it reports its width like
+    // the first. `Ltx2VideoEngine::Generate` reset the trace before it called in
+    // here, so these are this render's.
+    Ltx2DurationWidthCounts head_widths;
     frames = Ltx2DurationPredictFrames(
         im.duration_head_cfg, im.duration_head_weights, /*video_tokens=*/nullptr,
         /*video_token_count=*/0, audio_context, context_tokens, fps, auto_min_seconds,
-        auto_max_seconds, Ltx2ScaleFactors{}.time, &predicted_seconds);
+        auto_max_seconds, Ltx2ScaleFactors{}.time, &predicted_seconds, &head_widths);
     im.trace.duration_seconds = predicted_seconds;
     im.trace.duration_frames = frames;
+    im.trace.duration_head_not_bf16 = head_widths.not_bf16;
+    im.trace.duration_head_values = head_widths.values;
   }
 
   // ── the guider (t2a_one_stage.py:196-205) ─────────────────────────────────

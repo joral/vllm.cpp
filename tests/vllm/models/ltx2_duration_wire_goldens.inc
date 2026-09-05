@@ -129,6 +129,15 @@ struct Ltx2DurBf16Case {
     int64_t queries; int64_t heads; int64_t mlp_hidden;
     int64_t video_tokens; int64_t audio_tokens;
     double amplitude; double token_scale;
+    // FNV-1a over the little-endian bf16 WORDS of the fifteen parameters
+    // in named_parameters() order, and of the video-then-audio tokens.
+    // The C++ gate rebuilds this closed form with glibc `sin`, which is
+    // NOT bit-equal to torch's float64 `sin` -- so these say the two
+    // sides hold the same weights BEFORE they are asked to agree on the
+    // answer. A libm that ever moved one bf16 word reds here, by name,
+    // instead of arriving as an unexplained value mismatch.
+    uint64_t weight_digest;
+    uint64_t token_digest;
     // Upstream's own bf16 answer, and the seven rejected rules beside it
     // in the order kLtx2DurBf16RuleNames gives.
     float upstream;
@@ -144,15 +153,15 @@ inline constexpr const char* kLtx2DurBf16RuleNames[7] = {
     "exp_f32",
 };
 inline constexpr Ltx2DurBf16Case kLtx2DurBf16Cases[] = {
-    {4096, 2048, 256, 1, 4, 256, 6, 4, 0.18, 0.5, 4.78125f, {4.8125f, 4.78125f, 4.6875f, 4.8125f, 4.8125f, 4.8125f, 4.77073336f}},  // separates 6: two_round,emb_f32,soft_bf16,attn_f32,gelu_narrow,exp_f32
-    {4096, 2048, 256, 1, 4, 256, 7, 0, 0.18, 0.5, 5.5625f, {5.5f, 5.625f, 5.5625f, 5.5625f, 5.625f, 5.5625f, 5.57755232f}},  // separates 4: two_round,add_f32,attn_f32,exp_f32
-    {4096, 2048, 256, 1, 4, 256, 0, 5, 0.18, 0.5, 4.71875f, {4.78125f, 4.65625f, 4.71875f, 4.8125f, 4.8125f, 4.71875f, 4.73360682f}},  // separates 5: two_round,add_f32,soft_bf16,attn_f32,exp_f32
-    {4096, 2048, 256, 1, 4, 256, 6, 4, 0.05, 0.5, 1.0859375f, {1.0859375f, 1.0859375f, 1.0859375f, 1.0859375f, 1.0859375f, 1.0859375f, 1.08390081f}},  // separates 1: exp_f32
-    {128, 64, 32, 1, 4, 24, 6, 4, 0.35, 0.5, 2.09375f, {2.078125f, 2.09375f, 2.09375f, 2.09375f, 2.09375f, 2.09375f, 2.10052538f}},  // separates 2: two_round,exp_f32
-    {128, 64, 32, 1, 4, 24, 12, 8, 0.25, 0.5, 1.4375f, {1.4375f, 1.4375f, 1.4375f, 1.4375f, 1.4375f, 1.4453125f, 1.44085169f}},  // separates 2: gelu_narrow,exp_f32
-    {256, 128, 32, 1, 4, 32, 12, 8, 0.35, 0.5, 2.484375f, {2.484375f, 2.46875f, 2.46875f, 2.46875f, 2.5f, 2.484375f, 2.48471069f}},  // separates 5: add_f32,emb_f32,soft_bf16,attn_f32,exp_f32
-    {256, 128, 32, 1, 4, 32, 6, 4, 0.4, 0.5, 3.015625f, {2.9375f, 3.015625f, 2.984375f, 3.015625f, 2.984375f, 3.015625f, 3.00886369f}},  // separates 4: two_round,emb_f32,attn_f32,exp_f32
-    {128, 64, 32, 1, 4, 24, 12, 8, 0.4, 0.5, 2.46875f, {2.46875f, 2.46875f, 2.46875f, 2.46875f, 2.453125f, 2.46875f, 2.47502375f}},  // separates 2: attn_f32,exp_f32
+    {4096, 2048, 256, 1, 4, 256, 6, 4, 0.18, 0.5, 0x83ca89de8ade22daULL, 0x83adb692898a5319ULL, 4.78125f, {4.8125f, 4.78125f, 4.6875f, 4.8125f, 4.8125f, 4.8125f, 4.77073336f}},  // separates 6: two_round,emb_f32,soft_bf16,attn_f32,gelu_narrow,exp_f32
+    {4096, 2048, 256, 1, 4, 256, 7, 0, 0.18, 0.5, 0x83ca89de8ade22daULL, 0x409bcc428705810bULL, 5.5625f, {5.5f, 5.625f, 5.5625f, 5.5625f, 5.625f, 5.5625f, 5.57755232f}},  // separates 4: two_round,add_f32,attn_f32,exp_f32
+    {4096, 2048, 256, 1, 4, 256, 0, 5, 0.18, 0.5, 0x83ca89de8ade22daULL, 0x000ef454ae1bd9a8ULL, 4.71875f, {4.78125f, 4.65625f, 4.71875f, 4.8125f, 4.8125f, 4.71875f, 4.73360682f}},  // separates 5: two_round,add_f32,soft_bf16,attn_f32,exp_f32
+    {4096, 2048, 256, 1, 4, 256, 6, 4, 0.05, 0.5, 0x0c6c4e029788ccc4ULL, 0x83adb692898a5319ULL, 1.0859375f, {1.0859375f, 1.0859375f, 1.0859375f, 1.0859375f, 1.0859375f, 1.0859375f, 1.08390081f}},  // separates 1: exp_f32
+    {128, 64, 32, 1, 4, 24, 6, 4, 0.35, 0.5, 0x3fd5d0c31842f777ULL, 0x7e8e6a49789c88efULL, 2.09375f, {2.078125f, 2.09375f, 2.09375f, 2.09375f, 2.09375f, 2.09375f, 2.10052538f}},  // separates 2: two_round,exp_f32
+    {128, 64, 32, 1, 4, 24, 12, 8, 0.25, 0.5, 0xfe97d81f49ebef98ULL, 0xeeb9a1c815f9dff8ULL, 1.4375f, {1.4375f, 1.4375f, 1.4375f, 1.4375f, 1.4375f, 1.4453125f, 1.44085169f}},  // separates 2: gelu_narrow,exp_f32
+    {256, 128, 32, 1, 4, 32, 12, 8, 0.35, 0.5, 0xd81a9174d147ecb7ULL, 0x959eeb50b0ad495aULL, 2.484375f, {2.484375f, 2.46875f, 2.46875f, 2.46875f, 2.5f, 2.484375f, 2.48471069f}},  // separates 5: add_f32,emb_f32,soft_bf16,attn_f32,exp_f32
+    {256, 128, 32, 1, 4, 32, 6, 4, 0.4, 0.5, 0x76fc522e197f7b0bULL, 0xeeb9a1c815f9dff8ULL, 3.015625f, {2.9375f, 3.015625f, 2.984375f, 3.015625f, 2.984375f, 3.015625f, 3.00886369f}},  // separates 4: two_round,emb_f32,attn_f32,exp_f32
+    {128, 64, 32, 1, 4, 24, 12, 8, 0.4, 0.5, 0x400c825c8c3d30a8ULL, 0xeeb9a1c815f9dff8ULL, 2.46875f, {2.46875f, 2.46875f, 2.46875f, 2.46875f, 2.453125f, 2.46875f, 2.47502375f}},  // separates 2: attn_f32,exp_f32
 };
 // How many of the emitted fixtures separate each rule, in the order
 // kLtx2DurBf16RuleNames gives. The test asserts every entry is non-zero,
