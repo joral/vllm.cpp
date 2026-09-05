@@ -1002,9 +1002,17 @@ Not done, and each is a gate rather than a nicety:
   `s.step >= s.budget` (`qwen4_exp_forward.cpp:118`), so `VT_Q4EXP_LAYER_FP=3`
   covers forwards 0, 1, 2 = tokens `11751 13 15767`, which **agree on both arms**,
   while the three disagreeing ids are emitted at forwards 4, 6 and 7. **No
-  instrument on this row has yet observed a disagreeing step.** Those forwards are
-  causally upstream of forward 4 through the recurrent state, so the taps are not
-  irrelevant to the disagreement; they simply never observe it. (b) `rel(sumabs)`
+  `VT_Q4EXP_LAYER_FP` fingerprint has yet observed a disagreeing step.** Those
+  forwards are causally upstream of forward 4 through the recurrent state, so the
+  taps are not irrelevant to the disagreement; they simply never observe it.
+  **CORRECTION 2026-09-05
+  ([#2969](https://github.com/mudler/vllm.cpp/issues/2969)): this bullet said "no
+  instrument", which is wrong for the other tap.** `VT_MOE_SEL_FP` counts MoE
+  block invocations and not forwards, and `qwen4_exp` runs 48 MoE blocks in each
+  forward, so wave MOEDIV's 384 calls reached forwards 4, 6 and 7. That reading is
+  VOID for a different reason: its CUDA arm answered the degenerate pre-#2550
+  sequence `11751 271 271 271 271 271 0 0`. **A non-degenerate arm is what is
+  missing, not a wider window.** (b) `rel(sumabs)`
   is a difference of NORMS, not a norm of DIFFERENCES, and its under-report is a
   DISTRIBUTION rather than the `~122x` single seed draw this line first quoted: at
   `n = 12800` over 400 seeds the median is 75x (sigma 1e-3) to 140x (sigma 1e-4),
