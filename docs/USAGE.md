@@ -362,6 +362,37 @@ which names several speculators in preference order. It is parsed and checked
 today and **refused at startup**, because nothing resolves a chain yet; the same
 page says what the document looks like and what each rule refuses.
 
+### Read acceptance off `GET /metrics`
+
+A server started with `--speculative-config` exports four Prometheus counters
+under vLLM's own names, in addition to the always-on catalog. They are
+config-gated exactly as vLLM gates them: a server with no `--speculative-config`
+exports none of them, so an absent family means "this engine does not
+speculate" and never "it speculates and accepts nothing".
+
+| Series | What it counts |
+|---|---|
+| `vllm:spec_decode_num_drafts_total` | (request, step) pairs that carried a draft. NOT forward passes: one verify step over 8 drafted requests adds 8 |
+| `vllm:spec_decode_num_draft_tokens_total` | draft tokens verified, after subtracting positions the drafter could not fill |
+| `vllm:spec_decode_num_accepted_tokens_total` | draft tokens accepted, EXCLUDING the bonus/replacement token every verify step emits |
+| `vllm:spec_decode_num_accepted_tokens_per_pos_total{position="d"}` | acceptances at draft depth `d`, one series per configured draft position |
+
+Every series carries the `{model_name, engine}` labels the rest of the catalog
+uses. The acceptance rate and the mean acceptance length are the same PromQL
+vLLM documents:
+
+```text
+rate(vllm:spec_decode_num_accepted_tokens_total[5m])
+  / rate(vllm:spec_decode_num_draft_tokens_total[5m])
+
+1 + rate(vllm:spec_decode_num_accepted_tokens_total[5m])
+      / rate(vllm:spec_decode_num_drafts_total[5m])
+```
+
+The same figures are available in-process from the C ABI's
+`vllm_engine_spec_acceptance` (below), which reports cumulative totals for one
+engine handle rather than a scrapeable series.
+
 ## Reuse the NVFP4 tactic draw between runs
 
 An NVFP4 W4A4 model runs its general matrix multiplications through CUTLASS, and
