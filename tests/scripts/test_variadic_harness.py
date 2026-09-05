@@ -89,9 +89,14 @@ class MockHandler(BaseHTTPRequestHandler):
         cfg = self.server.cfg
         length = int(self.headers.get("Content-Length") or 0)
         self.rfile.read(length)
+        # `inflight` counts GENERATION, not the socket. A client that has read
+        # `[DONE]` and closed its connection can start its next request while
+        # this handler is still returning, and counting the socket would then
+        # report a phantom overlap at c=1.
         with self.server.lock:
             self.server.inflight += 1
             self.server.peak = max(self.server.peak, self.server.inflight)
+        released = False
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -112,15 +117,18 @@ class MockHandler(BaseHTTPRequestHandler):
                 usage["accepted_draft_tokens"] = cfg["accepted"]
             self._sse({"choices": [], "usage": usage} if cfg["usage"]
                       else {"choices": []})
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
             with self.server.lock:
                 self.server.drafted += cfg["drafted"]
                 self.server.accepted += cfg["accepted"]
-        finally:
-            with self.server.lock:
                 self.server.inflight -= 1
+                released = True
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        finally:
+            if not released:
+                with self.server.lock:
+                    self.server.inflight -= 1
 
     def _sse(self, obj):
         payload = ("data: " + json.dumps(obj) + "\n\n").encode()
@@ -336,6 +344,82 @@ class AcceptanceFromMetrics(unittest.TestCase):
         acc = report.acceptance(leg)
         self.assertEqual(acc["source"], "absent")
         self.assertNotIn("rate", acc)
+
+
+class ReportTablesAreWellFormed(unittest.TestCase):
+    """Every markdown row carries exactly as many cells as its header.
+
+    The statistics were right and the table was not: the axis name and p50
+    rendered into one cell, so every value after it sat under the heading to its
+    left and a reader taking p95 took p90. Nothing in this file could see that,
+    because nothing read the markdown.
+    """
+
+    def _report(self, tmp):
+        srv_o, url_o = start_mock(tokens=12, tokens_per_chunk=4, metrics=True)
+        srv_t, url_t = start_mock(tokens=12, tokens_per_chunk=1, metrics=False,
+                                  accepted=5)
+        corpus = make_corpus(tmp, 40)
+        for rnd in (1, 2):
+            for c in (1, 2):
+                run_leg(url_o, tmp, f"OURS-r{rnd}-c{c}", c, 6, 2, arm="OURS",
+                        corpus=corpus)
+                run_leg(url_t, tmp, f"THEIRS-r{rnd}-c{c}", c, 6, 2,
+                        arm="THEIRS", corpus=corpus)
+        _stop(srv_o)
+        _stop(srv_t)
+        for name in ("OURS", "THEIRS"):
+            for rnd in (1, 2):
+                for c in (1, 2):
+                    src = Path(tmp) / f"{name}-r{rnd}-c{c}.json"
+                    data = json.loads(src.read_text())
+                    data["summary"]["round"] = rnd
+                    src.write_text(json.dumps(data))
+        rc = subprocess.run(
+            [sys.executable, str(HARNESS / "report.py"), "--dir", tmp,
+             "--glob", "*-r*-c*.json"],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(rc.returncode, 0, rc.stderr)
+        return rc.stdout
+
+    def test_every_row_has_its_header_s_column_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._report(tmp)
+        width = None
+        checked = 0
+        for line in out.splitlines():
+            if not line.startswith("|"):
+                width = None
+                continue
+            cells = len(line.split("|"))
+            if width is None:
+                width = cells
+                continue
+            if set(line.replace("|", "").replace("-", "").strip()) == set():
+                self.assertEqual(cells, width, f"separator row: {line}")
+                continue
+            self.assertEqual(cells, width,
+                             f"row has {cells} cells, header has {width}: {line}")
+            checked += 1
+        self.assertGreater(checked, 40, "the report rendered almost no rows")
+
+    def test_the_percentile_table_carries_every_reported_percentile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._report(tmp)
+        header = next(ln for ln in out.splitlines()
+                      if ln.startswith("| arm | c | n | axis |"))
+        for pct in ("p50", "p90", "p95", "p99"):
+            self.assertIn(pct, header)
+        self.assertIn("max", header)
+        row = next(ln for ln in out.splitlines()
+                   if ln.startswith("| OURS |") and " ttft ms |" in ln)
+        self.assertEqual(len(row.split("|")), len(header.split("|")), row)
+
+    def test_both_warmup_views_are_printed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._report(tmp)
+        self.assertIn("warm only, warmup discarded", out)
+        self.assertIn("with warmup included", out)
 
 
 class CorpusIsDeterministic(unittest.TestCase):
