@@ -50,12 +50,16 @@ CORPUS_SEED=${CORPUS_SEED:-0}
 # --- our engine's serving configuration ---
 # --max-model-len is EXPLICIT. Left to auto-fit it takes the whole KV pool, and
 # the draft context then allocates per concurrent request against that number.
-# --num-blocks x block size is the KV pool: 8192 x 32 = 262,144 tokens. It is
-# generous on purpose: this model is a HYBRID, so the pool also holds every
-# concurrent sequence's recurrent state, and the loader clamps max_num_seqs
-# against it. start_ours raises it further and restarts if the clamp still bites.
+# --num-blocks x block size is the KV pool: 2048 x 32 = 65,536 tokens. Sized
+# from the top rung: 8 sequences of (about 3.4k prompt + 192 output) needs about
+# 900 blocks, and this model is a HYBRID whose pool ALSO holds each concurrent
+# sequence's recurrent state, roughly one page per linear-attention layer, so
+# about 384 more. 2048 leaves room over both. It is not set larger because the
+# pool is real device memory and a server that cannot allocate it dies at
+# startup; `start_ours` raises it and restarts if the clamp bites, and halves it
+# and restarts if the server dies allocating it.
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
-NUM_BLOCKS=${NUM_BLOCKS:-8192}
+NUM_BLOCKS=${NUM_BLOCKS:-2048}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
 MAX_BATCHED=${MAX_BATCHED:-16384}  # our engine has died at 65536 batch tokens
 NSPEC=${NSPEC:-7}
@@ -335,10 +339,21 @@ start_ours_once(){  # start_ours_once <logfile>
 # than the leg being published with a footnote. Bounded: two escalations, then
 # the rung is refused.
 start_ours(){  # start_ours <logfile> [<required concurrency>]
-    local slog="$1" need="${2:-$MAX_NUM_SEQS}" tries=0 rs
+    local slog="$1" need="${2:-$MAX_NUM_SEQS}" tries=0 shrinks=0 rs
     while : ; do
         start_ours_once "$slog"
-        if [ $? -ne 0 ]; then return 1; fi
+        if [ $? -ne 0 ]; then
+            # A pool that does not fit reads as a server that died at startup.
+            # Halve it once and retry, rather than losing the arm to a number
+            # this job chose.
+            if [ "$shrinks" -lt 1 ] && [ "$NUM_BLOCKS" -gt 512 ]; then
+                shrinks=$(( shrinks + 1 ))
+                NUM_BLOCKS=$(( NUM_BLOCKS / 2 ))
+                res "OURS server did not start at --num-blocks $(( NUM_BLOCKS * 2 )) -- halving to $NUM_BLOCKS and retrying once"
+                continue
+            fi
+            return 1
+        fi
         rs=$(resolved_seqs "$slog")
         if [ -z "$rs" ] || [ "$rs" -ge "$need" ]; then
             res "OURS resolved max_num_seqs=${rs:-$MAX_NUM_SEQS} (need $need) at --num-blocks $NUM_BLOCKS"
