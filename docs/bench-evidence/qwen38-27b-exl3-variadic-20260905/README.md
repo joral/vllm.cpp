@@ -18,6 +18,8 @@ Issue [#2970](https://github.com/mudler/vllm.cpp/issues/2970).
 | `report.md` | the report as the job printed it, from `benchmarks/variadic/report.py` |
 | `*.clientlog` | one per leg, the client's own stdout including its `CLIENT_RESULT` line |
 | `mutation-controls.txt` | the seven mutations run against `tests/scripts/test_variadic_harness.py`, and what each one broke |
+| `numpy-percentile-crosscheck.txt` | 27,000 pairs of `report.percentile` against `numpy.percentile`, over random samples of 1 to 40 values at nine percentiles |
+| `headtohead-recomputed-report.md` | the report as printed over the PREDECESSOR's four legs, converted by `benchmarks/variadic/adapt_headtohead.py`. Its with-warmup mean time to first token reproduces that page's four published values exactly, which is what makes it a rereading of the same bytes rather than a new run |
 
 The harness itself is committed at
 [`benchmarks/variadic/`](../../../benchmarks/variadic) and is not duplicated
