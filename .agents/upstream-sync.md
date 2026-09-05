@@ -68,8 +68,11 @@ the runtime and distribution strings from `IMPORT VLLM_VERSION` and
 the source build in [`sync/2026-09-03-e126687-runhalf.md`](sync/2026-09-03-e126687-runhalf.md)
 §2 and §5), the FlashInfer version from `PIPLIST flashinfer-python` in the same
 lease (§5.2). They are not derivable from the release number — the oracle reports
-`0.28.1rc1.dev132+ge126687a9`, not `0.28.1rc1`, and its distribution metadata
-adds a `.precompiled` suffix its runtime string lacks. `tools/bench/` reads this
+`0.28.1rc1.dev132+ge126687a9`, not `0.28.1rc1`. **This sentence used to end "and
+its distribution metadata adds a `.precompiled` suffix its runtime string
+lacks", which the correction below made false and which nothing then removed;**
+on a source build the two strings are equal, and a source build is the only mode
+that runs on this architecture. `tools/bench/` reads this
 block rather than duplicating it (#520); the duplicate drifted once, and the
 harness spent 17 days *refusing* the oracle this record required. Advance it only
 as part of a sync cycle, from a measured oracle, never by transcribing a version
@@ -98,6 +101,15 @@ revision produced
 ([`sync/2026-09-03-e126687-runhalf.md`](sync/2026-09-03-e126687-runhalf.md) §2,
 lines 52 and 56). Writing a string nobody read is the #520 failure and is not what
 happened here.
+
+**A second build has since read the same string on a second device.** Job
+`7386f034-246a-4af5-9a04-f98aafffce54` built this revision from source on
+`dgx:gpu0` (GB10, `sm_121a`) on 2026-09-04, read `importlib.metadata` from a
+directory that is not the source tree, and printed
+`VLLM_VERSION 0.28.1rc1.dev132+ge126687a9` — no suffix. The value above was taken
+from a Thor build; this one is GB10, which is the device every binding number on
+the affected gates was taken on.
+[`../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md`](../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md).
 
 Whoever next builds the oracle records WHICH mode they used and, if the field is
 wrong for it, corrects it from THAT measurement — never by editing the block to
