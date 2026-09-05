@@ -109,7 +109,7 @@ anchor below is the `e126687a9` one.
 ## Our baseline
 
 State at `c796fea41`, the base this row branched from, and re-verified at
-`dfd38059a` after merging 32 commits of `main` into it -- both headers still
+`885ed633f` after merging 46 commits of `main` into it -- both headers still
 say this, and the scheduler still carries the deferral comment. Both headers
 named the gap themselves, so nothing here had to be discovered:
 

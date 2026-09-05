@@ -666,9 +666,8 @@ two legs per arm. No multi-request batching, no long context, no second box.
 - For the earlier `vllm-bench` runs, the unmatched axes against the upstream
   recipe: context (8192 here against their `-cs 262144`) and KV dtype (bf16 here
   against their `-cq nvfp4`, which this engine refuses by name —
-  [#2620](https://github.com/mudler/vllm.cpp/issues/2620), whose named owner row
-  did not exist). `vllm-bench` had no way to select a KV dtype when those runs
-  were taken, so no number on this page states the KV dtype it was measured on.
+  [#2620](https://github.com/mudler/vllm.cpp/issues/2620)). `vllm-bench` had no
+  way to select a KV dtype when those runs were taken, so no number on this page states the KV dtype it was measured on.
   It has taken `--kv-cache-dtype` since `89bfd79b0`, which closed
   [#2619](https://github.com/mudler/vllm.cpp/issues/2619), so a rerun can now
   state it.
@@ -677,6 +676,17 @@ two legs per arm. No multi-request batching, no long context, no second box.
   [#2274](https://github.com/mudler/vllm.cpp/issues/2274), and no number on this
   page was measured on a tree that contains the fix. Every arm here ran
   `VT_DFLASH_PAGED=0` instead.
+- **The nvfp4 KV axis will not close by configuration, and the spike that measured
+  why is [`nvfp4-kv-cache.md`](../../.agents/specs/nvfp4-kv-cache.md).** vLLM
+  serves `nvfp4` KV only on FlashInfer's trtllm-gen path, admitted at compute
+  capability family 100; this box is `sm_121a`, so the pinned oracle refuses the
+  dtype here too and there is no oracle run to gate a port against. What their
+  `-cq nvfp4` denotes is not established either: the pinned exllamav3 has no
+  `tools/serve_openai.py`, its `-cq` takes a bit count rather than a format name
+  (`eval/model_diff.py:475`), and `nvfp4` appears there only in weight handling.
+  So this axis is not one engine lacking a switch the other has, until somebody
+  reads the revision that recipe was written against. Closing it on our side
+  means implementing the arm under `KV-NVFP4-TURBO`, which the spike now owns.
 - [#2570](https://github.com/mudler/vllm.cpp/issues/2570): the `m <= 8` EXL3
   GEMV. When this page was first written it instantiated `(3,1)` only, and this
   checkpoint has no `(3,1)` tensor at all, so the arm was dead on it. `(3,2)`

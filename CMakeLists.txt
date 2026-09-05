@@ -1735,6 +1735,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gdn_fused.hip
     src/vt/rocm/rocm_mla_fused_norm_rope.hip
     src/vt/rocm/rocm_mla_ops.hip
+    src/vt/rocm/rocm_mla_attn.hip
     src/vt/rocm/rocm_skinny_gemm.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
@@ -1761,6 +1762,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gdn_fused.hip
       src/vt/rocm/rocm_mla_fused_norm_rope.hip
       src/vt/rocm/rocm_mla_ops.hip
+      src/vt/rocm/rocm_mla_attn.hip
       src/vt/rocm/rocm_skinny_gemm.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
