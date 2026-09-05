@@ -195,6 +195,72 @@ TEST_CASE("ROCm SiluAndMul gate-dtype narrowing matches CPU oracle exactly") {
   }
 }
 
+// ── GeluAndMul: the same defect, same file, same helper ─────────────────────
+// The CPU oracle rounds the GELU intermediate through in_dt before the multiply
+// (cpu_ops.cpp:644) exactly as it does the silu one, so GeluMulK needs the same
+// narrowing. Without it the bf16 arm multiplies an f32 gelu where the oracle
+// multiplies a bf16-rounded one, and this case is red. Bounds are the SiluAndMul
+// case's: exact bytes on bf16 (which is what the narrowing buys), a 4-ULP band
+// on f32 for the device-vs-host transcendental.
+TEST_CASE("ROCm GeluAndMul gate-dtype narrowing matches CPU oracle exactly") {
+  if (NoDevice()) return;
+
+  struct Shape { int64_t T, D; };
+  const Shape shapes[] = {{1, 4}, {3, 128}, {2, 1024}};
+
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  QueueGuard cqg(cpu), rqg(rocm);
+
+  for (const auto& sh : shapes) {
+    const int64_t T = sh.T, D = sh.D;
+    const size_t xn = static_cast<size_t>(T * 2 * D);
+    const size_t on = static_cast<size_t>(T * D);
+    const std::vector<float> x_f = RandomVec(xn, 2003 + static_cast<uint32_t>(T * D));
+    const std::vector<uint16_t> x_bf = F32VecToBf16(x_f);
+
+    for (bool bf16 : {false, true}) {
+      CAPTURE(bf16);
+      CAPTURE(T);
+      CAPTURE(D);
+
+      std::vector<float> ref_f(on, 0.0f);
+      std::vector<uint16_t> ref_b(on, 0);
+      if (bf16) {
+        std::vector<uint16_t> cx = x_bf;
+        Tensor tx = MakeTensor(cx.data(), DType::kBF16, Cpu(), {T, 2 * D});
+        Tensor to = MakeTensor(ref_b.data(), DType::kBF16, Cpu(), {T, D});
+        vt::GeluAndMul(cqg.q, to, tx);
+      } else {
+        std::vector<float> cx = x_f;
+        Tensor tx = MakeTensor(cx.data(), DType::kF32, Cpu(), {T, 2 * D});
+        Tensor to = MakeTensor(ref_f.data(), DType::kF32, Cpu(), {T, D});
+        vt::GeluAndMul(cqg.q, to, tx);
+      }
+
+      const DType dt = bf16 ? DType::kBF16 : DType::kF32;
+      DeviceTensor dx(rocm, rqg.q, dt, {T, 2 * D}, bf16 ? static_cast<const void*>(x_bf.data())
+                                                        : static_cast<const void*>(x_f.data()));
+      DeviceTensor dout(rocm, rqg.q, dt, {T, D});
+      vt::GeluAndMul(rqg.q, dout.tensor(), dx.tensor());
+      rocm.Synchronize(rqg.q);
+
+      if (bf16) {
+        std::vector<uint16_t> got(on);
+        dout.Download(rqg.q, got.data());
+        CHECK(got == ref_b);  // exact: both sides narrow gelu to bf16 then multiply
+      } else {
+        std::vector<float> got(on);
+        dout.Download(rqg.q, got.data());
+        for (size_t i = 0; i < on; ++i) {
+          CAPTURE(i);
+          CHECK(UlpsApart(got[i], ref_f[i]) <= 4);  // device vs host tanhf band
+        }
+      }
+    }
+  }
+}
+
 // ── MoE MoeSiluMul: out[N] = silu(gate[N]) * up[N] ──────────────────────────
 TEST_CASE("ROCm MoeSiluMul gate-dtype narrowing matches CPU oracle exactly") {
   if (NoDevice()) return;
