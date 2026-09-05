@@ -18,11 +18,12 @@ through-`main` shape both halves of this change reuse.
 **In scope.** Two rules in `scripts/check-oracle-pins.py`, and the marker edits
 one of them needs.
 
-1. **#2883.** Every ` <!--pin:commit--> ` / ` <!--pin:label--> ` span in
-   `.agents/` and `docs/` must agree with the authority in
-   `.agents/upstream-sync.md`, and three *named* paths — `.agents/NOW.md`,
-   `docs/FEATURES.md`, `docs/benchmarks/how-we-measure.md` — must each carry at
-   least one `commit` span. The three surfaces gain the markers.
+1. **#2883.** Three *named* paths — `.agents/NOW.md`, `docs/FEATURES.md`,
+   `docs/benchmarks/how-we-measure.md` — must each carry at least one
+   ` <!--pin:commit--> ` span, and every ` commit ` / ` label ` span in them must
+   agree with the authority in `.agents/upstream-sync.md`. The three surfaces
+   gain the markers. **The rule reads those paths and nothing else**; see
+   §"A glob was built first and rejected" for the measurement that decided it.
 2. **#2898.** `ParityThroughMainTests` gains a case that drives `main` against a
    synthetic registry holding a declaration for an unregistered oracle, and
    asserts `main([]) == 1`. A companion case declares a *registered* oracle and
@@ -36,9 +37,8 @@ one of them needs.
 - **The other two public restatements of the current pin.**
   `docs/benchmarks/speculative-decoding.md:4` and
   `docs/benchmarks/vllm-online-serving.md:15` also name `e126687a9a`. They are
-  outside this change's file lane. The rule is built so that marking them later
-  needs **no checker edit**: it validates every marked span it finds and
-  requires markers only in the three named paths. Recorded under `## Owed`.
+  outside this change's file lane. Marking them later costs one line in
+  `PIN_SURFACES` and no other checker change. Recorded under `## Owed`.
 - **A regex over prose.** Ruled out by #2880's 286-file measurement and not
   revisited. The design below replaces prose parsing entirely.
 - **Removing the restatements.** #2883 admits that as a third outcome. It is a
@@ -130,13 +130,34 @@ This shape was chosen over the alternatives for five reasons:
   `vllm_commit`. `label` spans: equal to `public_version(vllm_runtime_version)`,
   by equality after that decomposition and not by prefix — the same reasoning
   #2880 recorded for `pin_label`.
-- Each path in `REQUIRED_PIN_SURFACES` must exist and carry at least one
+- Each path in `PIN_SURFACES` must exist and carry at least one
   `commit` span. `label` is not required per file, because the release label is
   derived from the commit and requiring it would red on an editor who tightens a
   sentence to name only the revision.
-- `main` collects `*.md` under `PIN_SURFACE_ROOTS` and calls the rule. All four
-  module constants are patchable, so the through-`main` tests can point the
-  whole rule at a synthetic tree.
+- `main` reads each path in `PIN_SURFACES` and calls the rule, swallowing the
+  `OSError` so the rule reports an absent surface with a reason instead of
+  skipping it. `PIN_SURFACES` is a module constant, patchable like `ROOT`,
+  `ORACLES`, `AGENTS_MD`, `UPSTREAM_SYNC` and `DECLARATION_ROOTS`, so the
+  through-`main` tests point the whole rule at a synthetic tree.
+
+## A glob was built first and rejected, on evidence
+
+The first implementation validated every marked span under `.agents/` and
+`docs/`, so that marking a fourth surface would need no checker edit. **It went
+red on this spec.** The `### 2` section above quotes the markers in a fenced
+block to explain them, and the checker read that as four openers, two complete
+spans, and a `commit` value half a document long:
+
+```text
+oracle-pins: .agents/specs/pin-prose-surfaces-and-declaration-reach.md: 4
+  `<!--pin:...-->` opener(s) but 2 complete span(s)
+```
+
+Documentation of a marker is not a surface carrying one, and no cheap rule
+separates them — not a code-fence exclusion, which is one more prose parser, and
+not a directory exemption, which is arbitrary. Reading only the named paths is
+also exactly what #2883 proposed, so the glob bought extensibility this rule was
+never asked for and paid for it with a false positive on its own spec.
 
 For #2898 no product code changes: `main` already calls `check_declarations`.
 The defect is that nothing measured the call.
@@ -208,7 +229,8 @@ re-run, because a restored `.py` can still execute mutant bytecode.
   the moment a marker is added and need no checker change. Tracked by
   [#2883](https://github.com/mudler/vllm.cpp/issues/2883) until it closes with
   this change, and by the follow-up filed in the pull request body if the two
-  files are still unmarked then.
+  files are still unmarked then. Adding them is a one-line edit to
+  `PIN_SURFACES` plus the markers themselves.
 - The two `## Owed` bullets in
   [`oracle-pin-parity-reconcile.md`](oracle-pin-parity-reconcile.md) that name
   #2883 and #2898 go stale when those issues close. That file is owned by
