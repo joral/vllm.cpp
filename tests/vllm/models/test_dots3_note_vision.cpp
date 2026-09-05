@@ -587,31 +587,45 @@ double Fp8E4M3Decode(unsigned char b) {
   return sm * std::ldexp(1.0 + static_cast<double>(m) / 8.0, e - 7);
 }
 
-// One block-cast weight: the packed bytes at `[N, K]` and the f64 scale grid at
+// One block-cast weight: the packed bytes at the PADDED
+// `[align(N,128), align(K,128)]` and the f64 scale grid at
 // `[cdiv(N,128), cdiv(K,128)]`.
 struct BlockCastRef {
   std::vector<unsigned char> packed;
   std::vector<double> scale;
-  int64_t rows = 0;   // cdiv(N, 128)
-  int64_t cols = 0;   // cdiv(K, 128)
+  int64_t rows = 0;   // cdiv(N, 128), and the padded row count / 128
+  int64_t cols = 0;   // cdiv(K, 128), and the padded column count / 128
 };
 
-// `_per_block_cast_to_fp8_padded` (`vision.py:225-239`) over
-// `per_block_cast_to_fp8` (`vllm/utils/deep_gemm.py:660-681`), literally:
+// `_per_block_cast_to_fp8_padded` (`vision.py:225-239` @ `9035151d6`) over
+// `per_block_cast_to_fp8` (`deep_gemm/utils/math.py:51-61` @ DeepGEMM
+// `e21c821f39a2056d68067a466c64ddc942200106`, the revision
+// `cmake/external_projects/deepgemm.cmake:33` pins and `:168-176` vendors into
+// `vllm.third_party.deep_gemm`, which is the module `vision.py:14` imports and
+// NOT `vllm/utils/deep_gemm.py`, whose same-named function takes no `gran_k`),
+// literally, and in the order upstream composes the two:
 //
-//   x_padded = zeros(align(m,128), align(n,128));  x_padded[:m,:n] = x   :669-672
-//   x_view   = x_padded.view(-1, 128, ncols/128, 128)                    :673
-//   x_amax   = x_view.abs().float().amax(dim=(1,3), keepdim=True).clamp(1e-4)
-//                                                                       :674
-//   sf       = x_amax / fp8_max                                          :676
-//   (no _ceil_to_ue8m0: use_ue8m0 is False at vision.py:237)             :677
-//   x_scaled = (x_view * (1.0 / sf)).to(fp8)                             :678
-//   return x_scaled[:m,:n], sf                                           :679-681
+//   OUTER (vision.py:229-239)
+//     padded = weight.new_zeros(ceil(rows,128), ceil(cols,128))          :230
+//     padded[:rows, :columns] = weight                                   :234
+//     return per_block_cast_to_fp8(padded, use_ue8m0=False, gran_k=128)  :235
+//       -- and it does NOT slice the result back.
+//   INNER (math.py:51-61), whose `m, n` is the PADDED shape it was handed
+//     x_padded = zeros(align(m,128), align(n,128)) (already aligned: no-op) :54
+//     x_view   = x_padded.view(-1, 128, ncols/128, 128)                    :56
+//     x_amax   = x_view.abs().float().amax(dim=(1,3), keepdim=True).clamp(1e-4)
+//                                                                          :57
+//     sf       = x_amax / 448.0                                            :58
+//     (no ceil_to_ue8m0: use_ue8m0 is False at vision.py:237)               :59
+//     x_scaled = (x_view * (1.0 / sf)).to(fp8)                              :60
+//     return x_scaled.view_as(x_padded)[:m, :n], sf                         :61
+//       -- `[:m, :n]` is the IDENTITY here, because `m, n` is already padded.
 //
-// The PAD is materialized here rather than reasoned away, because the whole
-// point of an independent reference is that it does not repeat the
-// implementation's shortcut. If the implementation's "a zero cannot raise an
-// absolute maximum" argument were wrong, this arm would disagree with it.
+// So the shard this returns carries the PAD, which is what upstream stacks. The
+// pad is materialized rather than reasoned away, because the whole point of an
+// independent reference is that it does not repeat the implementation's
+// shortcut: if the implementation's "a zero cannot raise an absolute maximum"
+// argument were wrong, this arm would disagree with it.
 BlockCastRef PerBlockCastFp8(const std::vector<double>& w, int64_t n,
                              int64_t k) {
   const int64_t B = 128;
@@ -646,11 +660,9 @@ BlockCastRef PerBlockCastFp8(const std::vector<double>& w, int64_t n,
         }
     }
   }
-  out.packed.assign(static_cast<size_t>(n * k), 0u);
-  for (int64_t r = 0; r < n; ++r)
-    for (int64_t c = 0; c < k; ++c)
-      out.packed[static_cast<size_t>(r * k + c)] =
-          full[static_cast<size_t>(r * pk + c)];
+  // NO SLICE BACK. `math.py:61` slices to the shape of ITS input, which the
+  // outer function already padded; the result therefore keeps `pn x pk`.
+  out.packed = std::move(full);
   return out;
 }
 
@@ -753,6 +765,13 @@ std::vector<double> MoeFfnFp8(const TinySpec& s, const TinyCheckpoint& ck,
                               bool bf16_denominator = false,
                               std::vector<double>* denom_out = nullptr) {
   const int64_t Im = s.v_moe_inter;
+  // `intermediate_size = w13.shape[1]` (`vision_moe.py:47`) and
+  // `activated_size = intermediate_size // 2` (`:70`). `w13` is the stack of
+  // two shards `_per_block_cast_to_fp8_padded` rounded up, so BOTH are derived
+  // from the padded expert width and never from `moe_intermediate_size`. This
+  // reference derives them the same way, which is why `BlockScaledMatmul`'s
+  // `K / 128` is always whole here.
+  const int64_t Imp = ((Im + 127) / 128) * 128;
   const int64_t k = std::min<int64_t>(
       static_cast<int64_t>(s.v_capacity_factor), ne);
   // `gate_logits = F.linear(x.float(), self.gate_weight.float())` (:289)
@@ -850,18 +869,23 @@ std::vector<double> MoeFfnFp8(const TinySpec& s, const TinyCheckpoint& ck,
                              x.begin() + static_cast<std::ptrdiff_t>((t + 1) * E));
       const GroupQuantRef aq = GroupQuantFp8(xt, 1, E, 128);
       const std::vector<double> g13 =
-          BlockScaledMatmul(aq, w13[static_cast<size_t>(e)], 1, 2 * Im, E);
+          BlockScaledMatmul(aq, w13[static_cast<size_t>(e)], 1, 2 * Imp, E);
       // `apply_moe_activation(MoEActivation.SILU, ...)` (:114-118):
-      // silu(first half) * second half.
-      std::vector<double> act(static_cast<size_t>(Im));
-      for (int64_t i = 0; i < Im; ++i) {
+      // silu(first half) * second half, over `activated_size = Imp`. The last
+      // `Imp - Im` lanes of both halves are the PAD, which is zero on both
+      // sides, so they contribute `silu(0) * 0 = 0` -- and `w2`'s matching pad
+      // COLUMNS are zero too. Neither is special-cased here: they fall out of
+      // the same expression as every real lane, which is what makes this arm a
+      // witness to the pad's inertness rather than an assumption of it.
+      std::vector<double> act(static_cast<size_t>(Imp));
+      for (int64_t i = 0; i < Imp; ++i) {
         const double gv = g13[static_cast<size_t>(i)];
         act[static_cast<size_t>(i)] =
-            (gv / (1.0 + std::exp(-gv))) * g13[static_cast<size_t>(Im + i)];
+            (gv / (1.0 + std::exp(-gv))) * g13[static_cast<size_t>(Imp + i)];
       }
-      const GroupQuantRef bq = GroupQuantFp8(act, 1, Im, 128);
+      const GroupQuantRef bq = GroupQuantFp8(act, 1, Imp, 128);
       const std::vector<double> o =
-          BlockScaledMatmul(bq, w2[static_cast<size_t>(e)], 1, E, Im);
+          BlockScaledMatmul(bq, w2[static_cast<size_t>(e)], 1, E, Imp);
       // `mul_routed_weight=True` on the second dispatch (:135) then
       // `ops.moe_sum` (:148).
       for (int64_t c = 0; c < E; ++c)
@@ -2515,12 +2539,18 @@ TEST_CASE("dots3-note W6b: a BF16 router_bias is refused by name, not read") {
 
 namespace {
 
-// A tower whose two FP8 widths are 128-aligned, so `enable_fp8_moe` resolves to
-// the FP8 class and the arm actually computes.
+// A tower whose expert width is ALREADY 128-aligned, so the pad is the
+// identity everywhere this fixture reaches.
 //
-// NO PUBLISHED CHECKPOINT IS SHAPED LIKE THIS and the case says so rather than
-// implying otherwise: the released `moe_intermediate_size` is 2112 and upstream
-// itself raises on it.
+// AND THAT IS EXACTLY WHY IT CANNOT GATE THE PAD, which is the defect the fresh
+// review of PR #2947 found: with `E = Im = 256` a `VT_CHECK(n % 128 == 0 && k %
+// 128 == 0)` inserted INSIDE `Dots3NoteVisionBlockCastFp8` left both suites
+// fully green (19/21683 and 31/16491), because every width this fixture hands
+// the caster is aligned. `Fp8MoeUnalignedSpec` below is the fixture that makes
+// the pad observable, and the two are kept side by side rather than one being
+// widened, because this one is also the ONLY fixture in which the padded and
+// unpadded readings of the geometry agree -- which is what makes it the control
+// for every other assertion in this section.
 //
 // 256 AND NOT 128, AND THE DIFFERENCE WAS MEASURED. 128 is the smallest value
 // that satisfies `_BLOCK_SHAPE[1]`, and it was the first choice. At 128 every
@@ -2543,37 +2573,92 @@ TinySpec Fp8MoeSpec() {
   return s;
 }
 
+// THE RELEASED EXPERT WIDTH, and the fixture that makes the pad observable.
+//
+// `moe_intermediate_size` 2112 is the value the published `vision_config`
+// carries, and `2112 % 128 == 64`, so `_per_block_cast_to_fp8_padded` rounds
+// each expert shard up to 2176 and the stacked `w13` to 4352. Everything the
+// pad decides is visible only here:
+//
+//   * the emitted shard is 2176 rows, not 2112 -- and a caster that sliced back
+//     would emit a `[4224, 256]` merged operand against a 34-row scale grid,
+//     which `dense_fp8_block::CheckFp8BlockMergeable` refuses by name;
+//   * 17 + 17 == 34 == cdiv(4352, 128), the arithmetic that makes the merge
+//     representable at all;
+//   * the pad rows are the e4m3 zero byte, and `w2`'s pad COLUMNS are too.
+//
+// `embed_dim` stays 256, because it is the one width no pad reaches
+// (`vision_moe.py:77-81`) and a ragged one is a refusal rather than a padding
+// case. The value is the released one rather than a smaller ragged width so
+// that the numbers this case prints are the numbers the checkpoint produces.
+TinySpec Fp8MoeUnalignedSpec() {
+  TinySpec s = Fp8MoeSpec();
+  s.v_moe_inter = 2112;  // the RELEASED `moe_intermediate_size`
+  return s;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // G0. THE LOAD-BEARING CLAIM: which class upstream selects, and whether it runs.
+//
+// W9d SHIPPED THE OPPOSITE ANSWER AND IT WAS FALSE. It asserted that upstream's
+// default class raises on the released geometry and that this tower therefore
+// runs the bf16 one. The arithmetic below is the correction, executed rather
+// than described, and it is written as the two-function chain because reading
+// either function alone reproduces the original mistake.
 // ---------------------------------------------------------------------------
-TEST_CASE("dots3-note W9d: `enable_fp8_moe` selects three states, and the RELEASED config lands in the middle one") {
+TEST_CASE("dots3-note W9d: `enable_fp8_moe` selects two states, and the RELEASED config takes the FP8 one") {
   // ── the arithmetic, as facts rather than as prose ─────────────────────────
   //
-  // THREE widths are in play and only the middle one fails. A reader who checks
-  // the STORED tensor will find it divisible and conclude this case is wrong,
-  // so all three are asserted.
+  // `_BLOCK_SHAPE[1]` is 128 (`vision_moe.py:22`) and
+  // `_per_block_cast_to_fp8_padded` rounds each expert shard UP to a multiple
+  // of it (`vision.py:222-235`), so every width the FP8 class quantizes is
+  // derived from the PADDED extent -- except the first, which is the tower's
+  // own activation and is `embed_dim`.
   const int64_t kBlock = 128;              // `_BLOCK_SHAPE[1]`, vision_moe.py:22
   const int64_t kEmbed = 1536;             // released `embed_dim`
   const int64_t kMoeInter = 2112;          // released `moe_intermediate_size`
-  const int64_t kStoredW13 = 2 * kMoeInter;  // `w13.shape[1]`, vision_moe.py:47
-  // The FIRST quantization (`vision_moe.py:77-81`) is over `embed_dim`: fine.
+  const auto align = [kBlock](int64_t x) { return ((x + kBlock - 1) / kBlock) * kBlock; };
+  const auto cdiv = [kBlock](int64_t x) { return (x + kBlock - 1) / kBlock; };
+
+  // The FIRST quantization (`vision_moe.py:77-81`) is over `embed_dim`, and no
+  // pad reaches it: fine here.
   CHECK(kEmbed % kBlock == 0);
-  // The STORED concatenated operand (`vision.py:258`) is fine TOO -- this is
-  // the number that makes "the expert tensors are unaligned" the wrong summary.
-  CHECK(kStoredW13 == 4224);
-  CHECK(kStoredW13 % kBlock == 0);
-  // The SECOND quantization is over `intermediate_size // 2`
-  // (`vision_moe.py:70`, quantized at `:119-123`), i.e. the HALVED width, and
-  // that is the one `per_token_group_quant_fp8` rejects
-  // (`fp8_utils.py:563-566`: `assert x.shape[-1] % group_size == 0`).
-  CHECK(kMoeInter % kBlock == 64);
+  // The SHARD upstream stores is the PADDED one -- `_per_block_cast_to_fp8_padded`
+  // pads (`vision.py:230-234`) and `per_block_cast_to_fp8` slices only to the
+  // shape it was handed (`deep_gemm/utils/math.py:61` @ `e21c821f`), which is
+  // that padded one, so the slice is the identity.
+  const int64_t kShard = align(kMoeInter);
+  CHECK(kShard == 2176);
+  CHECK(kShard % kBlock == 0);
+  // `w13 = cat((w1, w3), dim=0)` (`vision.py:258`), read as `intermediate_size`
+  // at `vision_moe.py:47`.
+  const int64_t kW13 = 2 * kShard;
+  CHECK(kW13 == 4352);
+  // `activated_size = intermediate_size // 2` (`vision_moe.py:70`), quantized
+  // at `:119-123`. THIS is the number W9d got wrong: it read 2112, the value
+  // an unpadded shard would give, and concluded the assertion fires.
+  const int64_t kActivated = kW13 / 2;
+  CHECK(kActivated == 2176);
+  CHECK(kActivated % kBlock == 0);
+  // ...and the CONCATENATED SCALE GRID, which is the other thing the pad
+  // decides and the reason it cannot be dropped as decoration.
+  CHECK(cdiv(kShard) == 17);
+  CHECK(cdiv(kShard) + cdiv(kShard) == cdiv(kW13));
+  CHECK(cdiv(kW13) == 34);
+  // The unpadded reading, kept as an executed fact so the failure mode has a
+  // number: 34 stacked scale rows against 33 merged block rows.
+  CHECK(cdiv(kMoeInter) + cdiv(kMoeInter) == 34);
+  CHECK(cdiv(2 * kMoeInter) == 33);
+  CHECK(cdiv(kMoeInter) + cdiv(kMoeInter) != cdiv(2 * kMoeInter));
   MESSAGE("W9d widths: embed_dim " << kEmbed << " %128=" << (kEmbed % kBlock)
-                                   << ", stored w13 " << kStoredW13 << " %128="
-                                   << (kStoredW13 % kBlock)
-                                   << ", HALVED activation " << kMoeInter
-                                   << " %128=" << (kMoeInter % kBlock));
+                                   << ", expert " << kMoeInter << " -> padded "
+                                   << kShard << ", w13 " << kW13
+                                   << ", activated " << kActivated << " %128="
+                                   << (kActivated % kBlock)
+                                   << ", scale rows " << cdiv(kShard) << "+"
+                                   << cdiv(kShard) << "==" << cdiv(kW13));
 
   // ── state 1: `enable_fp8_moe` false is upstream's OTHER branch ────────────
   {
@@ -2587,11 +2672,11 @@ TEST_CASE("dots3-note W9d: `enable_fp8_moe` selects three states, and the RELEAS
     CHECK(arm.upstream_raises.empty());
   }
 
-  // ── state 2: THE RELEASED CONFIG ─────────────────────────────────────────
+  // ── state 2: THE RELEASED CONFIG TAKES THE FP8 CLASS ─────────────────────
   {
     const Dots3NoteVisionParams v = ParseDoc(ReleasedConfigDoc());
     // The key is ABSENT from the released `vision_config`, so upstream's
-    // constructor default applies (`vision.py:69`) and this tree now reads it.
+    // constructor default applies (`vision.py:69`) and this tree reads it.
     const nlohmann::json& raw = ReleasedConfigDoc();
     CHECK_FALSE(raw["vision_config"].contains("enable_fp8_moe"));
     CHECK(v.enable_fp8_moe);
@@ -2600,48 +2685,29 @@ TEST_CASE("dots3-note W9d: `enable_fp8_moe` selects three states, and the RELEAS
 
     const vllm::Dots3NoteVisionMoeArm arm =
         vllm::ResolveDots3NoteVisionMoeArm(v);
-    // Upstream selects the FP8 class here and this tower does NOT run it,
-    // because upstream's own assertion fires first.
-    CHECK_FALSE(arm.fp8);
-    REQUIRE_FALSE(arm.upstream_raises.empty());
-    MESSAGE("W9d released-config notice: " << arm.upstream_raises);
-    // The notice must name the WIDTH, the ARITHMETIC, the ASSERTION and its
-    // ANCHOR. A refusal that stops naming its specific cause is the mute-switch
-    // shape this protocol refuses, so each is asserted rather than the whole
-    // string being matched loosely.
-    CHECK(arm.upstream_raises.find("moe_intermediate_size") != std::string::npos);
-    CHECK(arm.upstream_raises.find("2112") != std::string::npos);
-    CHECK(arm.upstream_raises.find("2112 % 128 == 64") != std::string::npos);
-    CHECK(arm.upstream_raises.find("fp8_utils.py:563-566") != std::string::npos);
-    CHECK(arm.upstream_raises.find("assert x.shape[-1] % group_size == 0") !=
-          std::string::npos);
-    CHECK(arm.upstream_raises.find("vision.py:69") != std::string::npos);
-    CHECK(arm.upstream_raises.find("MoESwiGLUFFNFP8") != std::string::npos);
-    CHECK(arm.upstream_raises.find("#2881") != std::string::npos);
-    // ...and it must name the class this tower DOES run, so the reader is told
-    // what happened and not only what did not.
-    CHECK(arm.upstream_raises.find("MoESwiGLUFFN`") != std::string::npos);
-  }
-
-  // ── state 3: a 128-aligned tower takes the FP8 class ─────────────────────
-  {
-    nlohmann::json d = ReleasedConfigDoc();
-    d["vision_config"]["embed_dim"] = 1536;
-    d["vision_config"]["adapter_in_dim"] = 1536;
-    d["vision_config"]["moe_intermediate_size"] = 2048;
-    const Dots3NoteVisionParams v = ParseDoc(d);
-    CHECK(v.enable_fp8_moe);
-    const vllm::Dots3NoteVisionMoeArm arm =
-        vllm::ResolveDots3NoteVisionMoeArm(v);
+    // Upstream selects the FP8 class here and it RUNS. There is no notice,
+    // because there is nothing to report.
     CHECK(arm.fp8);
     CHECK(arm.upstream_raises.empty());
+    // ...and `moe_intermediate_size` cannot put a tower in the other state at
+    // ANY value, because the pad owns that width. Swept over the residues that
+    // bracket a 128-block -- the first, the two either side of the half, the
+    // released one and the last -- rather than argued from the source.
+    for (const int64_t w : {2049, 2111, 2112, 2113, 2175, 2176}) {
+      nlohmann::json d = ReleasedConfigDoc();
+      d["vision_config"]["moe_intermediate_size"] = w;
+      const vllm::Dots3NoteVisionMoeArm a =
+          vllm::ResolveDots3NoteVisionMoeArm(ParseDoc(d));
+      CAPTURE(w);
+      CHECK(a.fp8);
+      CHECK(a.upstream_raises.empty());
+    }
   }
 
-  // ── the FIRST width can fail too, and the notice must name THAT one ──────
-  // `embed_dim` reaches the same assertion one call earlier
-  // (`vision_moe.py:77-81`), so the message names whichever fails FIRST rather
-  // than a set. Without this subcase a resolution that only ever looked at
-  // `moe_intermediate_size` would read green.
+  // ── the ONE state that still refuses, and it is the FIRST quantization ───
+  // `embed_dim` is the last dimension of the activation the tower hands in
+  // (`vision_moe.py:77-81`), which is not a weight and which no pad reaches.
+  // Without this subcase the resolution would have no negative arm at all.
   {
     // 1488 = 24 x 62, so it satisfies the parser's own
     // `embed_dim % num_attention_heads == 0` and its even-head_dim rule while
@@ -2650,19 +2716,249 @@ TEST_CASE("dots3-note W9d: `enable_fp8_moe` selects three states, and the RELEAS
     nlohmann::json d = ReleasedConfigDoc();
     d["vision_config"]["embed_dim"] = 1488;
     d["vision_config"]["adapter_in_dim"] = 1488;
-    d["vision_config"]["moe_intermediate_size"] = 2048;
     const vllm::Dots3NoteVisionMoeArm arm =
         vllm::ResolveDots3NoteVisionMoeArm(ParseDoc(d));
     CHECK_FALSE(arm.fp8);
     REQUIRE_FALSE(arm.upstream_raises.empty());
+    MESSAGE("W9d embed_dim notice: " << arm.upstream_raises);
+    // The notice must name the WIDTH, the ARITHMETIC, the ASSERTION and its
+    // ANCHOR. A refusal that stops naming its specific cause is the mute-switch
+    // shape this protocol refuses, so each is asserted rather than the whole
+    // string being matched loosely.
     CHECK(arm.upstream_raises.find("embed_dim") != std::string::npos);
     CHECK(arm.upstream_raises.find("1488 % 128 == 80") != std::string::npos);
-    // ...and NOT the other width, which is aligned here. A message that named
-    // both would be a set, and the point of naming one is that it is the one
-    // upstream reaches first.
-    CHECK(arm.upstream_raises.find("moe_intermediate_size") ==
+    CHECK(arm.upstream_raises.find("fp8_utils.py:563-566") != std::string::npos);
+    CHECK(arm.upstream_raises.find("assert x.shape[-1] % group_size == 0") !=
+          std::string::npos);
+    CHECK(arm.upstream_raises.find("vision_moe.py:77-81") != std::string::npos);
+    CHECK(arm.upstream_raises.find("vision.py:69") != std::string::npos);
+    CHECK(arm.upstream_raises.find("MoESwiGLUFFNFP8") != std::string::npos);
+    CHECK(arm.upstream_raises.find("#2881") != std::string::npos);
+    // ...it must name the class this tower DOES run, so the reader is told what
+    // happened and not only what did not...
+    CHECK(arm.upstream_raises.find("MoESwiGLUFFN`") != std::string::npos);
+    // ...and it must NOT name the expert width, at any value. W9d's notice did,
+    // and that claim was false; a message that names it again is the regression
+    // this line exists to catch.
+    CHECK(arm.upstream_raises.find("moe_intermediate_size") !=
+          std::string::npos);  // named only to say it is NOT the cause
+    CHECK(arm.upstream_raises.find("NO PAD REACHES THIS ONE") !=
           std::string::npos);
   }
+
+  // ── and a ragged `embed_dim` refuses REGARDLESS of the expert width ──────
+  {
+    nlohmann::json d = ReleasedConfigDoc();
+    d["vision_config"]["embed_dim"] = 1488;
+    d["vision_config"]["adapter_in_dim"] = 1488;
+    d["vision_config"]["moe_intermediate_size"] = 2048;
+    const vllm::Dots3NoteVisionMoeArm arm =
+        vllm::ResolveDots3NoteVisionMoeArm(ParseDoc(d));
+    CHECK_FALSE(arm.fp8);
+    CHECK_FALSE(arm.upstream_raises.empty());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// G0b. THE PAD, ON A FIXTURE THAT CAN SEE IT — the gate W9d did not have.
+//
+// The fresh review of PR #2947 inserted `VT_CHECK(n % 128 == 0 && k % 128 == 0)`
+// INSIDE `Dots3NoteVisionBlockCastFp8` and both suites stayed fully green,
+// because `Fp8MoeSpec` uses `E = Im = 256` and the resolver sent every ragged
+// width to the bf16 class before the caster ran. A gate that cannot distinguish
+// a padded shard from an unpadded one has not tested the pad; this one can.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W9d: the RELEASED ragged expert width PADS, and the pad is inert") {
+  const TowerRun r = RunTower(Fp8MoeUnalignedSpec());
+  // The released width takes the FP8 class. Before the PR #2947 repair this
+  // line alone reds: the resolver sent `2112 % 128 == 64` to bf16.
+  REQUIRE(r.weights.moe_arm.fp8);
+  CHECK(r.weights.moe_arm.upstream_raises.empty());
+  REQUIRE(r.weights.blocks.size() == 2u);
+  REQUIRE(r.weights.blocks[1].is_moe);
+  const vllm::Dots3NoteVisionMoeWeights& m = r.weights.blocks[1].moe;
+  const int64_t E = r.bench->spec.v_embed, Im = r.bench->spec.v_moe_inter;
+  const int64_t ne = m.num_routed;
+
+  // THE FIXTURE MUST BE RAGGED, or every assertion below is the identity and
+  // measures nothing. This is the same discriminator M3's denominator case
+  // carries, pointed at the geometry instead of at an arithmetic gap.
+  REQUIRE(Im % 128 != 0);
+  REQUIRE(E % 128 == 0);
+  const int64_t Imp = vllm::Dots3NoteVisionFp8PadTo128(Im);
+  REQUIRE(Imp == 2176);
+  REQUIRE(Imp != Im);
+  const auto cdiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+
+  REQUIRE(m.expert_gate_fp8.size() == static_cast<size_t>(ne));
+  REQUIRE(m.expert_down_fp8.size() == static_cast<size_t>(ne));
+  std::size_t pad_bytes_seen = 0, pad_bytes_nonzero = 0;
+  for (int64_t e = 0; e < ne; ++e) {
+    const size_t ei = static_cast<size_t>(e);
+    struct Named {
+      const vllm::Fp8BlockWeight* w;
+      const char* name;
+      int64_t n;
+      int64_t k;
+    };
+    // THE PADDED EXTENTS ARE THE EMITTED EXTENTS. `fc1`/`fc3` are `[Im, E]` on
+    // disk and leave the caster `[align(Im,128), E]`; `fc2` is `[E, Im]` and
+    // leaves it `[E, align(Im,128)]`.
+    const Named all[3] = {{&m.expert_gate_fp8[ei], "fc1", Imp, E},
+                          {&m.expert_up_fp8[ei], "fc3", Imp, E},
+                          {&m.expert_down_fp8[ei], "fc2", E, Imp}};
+    for (const Named& t : all) {
+      CAPTURE(t.name);
+      CHECK(t.w->n == t.n);
+      CHECK(t.w->k == t.k);
+      CHECK(t.w->packed.shape[0] == t.n);
+      CHECK(t.w->packed.shape[1] == t.k);
+      CHECK(t.w->packed.bytes.size() ==
+            static_cast<std::size_t>(t.n) * static_cast<std::size_t>(t.k));
+      CHECK(t.w->scale.shape[0] == cdiv(t.n, 128));
+      CHECK(t.w->scale.shape[1] == cdiv(t.k, 128));
+    }
+    // THE MERGE ARITHMETIC, on the shards this load actually built. 17 + 17 ==
+    // 34 == cdiv(4352, 128). The unpadded reading gives 34 against 33, which is
+    // the geometry `dense_fp8_block::CheckFp8BlockMergeable` refuses -- so this
+    // is not a cosmetic equality, it is the precondition of the merged seam the
+    // forward runs through.
+    const int64_t rows_gate = m.expert_gate_fp8[ei].scale.shape[0];
+    const int64_t rows_up = m.expert_up_fp8[ei].scale.shape[0];
+    CHECK(rows_gate == cdiv(Imp, 128));
+    CHECK(rows_gate + rows_up == cdiv(2 * Imp, 128));
+    CHECK(rows_gate + rows_up != cdiv(2 * Im, 128));
+    // ...and the rule that makes it valid: every shard but the LAST starts the
+    // next one on a block boundary.
+    CHECK(m.expert_gate_fp8[ei].n % m.expert_gate_fp8[ei].block_n == 0);
+
+    // THE PAD IS THE e4m3 ZERO BYTE. Rows [Im, Imp) of the gate and up shards,
+    // and columns [Im, Imp) of the down shard. `SiLU(0) * 0 == 0` on the first
+    // pair and a zero COLUMN on the second, so a pad lane contributes nothing
+    // to the down GEMM twice over.
+    for (const vllm::Fp8BlockWeight* w :
+         {&m.expert_gate_fp8[ei], &m.expert_up_fp8[ei]}) {
+      const auto* b = w->packed.bytes.data();
+      for (int64_t rr = Im; rr < Imp; ++rr)
+        for (int64_t c = 0; c < E; ++c) {
+          ++pad_bytes_seen;
+          if (b[static_cast<size_t>(rr * E + c)] != 0U) ++pad_bytes_nonzero;
+        }
+    }
+    {
+      const vllm::Fp8BlockWeight& w = m.expert_down_fp8[ei];
+      const auto* b = w.packed.bytes.data();
+      for (int64_t rr = 0; rr < E; ++rr)
+        for (int64_t c = Im; c < Imp; ++c) {
+          ++pad_bytes_seen;
+          if (b[static_cast<size_t>(rr * Imp + c)] != 0U) ++pad_bytes_nonzero;
+        }
+    }
+  }
+  // The instrument must be shown to have READ something: a loop that walked
+  // zero pad lanes would report "no non-zero pad byte" and pass.
+  MESSAGE("W9d pad lanes: " << pad_bytes_seen << " bytes inspected, "
+                            << pad_bytes_nonzero << " non-zero");
+  REQUIRE(pad_bytes_seen == static_cast<std::size_t>(ne) *
+                                (2 * (Imp - Im) * E + E * (Imp - Im)));
+  CHECK(pad_bytes_nonzero == 0u);
+
+  // THE PAD DOES NOT MOVE A SCALE EITHER. The ragged final block row of a gate
+  // shard covers real rows [2048, 2112) and pad rows [2112, 2176); its scale
+  // must equal `max|w| / 448` over the REAL rows alone. Recomputed here from
+  // the bf16 the checkpoint holds, so a caster that let a pad lane into the
+  // reduction -- or that silently used the FULL block -- would disagree.
+  {
+    const std::vector<double>& fc1 =
+        r.bench->ckpt.value_of("vision_encoder.blocks.1.mlp.experts.0.fc1.weight");
+    REQUIRE(fc1.size() == static_cast<std::size_t>(Im * E));
+    const vllm::Fp8BlockWeight& w = m.expert_gate_fp8[0];
+    const int64_t last = cdiv(Imp, 128) - 1;
+    const auto* sf = reinterpret_cast<const float*>(w.scale.bytes.data());
+    for (int64_t bj = 0; bj < w.scale.shape[1]; ++bj) {
+      double amax = 0.0;
+      for (int64_t rr = last * 128; rr < Im; ++rr)
+        for (int64_t c = bj * 128; c < std::min<int64_t>((bj + 1) * 128, E); ++c)
+          amax = std::max(amax, std::fabs(fc1[static_cast<std::size_t>(rr * E + c)]));
+      REQUIRE(amax > 0.0);
+      const double want = amax / 448.0;
+      const double got = static_cast<double>(sf[last * w.scale.shape[1] + bj]);
+      CAPTURE(bj);
+      CAPTURE(want);
+      CAPTURE(got);
+      CHECK(std::fabs(got - want) <= 1e-6 * want);
+    }
+  }
+
+  // THE MERGED SEAM ACCEPTS THE PAIR, asked directly rather than inferred from
+  // the forward not throwing. This is the checker that refuses the unpadded
+  // reading by name -- a 2112-row non-final shard is not a multiple of
+  // `block_n` -- so calling it on the shards this load built is the executable
+  // form of "the pad is what makes the merge representable".
+  {
+    const vllm::dense_fp8_block::Fp8BlockShard shards[2] = {
+        {&m.expert_gate_fp8[0], "gate_proj"}, {&m.expert_up_fp8[0], "up_proj"}};
+    vllm::dense_fp8_block::CheckFp8BlockMergeable(vt::kFp8BlockGateUpSwiGLU,
+                                                  "gate_up_proj", shards, 2);
+    // ...and it is not vacuous: the same checker over an UNPADDED gate shard
+    // refuses, which is the state W9d's caster would have produced.
+    vllm::Fp8BlockWeight unpadded = m.expert_gate_fp8[0];
+    unpadded.n = Im;
+    unpadded.packed.shape[0] = Im;
+    unpadded.packed.bytes = vllm::OwnedBytes(std::vector<uint8_t>(
+        static_cast<std::size_t>(Im) * static_cast<std::size_t>(E), 0U));
+    const vllm::dense_fp8_block::Fp8BlockShard bad[2] = {
+        {&unpadded, "gate_proj"}, {&m.expert_up_fp8[0], "up_proj"}};
+    CHECK_THROWS_AS(vllm::dense_fp8_block::CheckFp8BlockMergeable(
+                        vt::kFp8BlockGateUpSwiGLU, "gate_up_proj", bad, 2),
+                    std::runtime_error);
+  }
+
+  // THE ROUTING IS EXACT, and it is the assertion that is not a tolerance.
+  // Top-k selection is a DISCRETE choice whose error is bimodal, so a padded
+  // operand that fed the router garbage shows here and nowhere else.
+  REQUIRE(r.capture.moe_routes.size() == 1u);
+  CHECK(r.capture.moe_routes[0].fp8);
+  {
+    const vllm::Dots3NoteVisionMoeRoute& mine = r.capture.moe_routes[0];
+    const ref::MoeRouteRef& theirs = r.ref_routes[0];
+    const int64_t L = 16, K = mine.top_k;
+    REQUIRE(K == 2);
+    REQUIRE(mine.ids.size() == static_cast<std::size_t>(L * K));
+    int64_t flipped = 0;
+    for (int64_t t = 0; t < L; ++t) {
+      std::vector<int64_t> a(mine.ids.begin() + static_cast<std::ptrdiff_t>(t * K),
+                             mine.ids.begin() + static_cast<std::ptrdiff_t>((t + 1) * K));
+      std::sort(a.begin(), a.end());
+      const std::vector<int64_t> b(
+          theirs.ids.begin() + static_cast<std::ptrdiff_t>(t * K),
+          theirs.ids.begin() + static_cast<std::ptrdiff_t>((t + 1) * K));
+      if (a != b) ++flipped;
+    }
+    MESSAGE("W9d padded routing: " << flipped << " of " << L
+                                   << " tokens selected a different SET");
+    CHECK(flipped == 0);
+  }
+
+  // AND THE TOWER COMPUTES, against the independent double reference that
+  // transcribes the SAME two-function chain from upstream. A padded shard the
+  // forward mis-sliced, or a merged operand whose scale grid was off by a row,
+  // cannot land here.
+  //
+  // THE BOUND IS LOOSER THAN G2's AND THE REASON IS THE GEOMETRY, not a tuned
+  // tolerance. G2 runs the aligned fixture at `Im = 256`; the down GEMM here
+  // reduces over `align(2112,128) = 2176` e4m3 products instead of 256, and its
+  // rounding grows with that length. Measured 0.0492 relative against G2's
+  // 0.0295 on the same tower depth. This case's gate is the STRUCTURE above --
+  // extents, scale rows, pad bytes, the merge checker and the exact routing --
+  // and the value bound is here to catch an operand that computes garbage, not
+  // to gate the arithmetic, which G2 owns on a fixture whose noise is
+  // calibrated.
+  MESSAGE("W9d padded tower: max |impl - double ref| = "
+          << r.max_abs << " over a scale of " << r.scale << " (relative "
+          << r.rel << ")");
+  REQUIRE(r.scale > 1e-3);
+  CHECK(r.rel < 1e-1);
 }
 
 // ---------------------------------------------------------------------------
@@ -2728,7 +3024,8 @@ TEST_CASE("dots3-note W9d: the FP8 cast's MEMORY FORMAT is upstream's, and no sc
             static_cast<std::size_t>(cdiv(t.n, 128)) *
                 static_cast<std::size_t>(cdiv(t.k, 128)) * sizeof(float));
       // ...AND NOT ON THE e8m0 LATTICE. `_ceil_to_ue8m0` is
-      // `2 ** ceil(log2(x))` (`deep_gemm.py:644-645`), so a rounded scale is
+      // `2 ** ceil(log2(x))` (`ceil_to_ue8m0`, `deep_gemm/utils/math.py:13-16`
+      // @ `e21c821f`), so a rounded scale is
       // EXACTLY a power of two. `use_ue8m0` is False at this site
       // (`vision.py:237`), so a scale landing on a power of two here is chance
       // and every scale doing so is the defect.
@@ -2931,16 +3228,26 @@ TEST_CASE("dots3-note W9d: the FP8 arm takes upstream's F32 clamp_min denominato
   // and the numbers are recorded here rather than the assertion being tuned
   // until it passed.
   //
-  // Measured on this fixture: the two reference towers differ by 0.0790 over a
-  // scale of 71.16 (relative 1.11e-3) -- the denominator's 6.1e-3 at the MoE
-  // block, diluted by the residual around it and by the adapter after it. The
-  // IMPLEMENTATION is 3.427 from the F32 reference and 3.439 from the BF16 one.
-  // Both distances are ~43x the separation being tested, because this arm
+  // Measured on this fixture, and RE-MEASURED by PR #2947's repair after the M3
+  // fixture move from 128 to 256 changed every one of these numbers: the two
+  // reference towers differ by 0.0273 over a scale of 144.15 (relative
+  // 1.90e-4) -- the denominator's 6.1e-3 at the MoE block, diluted by the
+  // residual around it and by the adapter after it. The IMPLEMENTATION is
+  // 4.25719 from the F32 reference and 4.25394 from the BF16 one. Both
+  // distances are 155.7x the separation being tested, because this arm
   // QUANTIZES: a bf16 activation and a double activation land on different
   // e4m3 codes near a boundary, which is ~1/2 e4m3 ULP -- several percent -- at
-  // every one of the four GEMMs. The right ordering is visible (3.4275 <
-  // 3.4395) and it is noise-dominated, so asserting it would be asserting a
-  // coin flip.
+  // every one of the four GEMMs.
+  //
+  // AND THE ORDERING RUNS THE WRONG WAY: 4.25719 (F32) is LARGER than 4.25394
+  // (BF16), so on this fixture the implementation sits NEARER the reference it
+  // did not take. The earlier prose here claimed the opposite and cited stale
+  // numbers for it. Nothing follows about which denominator ran -- the gap
+  // between the two distances is 3.25e-3, which is 0.08% of either and two
+  // orders below the quantization noise that dominates both -- and that is
+  // exactly the point: a direction test at the tower output is a coin flip in
+  // both directions, not only in the convenient one. The capture assertion
+  // above is the gate, and it separates the two by five orders of magnitude.
   //
   // So the DENOMINATOR ASSERTION ABOVE IS THE GATE, and it is a capture
   // assertion rather than a value one for the same reason G1 is a byte
@@ -3082,4 +3389,33 @@ TEST_CASE("dots3-note W9d: a device with no block-scaled FP8 GEMM is refused BY 
   CHECK(msg.find("12.0a,12.1a") != std::string::npos);
   CHECK(msg.find("cutlass-fp8") != std::string::npos);
   CHECK(msg.find("UNREGISTERED") != std::string::npos);
+
+  // ── AND IT IS A SHARED SURFACE, not this row's message ────────────────────
+  //
+  // `RefuseUnrunnableFp8BlockWeight` has TWO production callers:
+  // `VisionMoeFfn` here and `RefuseUnrunnableQwen3_5DenseFp8Block`
+  // (`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp`, which passes
+  // projection names of the shape `model.layers.N.linear_attn.in_proj_qkv`).
+  // Only this file asserted the text, so a change made for dots3-note could
+  // silently reshape Qwen3.5's refusal — found by the fresh review of PR #2947
+  // (F6). Asking the same function for the OTHER caller's projection and
+  // requiring the arch-cell half to be byte-identical is what makes the
+  // assertion about the shared surface rather than about one caller's string.
+  std::string qwen;
+  try {
+    vllm::RefuseUnrunnableFp8BlockWeight("model.layers.3.linear_attn.in_proj_qkv",
+                                         vt::DeviceType::kMETAL);
+    FAIL("RefuseUnrunnableFp8BlockWeight returned");
+  } catch (const std::runtime_error& e) {
+    qwen = e.what();
+  }
+  CHECK(qwen.find("model.layers.3.linear_attn.in_proj_qkv") != std::string::npos);
+  CHECK(qwen.find("vision_encoder") == std::string::npos);
+  // Everything after the projection name is the SHARED half, and it must be the
+  // same bytes for both callers.
+  const std::size_t a = msg.find(" and there is no block-wise FP8 GEMM");
+  const std::size_t b = qwen.find(" and there is no block-wise FP8 GEMM");
+  REQUIRE(a != std::string::npos);
+  REQUIRE(b != std::string::npos);
+  CHECK(msg.substr(a) == qwen.substr(b));
 }

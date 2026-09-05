@@ -263,9 +263,12 @@ namespace {
 // the ONE value `_per_block_cast_to_fp8_padded` passes for `block_size`
 // (`vision.py:227`, `:238`).
 constexpr int64_t kVisionFp8Block = 128;
-// `get_fp8_min_max()[1]` for e4m3fn (`deep_gemm.py:675`, `quant_utils.py:27-35`).
+// The literal 448.0 the VENDORED caster divides by
+// (`deep_gemm/utils/math.py:58` @ DeepGEMM `e21c821f`); `vllm/utils/deep_gemm.py`
+// calls `get_fp8_min_max()` for the same value, and that module is NOT the one
+// `vision.py:14` imports.
 constexpr float kVisionFp8Max = 448.0F;
-// `.clamp(1e-4)` on the block amax (`deep_gemm.py:674`). NOT the activation
+// `.clamp(1e-4)` on the block amax (`deep_gemm/utils/math.py:57`). NOT the activation
 // quantizer's `1e-10`; see the header's note on the three constants.
 constexpr float kVisionFp8AmaxFloor = 1e-4F;
 
@@ -281,21 +284,17 @@ Dots3NoteVisionMoeArm ResolveDots3NoteVisionMoeArm(
   // inverted so this line and upstream's read the same way round.
   if (!v.enable_fp8_moe) return arm;
 
-  // The two widths `note_vision_fused_moe_fp8` quantizes, in the order it
-  // reaches them, so the message names the FIRST one that fails rather than a
-  // set. `embed_dim` is the first call (`vision_moe.py:77-81`) and the K of the
-  // gate/up GEMM; `moe_intermediate_size` is the second (`:119-123`) and the K
-  // of the down GEMM.
-  const char* which = nullptr;
-  int64_t width = 0;
-  if (v.embed_dim % kVisionFp8Block != 0) {
-    which = "embed_dim";
-    width = v.embed_dim;
-  } else if (v.moe_intermediate_size % kVisionFp8Block != 0) {
-    which = "moe_intermediate_size";
-    width = v.moe_intermediate_size;
-  }
-  if (which == nullptr) {
+  // ONE width, and it is NOT the expert one. `note_vision_fused_moe_fp8`
+  // quantizes twice. The FIRST call takes the tower's own activation
+  // (`vision_moe.py:77-81`), whose last dimension is `embed_dim`, and no pad
+  // reaches it. The SECOND takes `activated`, whose width is
+  // `intermediate_size // 2` where `intermediate_size` is `w13.shape[1]`
+  // (`:47`, `:70`) -- and `w13` is the stack of shards
+  // `_per_block_cast_to_fp8_padded` already rounded up to a multiple of 128, so
+  // that width is 128-aligned by construction and the second assertion cannot
+  // fail once the first passed. `Dots3NoteVisionMoeArm`'s own note carries the
+  // two-function chain that establishes it.
+  if (v.embed_dim % kVisionFp8Block == 0) {
     arm.fp8 = true;
     return arm;
   }
@@ -305,22 +304,32 @@ Dots3NoteVisionMoeArm ResolveDots3NoteVisionMoeArm(
           "dots3-note vision tower: `enable_fp8_moe` is true (its own default, "
           "vision.py:69 @ 9035151d6) so upstream builds `MoESwiGLUFFNFP8` "
           "(vision.py:369) -- and that class RAISES on this config before its "
-          "first GEMM. `note_vision_fused_moe_fp8` quantizes per token in "
-          "groups of ") +
+          "first GEMM. `note_vision_fused_moe_fp8` quantizes the tower's own "
+          "activation per token in groups of ") +
       std::to_string(kVisionFp8Block) +
-      " (`_BLOCK_SHAPE`, vision_moe.py:22), and "
+      " (`_BLOCK_SHAPE`, vision_moe.py:22, at vision_moe.py:77-81), and "
       "`per_token_group_quant_fp8` opens with `assert x.shape[-1] % group_size "
-      "== 0` (fp8_utils.py:563-566 @ 9035151d6). `" +
-      which + "` is " + std::to_string(width) + " and " +
-      std::to_string(width) + " % " + std::to_string(kVisionFp8Block) + " == " +
-      std::to_string(width % kVisionFp8Block) +
-      ". This tower therefore runs upstream's OTHER class, "
-      "`MoESwiGLUFFN` (the `enable_fp8_moe=False` branch), which is the arm "
-      "W6b ported and the only one of the two that computes anything on this "
-      "geometry. That is a DIVERGENCE from upstream and it is reported rather "
-      "than silent: upstream raises here. Issue #2881, spec "
-      "`.agents/specs/dots3-note.md` section 4.20";
+      "== 0` (fp8_utils.py:563-566 @ 9035151d6). That last dimension is "
+      "`embed_dim`, it is " +
+      std::to_string(v.embed_dim) + " and " + std::to_string(v.embed_dim) +
+      " % " + std::to_string(kVisionFp8Block) + " == " +
+      std::to_string(v.embed_dim % kVisionFp8Block) +
+      ". NO PAD REACHES THIS ONE: `_per_block_cast_to_fp8_padded` rounds the "
+      "EXPERT extents up (vision.py:225-239), which is what keeps "
+      "`moe_intermediate_size` out of this predicate at every value, and the "
+      "activation the tower hands in is not a weight. This tower therefore "
+      "runs upstream's OTHER class, `MoESwiGLUFFN` (the `enable_fp8_moe=False` "
+      "branch), which is the arm W6b ported and the only one of the two that "
+      "computes anything on this geometry. That is a DIVERGENCE from upstream "
+      "and it is reported rather than silent: upstream raises here. Issue "
+      "#2881, spec `.agents/specs/dots3-note.md` section 4.20";
   return arm;
+}
+
+int64_t Dots3NoteVisionFp8PadTo128(int64_t extent) {
+  // `_ceil_to_multiple` (`vision.py:222-223` @ 9035151d6) == DeepGEMM's `align`
+  // (`deep_gemm/utils/math.py:9-10` @ `e21c821f`).
+  return VisionCDiv(extent, kVisionFp8Block) * kVisionFp8Block;
 }
 
 Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
@@ -332,8 +341,16 @@ Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
   VT_CHECK(w.bytes.size() == static_cast<size_t>(n) * static_cast<size_t>(k) * 2,
            "Dots3NoteVisionBlockCastFp8: the weight does not carry n*k bf16 "
            "values");
-  const int64_t bn = VisionCDiv(n, kVisionFp8Block);
-  const int64_t bk = VisionCDiv(k, kVisionFp8Block);
+  // THE PADDED EXTENTS ARE THE RESULT'S EXTENTS. `_per_block_cast_to_fp8_padded`
+  // allocates `new_zeros(ceil(rows,128), ceil(cols,128))` (`vision.py:230-234`)
+  // and `per_block_cast_to_fp8` slices back to the shape of the tensor IT was
+  // handed (`deep_gemm/utils/math.py:61` @ `e21c821f`), which is that padded
+  // one. Emitting `[n, k]` here -- W9d's defect -- would make the merged `w13`
+  // scale grid disagree with its own block rows whenever `n` is ragged.
+  const int64_t np = Dots3NoteVisionFp8PadTo128(n);
+  const int64_t kp = Dots3NoteVisionFp8PadTo128(k);
+  const int64_t bn = np / kVisionFp8Block;
+  const int64_t bk = kp / kVisionFp8Block;
 
   const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
   // bf16 -> f32 is an exact widening: the 16 bits ARE the top half of the f32.
@@ -344,7 +361,11 @@ Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
     return out;
   };
 
-  std::vector<uint8_t> packed(static_cast<size_t>(n) * static_cast<size_t>(k));
+  // Zero-initialized, which IS the pad: `(0 * (1/sf))` encodes to the e4m3 zero
+  // byte for every finite positive `sf`, so a pad lane needs no pass of its own
+  // and cannot pick up a value from one.
+  std::vector<uint8_t> packed(static_cast<size_t>(np) * static_cast<size_t>(kp),
+                              0U);
   std::vector<uint8_t> scale_bytes(static_cast<size_t>(bn) *
                                    static_cast<size_t>(bk) * sizeof(float));
   auto* sf = reinterpret_cast<float*>(scale_bytes.data());
@@ -356,9 +377,11 @@ Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
       const int64_t r1 = std::min(r0 + kVisionFp8Block, n);
       const int64_t c1 = std::min(c0 + kVisionFp8Block, k);
       // `x_amax = x_view.abs().float().amax(...).clamp(1e-4)`
-      // (`deep_gemm.py:674`). The PAD is zero-filled (`:669-672`), and a zero
-      // never raises an absolute maximum, so iterating the real lanes only is
-      // upstream's number and not a shortcut past it.
+      // (`deep_gemm/utils/math.py:57`). The pad is zero-filled (`:54-55`), and
+      // a zero never raises an absolute maximum, so iterating the real lanes
+      // only is upstream's number and not a shortcut past it. A block with no
+      // real lane at all reads amax 0 and takes the floor, which is again
+      // upstream's answer for an all-zero block.
       float amax = 0.0F;
       for (int64_t r = r0; r < r1; ++r) {
         for (int64_t c = c0; c < c1; ++c) {
@@ -366,17 +389,17 @@ Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
         }
       }
       if (amax < kVisionFp8AmaxFloor) amax = kVisionFp8AmaxFloor;
-      // `sf = x_amax / fp8_max` (`deep_gemm.py:676`), and NO `_ceil_to_ue8m0`
-      // because `use_ue8m0` is False at this call site (`vision.py:237`).
+      // `sf = x_amax / fp8_max` (`math.py:58`), and NO `ceil_to_ue8m0` because
+      // `use_ue8m0` is False at this call site (`vision.py:237`).
       const float s = amax / kVisionFp8Max;
       sf[bi * bk + bj] = s;
-      // `x_scaled = (x_view * (1.0 / sf)).to(fp8_dtype)` (`deep_gemm.py:678`)
-      // -- a reciprocal MULTIPLY, formed once per block exactly as upstream
-      // forms it, and not the divide the activation quantizer ships.
+      // `x_scaled = (x_view * (1.0 / sf)).to(fp8)` (`math.py:60`) -- a
+      // reciprocal MULTIPLY, formed once per block exactly as upstream forms
+      // it, and not the divide the activation quantizer ships.
       const float inv = 1.0F / s;
       for (int64_t r = r0; r < r1; ++r) {
         for (int64_t c = c0; c < c1; ++c) {
-          packed[static_cast<size_t>(r * k + c)] =
+          packed[static_cast<size_t>(r * kp + c)] =
               vt::F32ToF8E4M3(bf16(r * k + c) * inv);
         }
       }
@@ -387,16 +410,16 @@ Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
   out.packed.bytes = OwnedBytes(std::move(packed));
   out.packed.dtype = vt::DType::kI8;
   out.packed.rank = 2;
-  out.packed.shape[0] = n;
-  out.packed.shape[1] = k;
+  out.packed.shape[0] = np;
+  out.packed.shape[1] = kp;
   out.packed.nk = true;
   out.scale.bytes = OwnedBytes(std::move(scale_bytes));
   out.scale.dtype = vt::DType::kF32;
   out.scale.rank = 2;
   out.scale.shape[0] = bn;
   out.scale.shape[1] = bk;
-  out.n = n;
-  out.k = k;
+  out.n = np;
+  out.k = kp;
   out.block_n = kVisionFp8Block;
   out.block_k = kVisionFp8Block;
   return out;
@@ -733,6 +756,20 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
       // ── `MoESwiGLUFFNFP8.process_weights_after_loading` (vision.py:245-283
       // @ 9035151d6), including its LAST line ────────────────────────────────
       if (w.moe_arm.fp8) {
+        // The resolver's own precondition, restated where the bytes are
+        // written: `embed_dim` is the ONE width no pad reaches, so the cast
+        // shards' K (gate/up) and N (down) come out equal to `E` rather than
+        // rounded, and the down GEMM's output is `E` wide as
+        // `note_vision_fused_moe_fp8`'s `output_size` is (`vision_moe.py:48`,
+        // `:147-148`). Reaching here with a ragged `E` is a caller defect, not
+        // a config this arm silently rounds.
+        VT_CHECK(E % 128 == 0,
+                 "dots3-note vision tower: the FP8 arm was selected with "
+                 "embed_dim " +
+                     std::to_string(E) +
+                     ", which is not a multiple of 128. "
+                     "ResolveDots3NoteVisionMoeArm should have sent this "
+                     "config to the bf16 class; reaching here is a defect.");
         m.expert_gate_fp8.reserve(static_cast<size_t>(m.num_routed));
         m.expert_up_fp8.reserve(static_cast<size_t>(m.num_routed));
         m.expert_down_fp8.reserve(static_cast<size_t>(m.num_routed));
@@ -742,7 +779,10 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
           // `w1, s1 = _per_block_cast_to_fp8_padded(expert.fc1.weight)` and the
           // two lines under it (`:255-257`). Each half is cast SEPARATELY --
           // the `cat` at `:258-259` happens AFTER, and here it happens inside
-          // the merged seam rather than by hand.
+          // the merged seam rather than by hand. The LOGICAL extents are passed
+          // in; the caster returns the PADDED ones, exactly as
+          // `_per_block_cast_to_fp8_padded` does, so `Im` here and
+          // `expert_gate_fp8[ei].n` differ whenever `Im` is ragged.
           m.expert_gate_fp8.push_back(
               Dots3NoteVisionBlockCastFp8(m.expert_gate[ei], Im, E));
           m.expert_up_fp8.push_back(
@@ -970,6 +1010,13 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
                   const Dots3NoteVisionMoeArm& arm, const Tensor& x, int64_t L,
                   int64_t E, int64_t block, Dots3NoteVisionCapture* cap) {
   const int64_t ne = m.num_routed, k = m.top_k, Im = v.moe_intermediate_size;
+  // THE WIDTH THE FP8 ARM RUNS AT IS THE PADDED ONE, and it is derived from
+  // the same function the caster used rather than recomputed. `w13.shape[1]`
+  // is `2 * align(Im, 128)` (`vision.py:258` over `:225-239`) and
+  // `activated_size` is half of that (`vision_moe.py:47`, `:70`), so the
+  // SwiGLU tail and the down GEMM both see `align(Im, 128)`. On the bf16 arm
+  // nothing pads and this is `Im`.
+  const int64_t Imp = Dots3NoteVisionFp8PadTo128(Im);
   const int64_t P = L * k;
   VT_CHECK(k >= 2 && k <= ne,
            "dots3-note vision tower: block " + std::to_string(block) +
@@ -1079,7 +1126,7 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
     DBuf act =
         arm.fp8 ? layers::Fp8BlockMlpGateUpMethod(
                       &m.expert_gate_fp8[ei], &m.expert_up_fp8[ei],
-                      &m.expert_gateup_merged[ei], Im)
+                      &m.expert_gateup_merged[ei], Imp)
                       .Apply(d, xg.t())
                 : layers::UnquantizedMlpGateUpSplitMethod(&m.expert_gate[ei],
                                                           &m.expert_up[ei], Im)
@@ -1157,7 +1204,7 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
       // `clamp_min(F32)` while dividing by the bf16 value left the entire
       // suite green (spec section 4.20.4.1, M2b): no value comparison this
       // fixture can make separates a 6.1e-3 denominator change from e4m3
-      // quantization noise 43x larger, so the capture was the only witness --
+      // quantization noise 155.7x larger, so the capture was the only witness --
       // and a capture that reports an INTENT witnesses nothing about what ran.
       // Deriving it from the quotient makes "reported but not applied"
       // unrepresentable instead of undetected.

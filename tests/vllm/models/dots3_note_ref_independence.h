@@ -27,6 +27,15 @@
 // LIST beside a reference would count itself and the instrument would agree
 // with any list it was given — which is the exact failure this replaces.
 //
+// EVERY FREE FUNCTION HERE IS `inline`, and that is a requirement rather than a
+// style. The header is included by two test translation units
+// (`test_dots3_note_vision.cpp` and `test_dots3_note_audio.cpp`); a non-`inline`
+// definition in a header gives each TU an external-linkage symbol with the same
+// name, which is an ODR violation the moment those two objects are linked into
+// one binary. They are separate executables today, so the hazard is latent --
+// which is exactly the state in which it gets discovered by a link error in
+// somebody else's change. Found by the fresh review of PR #2947 (F7).
+//
 // IT LIVES IN A HEADER SINCE W9d (#2881) and it did not before. W7b, W7c-2 and
 // W8a each EXTENDED it to another namespace, for the stated reason that
 // reference code the instrument does not read is reference code whose
@@ -48,7 +57,7 @@ struct RefNames {
   std::set<std::string> names;
 };
 
-std::string Join(const std::set<std::string>& s) {
+inline std::string Join(const std::set<std::string>& s) {
   std::string out;
   for (const std::string& v : s) {
     if (!out.empty()) out += ",";
@@ -57,13 +66,13 @@ std::string Join(const std::set<std::string>& s) {
   return out;
 }
 
-bool IsIdentChar(char c) {
+inline bool IsIdentChar(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
          (c >= '0' && c <= '9') || c == '_';
 }
 
 // Comments and literals out, everything else through unchanged.
-std::string StripCommentsAndLiterals(const std::string& code) {
+inline std::string StripCommentsAndLiterals(const std::string& code) {
   std::string out;
   const size_t n = code.size();
   for (size_t i = 0; i < n;) {
@@ -111,7 +120,7 @@ std::string StripCommentsAndLiterals(const std::string& code) {
   return out;
 }
 
-RefNames QualifiedNamesInFile(const char* source_path, const std::string& ns) {
+inline RefNames QualifiedNamesInFile(const char* source_path, const std::string& ns) {
   std::ifstream in(source_path, std::ios::binary);
   REQUIRE_MESSAGE(in.good(),
                   "the enumeration instrument could not open the source at "

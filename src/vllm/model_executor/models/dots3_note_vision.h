@@ -233,38 +233,71 @@ struct Dots3NoteVisionParams {
 // `9035151d6` asked here rather than at every use site.
 //
 // Upstream's selection is one line (`mlp_cls = MoESwiGLUFFNFP8 if
-// config.enable_fp8_moe else MoESwiGLUFFN`, `:369`), and it is not the whole
-// answer, because the class it names by default DOES NOT RUN on the released
-// checkpoint. `MoESwiGLUFFNFP8.forward` calls `note_vision_fused_moe_fp8`,
-// whose second activation quantization is over a width of
-// `moe_intermediate_size` (`vision_moe.py:70-75`, :119-123`, and `:47` where
-// `intermediate_size` is `w13.shape[1]` = twice the expert width because
-// `vision.py:258` concatenates fc1 and fc3), in groups of `_BLOCK_SHAPE[1]`
-// = 128 (`vision_moe.py:22`), and `per_token_group_quant_fp8` opens with
+// config.enable_fp8_moe else MoESwiGLUFFN`, `:369`), and on the released
+// checkpoint it selects the FP8 class AND THAT CLASS RUNS. W9d shipped the
+// opposite claim and it was FALSE; the correction is the substance of this
+// block, so it is written out rather than quietly deleted.
 //
-//   assert x.shape[-1] % group_size == 0     (fp8_utils.py:563-566 @ 9035151d6)
+// WHAT W9d GOT WRONG. It read `_per_block_cast_to_fp8_padded` as a cast that
+// pads for tiling and hands back the ORIGINAL extent, concluded that upstream's
+// `w13` is `[2 * moe_intermediate_size, embed_dim]` = `[4224, 1536]`, that
+// `activated_size = intermediate_size // 2` is therefore 2112, and that
+// `per_token_group_quant_fp8`'s `assert x.shape[-1] % group_size == 0`
+// (`fp8_utils.py:563-566`) fires on `2112 % 128 == 64`. The pad is not
+// droppable and the extent is not the original one:
 //
-// The released `moe_intermediate_size` is 2112 and `2112 % 128 == 64`, so
-// upstream raises before its first GEMM. The FIRST quantization in the same
-// function is safe -- it quantizes at `embed_dim` 1536 -- so the failure is
-// specific to the expert width.
+//   `_per_block_cast_to_fp8_padded` (`vision.py:225-239`) builds
+//   `weight.new_zeros(ceil(rows,128), ceil(cols,128))`, copies the weight into
+//   its corner, and calls `per_block_cast_to_fp8(padded, use_ue8m0=False,
+//   gran_k=128)` on THAT. It never slices the result back.
 //
-// THREE STATES, NEVER A FOURTH:
+//   `per_block_cast_to_fp8` (`deep_gemm/utils/math.py:51-61` @ DeepGEMM
+//   `e21c821f39a2056d68067a466c64ddc942200106`, the revision
+//   `cmake/external_projects/deepgemm.cmake:33` pins and `:168-176` vendors
+//   into `vllm.third_party.deep_gemm`, which is the module `vision.py:14`
+//   imports) DOES slice, to `[:m, :n]` -- but `m, n` is the shape of ITS OWN
+//   input, which is the ALREADY-PADDED matrix. On the released expert that is
+//   `[:2176, :1536]`, i.e. the identity.
+//
+// So fc1 casts to `(2176, 1536)`, `torch.cat((w1, w3), dim=0)`
+// (`vision.py:258`) is `(4352, 1536)`, `intermediate_size` read at
+// `vision_moe.py:47` is 4352, `activated_size` at `:70` is 2176, and
+// `2176 % 128 == 0`. Upstream does not raise.
+//
+// THE PADDING IS LOAD-BEARING, WHICH IS WHY UPSTREAM WRITES IT. It is what
+// makes the `w13` concatenation well-defined at all. A block scale is indexed
+// by `n / 128`, so the concatenated scale grid has to have as many rows as the
+// concatenated operand has block rows:
+//
+//   unpadded: `cdiv(2112,128)` = 17 per shard, 34 stacked, against
+//             `cdiv(4224,128)` = 33 for the merged operand -- a MISMATCH, and
+//             the geometry `dense_fp8_block::CheckFp8BlockMergeable` refuses.
+//   padded:   `cdiv(2176,128)` = 17 per shard, 34 stacked, against
+//             `cdiv(4352,128)` = 34 -- exact, and every shard but the last is
+//             a whole multiple of `block_n`, which is that checker's rule.
+//
+// The pad is numerically inert and structurally required, and W9d's "the
+// padding cannot move a scale and is ported anyway" was true of the scale
+// VALUES and false about the SHAPE. `fp8_utils.py:563` reads the shape.
+//
+// TWO STATES, AND THE SECOND ONE IS NARROW:
 //   `enable_fp8_moe` false                  -> bf16, `upstream_raises` empty.
 //       Upstream's own other branch, and W6b's arm, unchanged.
-//   true, a width not a multiple of 128     -> bf16, `upstream_raises` set.
+//   true, `embed_dim` not a multiple of 128 -> bf16, `upstream_raises` set.
 //       A RECORDED DIVERGENCE and not a silent fallback: upstream raises here
 //       and this tree answers. `MaterializeDots3NoteVision` writes the notice
-//       to stderr once, the gate asserts its text for the released config, and
-//       reversing the polarity is a one-line edit in one function.
-//   true, both widths 128-aligned           -> fp8.
+//       to stderr once and the gate asserts its text.
+//   true, `embed_dim` 128-aligned           -> fp8. THE RELEASED CONFIG IS
+//       HERE, because `embed_dim` is 1536.
 //
-// The two widths are `embed_dim` (the FIRST quantization, and the K of the
-// gate/up GEMM) and `moe_intermediate_size` (the SECOND, and the K of the down
-// GEMM). Both are checked because both reach a `QuantFp8Group` whose K must
-// divide the group, which is upstream's own asymmetry mirrored:
-// `MatmulFp8BlockScaledD` tiles the WEIGHT with cdiv and demands divisibility
-// of the ACTIVATION.
+// WHY ONLY `embed_dim` SURVIVES AS A REFUSAL. Padding fixes every width the
+// EXPERTS own and does nothing for the first quantization, which is over the
+// activation the tower hands in: `per_token_group_quant_fp8(hidden_states,
+// 128, use_ue8m0=False)` at `vision_moe.py:77-81`, whose last dimension is
+// `embed_dim` and which no pad reaches. `moe_intermediate_size` no longer
+// appears in this predicate at any value, because `activated_size` is derived
+// from the PADDED `w13` and is 128-aligned by construction. The second
+// quantization (`:119-123`) therefore cannot fail once the first one passed.
 struct Dots3NoteVisionMoeArm {
   // `MoESwiGLUFFNFP8` was selected AND can execute here.
   bool fp8 = false;
@@ -277,37 +310,62 @@ struct Dots3NoteVisionMoeArm {
 Dots3NoteVisionMoeArm ResolveDots3NoteVisionMoeArm(
     const Dots3NoteVisionParams& v);
 
+// `_ceil_to_multiple(value, 128)` (`vision.py:222-223` @ `9035151d6`), which is
+// DeepGEMM's own `align` (`deep_gemm/utils/math.py:9-10` @ `e21c821f`). Exposed
+// because every consumer of a cast expert shard needs the PADDED extent and
+// deriving it twice is how the two would drift apart.
+int64_t Dots3NoteVisionFp8PadTo128(int64_t extent);
+
 // `_per_block_cast_to_fp8_padded` (`vision.py:225-239` @ `9035151d6`) over
-// `per_block_cast_to_fp8` (`vllm/utils/deep_gemm.py:660-681`, itself DeepGEMM's
-// `deep_gemm/utils/math.py`), as a WEIGHT-side caster.
+// `per_block_cast_to_fp8` (`deep_gemm/utils/math.py:51-61` @ DeepGEMM
+// `e21c821f39a2056d68067a466c64ddc942200106`), as a WEIGHT-side caster.
+//
+// THE MODULE, because the obvious citation is the wrong one. `vision.py:14`
+// imports `per_block_cast_to_fp8` from `vllm.third_party.deep_gemm`, which is
+// DeepGEMM VENDORED at build time -- `cmake/external_projects/deepgemm.cmake:33`
+// pins the revision and `:168-176` installs `deep_gemm/utils/*.py` under
+// `vllm/third_party/deep_gemm/utils`. It is NOT `vllm/utils/deep_gemm.py`, whose
+// same-named function has the signature `(x, block_size: list[int], use_ue8m0)`
+// and no `gran_k` at all (`:662-664` @ `9035151d6`); `vision.py:238` passes
+// `gran_k=block_size`, so a call into that module would `TypeError`. The two
+// bodies also differ: the vendored one hard-codes `448.0` where vLLM's calls
+// `get_fp8_min_max()`.
 //
 // `w` is a raw-NK `[N, K]` bf16 torch Linear weight. The result is upstream's
-// pair: `packed` the e4m3fn bytes sliced back to `[N, K]`, `scale` the f32
+// pair AT THE PADDED EXTENT: `packed` the e4m3fn bytes at
+// `[align(N,128), align(K,128)]` and `scale` the f32
 // `[cdiv(N,128), cdiv(K,128)]` grid, `block_n`/`block_k` both 128. It is an
 // `Fp8BlockWeight` because that is what `layers::Fp8BlockLinearMethod` and
 // `dense_fp8_block::MatmulFp8BlockScaledD` consume, so the FP8 arm rides the
 // shared block-FP8 seams rather than a caster-specific path.
 //
+// THE PAD IS EMITTED, NOT DROPPED, AND THAT IS THE WHOLE POINT. Upstream pads
+// and never slices back (the two-function chain is spelled out on
+// `Dots3NoteVisionMoeArm` above), so the shard this returns is the shard
+// upstream stacks. Dropping it -- W9d's defect -- makes the concatenated `w13`
+// scale grid disagree with the concatenated operand's block rows by one row on
+// the released geometry, which is the case
+// `dense_fp8_block::CheckFp8BlockMergeable` refuses by name.
+//
+// THE PAD IS NUMERICALLY INERT, and the two independent reasons are both
+// structural rather than tolerated: `x_padded` is zero-filled and amax is a max
+// of ABSOLUTE values, so a pad lane never raises a block's amax and no scale
+// moves; and `(0 * (1/sf))` encodes to the e4m3 zero byte, so a pad ROW of the
+// gate half and of the up half give `SiLU(0) * 0 = 0`, against pad COLUMNS of
+// `w2` that are zero as well.
+//
 // THE THREE CONSTANTS THAT ARE NOT `vt::QuantFp8Group`'s, because a reader who
 // assumes the two quantizers agree will get all three wrong:
-//   * the amax floor is `clamp(1e-4)` (`deep_gemm.py:674`), NOT the `1e-10` the
+//   * the amax floor is `clamp(1e-4)` (`math.py:57`), NOT the `1e-10` the
 //     ACTIVATION quantizer seeds its reduction with (`per_token_group_quant.cu
 //     :47`). Two different upstream kernels, two different constants.
-//   * the scaling is a RECIPROCAL MULTIPLY, `x * (1.0 / sf)`
-//     (`deep_gemm.py:678`), where `QuantFp8Group` ships a DIVIDE and
-//     `include/vt/ops.h` says at length not to "correct" that divide into a
-//     multiply. The polarity is reversed here, for the same reason: mirror what
-//     upstream ships at THIS site.
+//   * the scaling is a RECIPROCAL MULTIPLY, `x * (1.0 / sf)` (`math.py:60`),
+//     where `QuantFp8Group` ships a DIVIDE and `include/vt/ops.h` says at
+//     length not to "correct" that divide into a multiply. The polarity is
+//     reversed here, for the same reason: mirror what upstream ships at THIS
+//     site.
 //   * `use_ue8m0` is FALSE (`vision.py:237`), so the scales are FP32 and are
 //     never rounded onto the e8m0 lattice.
-//
-// THE PADDING CANNOT MOVE A SCALE and is ported anyway. `x_padded` is
-// zero-filled and amax is a max of absolute values, so a padded lane never
-// raises a block's amax; the caster is therefore numerically identical to a
-// straight cdiv-tiled cast of the unpadded weight. It is written as upstream
-// writes it because reading the pad as droppable is one edit away from also
-// dropping the `cdiv` that owns the ragged final block, which is not
-// droppable: the released expert width 2112 has a final block of 64 rows.
 Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
                                            int64_t k);
 
@@ -412,13 +470,17 @@ struct Dots3NoteVisionMoeWeights {
   // The order matters and is upstream's: cast each half, then merge. A merged
   // bf16 operand cast as one piece is a DIFFERENT scale grid whenever `Im` is
   // not a multiple of `block_n`, because a block scale is indexed by
-  // `n / block_n`. The merged seam refuses exactly that case by name
-  // (`dense_fp8_block::CheckFp8BlockMergeable`), and `MoESwiGLUFFNFP8` never
-  // reaches it here because `ResolveDots3NoteVisionMoeArm` already sent a
-  // non-128 `moe_intermediate_size` to the bf16 class.
-  std::vector<Fp8BlockWeight> expert_gate_fp8;  // num_routed x fc1 [Im, E]
-  std::vector<Fp8BlockWeight> expert_up_fp8;    // num_routed x fc3 [Im, E]
-  std::vector<Fp8BlockWeight> expert_down_fp8;  // num_routed x fc2 [E, Im]
+  // `n / block_n`. Casting first is also what makes the merge REPRESENTABLE:
+  // each shard leaves the caster at `align(Im, 128)` rows, so every shard but
+  // the last is a whole multiple of `block_n` and the stacked scale grid has
+  // exactly `cdiv(2 * align(Im, 128), 128)` rows. That is the rule
+  // `dense_fp8_block::CheckFp8BlockMergeable` enforces, and the released
+  // geometry satisfies it only BECAUSE of the pad: 17 + 17 == 34 ==
+  // cdiv(4352, 128), where the unpadded reading gives 34 against
+  // cdiv(4224, 128) == 33.
+  std::vector<Fp8BlockWeight> expert_gate_fp8;  // num_routed x fc1 [Imp, E]
+  std::vector<Fp8BlockWeight> expert_up_fp8;    // num_routed x fc3 [Imp, E]
+  std::vector<Fp8BlockWeight> expert_down_fp8;  // num_routed x fc2 [E, Imp]
   // The lazily-built merged `gate_up` device operand, one per expert. Mutable
   // state on a const weight, exactly as `Fp8BlockWeight::d_packed` is.
   std::vector<Fp8BlockMergedResident> expert_gateup_merged;

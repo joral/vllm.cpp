@@ -2407,17 +2407,23 @@ TEST_CASE("dots3-note W9d: `enable_fp8_moe` changes what the server answers") {
   CHECK(with_fp8 != without);
 }
 
-TEST_CASE("dots3-note W9d: the RELEASED expert width serves the bf16 class, and enters NO block-FP8 GEMM") {
-  // The other side of the same coin, and the case that keeps W6b's served path
-  // honest. `enable_fp8_moe` is TRUE here too — the key is absent, exactly as
-  // on the released checkpoint — but `moe_intermediate_size` is not a multiple
-  // of 128, so upstream's own class would raise and this tower runs the bf16
-  // one. The served answer must still be produced, and NOTHING must enter the
-  // block-FP8 GEMM.
+TEST_CASE("dots3-note W9d: a RAGGED expert width is PADDED and still enters the block-FP8 GEMM") {
+  // THE SERVED FORM OF THE PR #2947 REPAIR. W9d shipped this case asserting the
+  // opposite -- that a ragged `moe_intermediate_size` makes upstream's own class
+  // raise, so the tower falls back to bf16 and NOTHING enters the block-FP8
+  // GEMM. That was false. `_per_block_cast_to_fp8_padded` (`vision.py:225-239`
+  // @ `9035151d6`) rounds each expert shard up to a multiple of 128 and
+  // `per_block_cast_to_fp8` slices only to the shape it was handed
+  // (`deep_gemm/utils/math.py:61` @ DeepGEMM `e21c821f`), so `w13` is
+  // `2 * align(Im, 128)` wide, `activated_size` is `align(Im, 128)`, and
+  // `per_token_group_quant_fp8`'s divisibility assertion is satisfied.
+  //
+  // 100 pads to 128, so this served checkpoint is ragged in exactly the way the
+  // released one is (2112 -> 2176) and the pad is not the identity.
   TinySpec spec;
   spec.v_pyramid = {-1, 4};
-  spec.v_embed = 128;
-  spec.v_moe_inter = 100;  // 100 % 128 == 100: upstream asserts here
+  spec.v_embed = 128;      // the ONE width no pad reaches: aligned
+  spec.v_moe_inter = 100;  // 100 % 128 == 100 -> padded to 128
   Served s(spec);
   MmServerHarness h(s.config, *s.model, Fixture());
   std::ostringstream log;
@@ -2430,8 +2436,48 @@ TEST_CASE("dots3-note W9d: the RELEASED expert width serves the bf16 class, and 
   INFO("body: ", r.body);
   REQUIRE(r.status == 200);
   const std::uint64_t ran = vllm::dense_fp8_block::BlockGemmCount() - before;
-  MESSAGE("W9d released-shaped width entered the block-FP8 GEMM " << ran
-                                                                  << " times");
+  MESSAGE("W9d ragged-width served request entered the block-FP8 GEMM "
+          << ran << " times");
+  // The same 2-GEMMs-per-active-expert range the aligned case asserts, and for
+  // the same reason. What this case adds is that a PADDED operand reaches the
+  // kernel at all: a caster that dropped the pad would make the merged
+  // `gate_up` scale grid disagree with its own block rows and
+  // `dense_fp8_block::CheckFp8BlockMergeable` would refuse the request instead.
+  CHECK(ran >= 4u);
+  CHECK(ran <= 8u);
+  CHECK(ran % 2u == 0u);
+  CHECK(json::parse(r.body).at("usage").at("prompt_tokens") ==
+        3 + dots3_tiny::kExpectedImageTokens);
+}
+
+TEST_CASE("dots3-note W9d: a ragged `embed_dim` serves the bf16 class, and enters NO block-FP8 GEMM") {
+  // THE REFUSAL THAT SURVIVES, served. `note_vision_fused_moe_fp8` quantizes
+  // the tower's own activation first (`vision_moe.py:77-81`), whose last
+  // dimension is `embed_dim` and which no weight pad reaches, so
+  // `per_token_group_quant_fp8`'s `assert x.shape[-1] % group_size == 0`
+  // (`fp8_utils.py:563-566`) is the one assertion a config can still trip.
+  // `enable_fp8_moe` is TRUE here -- the key is absent, exactly as on the
+  // released checkpoint -- and the tower runs upstream's OTHER class anyway.
+  // The served answer must still be produced, and NOTHING must enter the
+  // block-FP8 GEMM.
+  TinySpec spec;
+  spec.v_pyramid = {-1, 4};
+  spec.v_embed = 120;      // 120 % 128 == 120, and 120 % v_heads(2) == 0
+  spec.v_moe_inter = 128;  // aligned, so the EXPERT width is not the cause
+  Served s(spec);
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  const std::uint64_t before = vllm::dense_fp8_block::BlockGemmCount();
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(ChatBody(1, 0, false).dump());
+  INFO("body: ", r.body);
+  REQUIRE(r.status == 200);
+  const std::uint64_t ran = vllm::dense_fp8_block::BlockGemmCount() - before;
+  MESSAGE("W9d ragged-embed_dim served request entered the block-FP8 GEMM "
+          << ran << " times");
   CHECK(ran == 0u);
   CHECK(json::parse(r.body).at("usage").at("prompt_tokens") ==
         3 + dots3_tiny::kExpectedImageTokens);

@@ -7920,17 +7920,23 @@ still true that no test here can verify a claim about another repository
 be gated by nothing. The measured statement is "the two doors that exist cannot
 drift", and it is now that sentence rather than the earlier one.
 
-### 4.20 W9d reads `enable_fp8_moe`, and finds the class upstream selects cannot run
+### 4.20 W9d reads `enable_fp8_moe` and ports the class it selects
 
 **Issue: [#2881](https://github.com/mudler/vllm.cpp/issues/2881). Brick: W9d,
-the VISION half of W9.** This slice does two things. It makes the tree read
+the VISION half of W9.** This slice makes the tree read
 `vision_config.enable_fp8_moe` — the key that selects between upstream's two
 vision-MoE classes and which this tree had never read — and it ports the FP8
-class those two words select. It also corrects #2881's own premise, because
-running the port against the released geometry established something the issue
-could not: **on `dots-studio/dots3-note-prev` the class upstream selects
-by default cannot execute at all.** Both halves are below, the correction first,
-because it changes what the rest of the slice is for.
+class those two words select. On `dots-studio/dots3-note-prev` that class is
+the one upstream builds, and it RUNS.
+
+**THE FIRST VERSION OF THIS SECTION SAID THE OPPOSITE, AND IT WAS WRONG.** W9d
+as originally landed asserted that `MoESwiGLUFFNFP8` raises on the released
+geometry, shipped a three-state resolver whose middle state recorded that as a
+divergence, and wrote a stderr notice for every load of the released
+checkpoint. The fresh review of [PR #2947](https://github.com/mudler/vllm.cpp/pull/2947)
+executed the upstream chain and falsified it. §4.20.1 is the corrected finding
+and §4.20.1.1 is the error, kept rather than deleted because the shape of the
+mistake is the reason the pad is now gated.
 
 #### 4.20.1 The finding, and its anchors
 
@@ -7949,86 +7955,132 @@ with no key rewritten and nothing padded. The released `vision_config` does not
 carry `enable_fp8_moe` (verified again here against the committed fixture
 `tests/vllm/models/fixtures/dots3_note_prev/config.json`), so the constructor
 default applies and upstream builds `MoESwiGLUFFNFP8` for all 17 pyramid blocks.
-That much is #2881's finding and it is confirmed.
+That is #2881's finding and it is confirmed.
 
-**What #2881 could not say is what that class does when it runs.** It runs
-`note_vision_fused_moe_fp8` (`nvidia/vision_moe.py:25-149`), whose second
-activation quantization is
-
-```python
-# nvidia/vision_moe.py:119-123 @ 9035151d6
-quantized_activated, activated_scale = per_token_group_quant_fp8(
-    activated, _BLOCK_SHAPE[1], use_ue8m0=False,
-)
-```
-
-`activated` is `[num_tokens * topk, intermediate_size // 2]`
-(`vision_moe.py:70-75`), and `intermediate_size` is `w13.shape[1]`
-(`vision_moe.py:47`), which is `2 * moe_intermediate_size` because
-`process_weights_after_loading` concatenates `fc1` and `fc3` along dim 0
-(`vision.py:258`). So the quantized width is exactly `moe_intermediate_size`.
-`_BLOCK_SHAPE` is `[128, 128]` (`vision_moe.py:22`), and
-`per_token_group_quant_fp8` opens with
+**And that class executes on the released geometry, because the weight cast
+PADS.** The chain is two functions and reading either one alone gets it wrong.
 
 ```python
-# vllm/model_executor/layers/quantization/utils/fp8_utils.py:563-566 @ 9035151d6
-assert x.shape[-1] % group_size == 0, (
-    f"the last dimension of `x` {x.shape[-1]} must be divisible "
-    f"by `group_size` {group_size}"
-)
+# nvidia/vision.py:222-239 @ 9035151d6  — the OUTER function
+def _ceil_to_multiple(value, multiple):
+    return ((value + multiple - 1) // multiple) * multiple
+
+def _per_block_cast_to_fp8_padded(weight, block_size=128):
+    rows, columns = weight.shape
+    padded = weight.new_zeros(_ceil_to_multiple(rows, block_size),
+                              _ceil_to_multiple(columns, block_size))
+    padded[:rows, :columns] = weight
+    return per_block_cast_to_fp8(padded.contiguous(), use_ue8m0=False,
+                                 gran_k=block_size)
 ```
 
-The released `vision_config` sets `moe_intermediate_size = 2112`, and
-`2112 % 128 == 64`. **Upstream's default vision MoE therefore raises
-`AssertionError` at the first routed block of the first image**, before any
-GEMM. The first quantization in the same function is safe — it quantizes
-`hidden_states` at `embed_dim = 1536`, and `1536 % 128 == 0` — so the failure is
-specific to the second one.
+It pads and it **never slices back**. The inner function does slice — but to the
+shape of the tensor IT was handed, which is the already-padded one:
 
-**WHICH width, exactly, because the STORED one is fine and a reader who checks
-it will conclude this section is wrong.** Three widths are in play and only the
-middle one fails:
+```python
+# deep_gemm/utils/math.py:51-61 @ DeepGEMM e21c821f39a2056d68067a466c64ddc942200106
+def per_block_cast_to_fp8(x, use_ue8m0, gran_k=128):
+    m, n = x.shape                       # <- 2176, 1536 on the released expert
+    x_padded = torch.zeros((align(m, gran_k), align(n, gran_k)), ...)
+    ...
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(...)
+```
 
-| width | value | `% 128` | where |
-|---|---|---|---|
-| `embed_dim` — the FIRST quantization, and the K of the gate/up GEMM | 1536 | **0** | `vision_moe.py:77-81` |
-| `w13.shape[1]` — the STORED concatenated fc1+fc3 operand | 4224 | **0** | `vision.py:258`, read at `vision_moe.py:47` |
-| `intermediate_size // 2` — the SECOND quantization's operand | 2112 | **64** | `vision_moe.py:70`, quantized at `:119-123` |
+**THE MODULE MATTERS AND THE OBVIOUS CITATION IS THE WRONG ONE.**
+`nvidia/vision.py:14` is `from vllm.third_party.deep_gemm import
+per_block_cast_to_fp8`. `vllm/third_party/deep_gemm` is not in the vLLM source
+tree at any revision: it is DeepGEMM VENDORED at build time.
+`cmake/external_projects/deepgemm.cmake:33` @ `9035151d6` pins
+`https://github.com/vllm-project/DeepGEMM.git` at
+`e21c821f39a2056d68067a466c64ddc942200106`, and `:168-176` installs that repo's
+`deep_gemm/__init__.py` and `deep_gemm/utils/*.py` under
+`vllm/third_party/deep_gemm`. So the executing body is
+`deep_gemm/utils/math.py:51-61` at that DeepGEMM revision.
 
-So it is not "the expert tensors are unaligned". The tensor upstream actually
-stores is `[2 * 2112, 1536]` and both of its axes are multiples of 128. It is
-the **halving at `vision_moe.py:70`** — `activated_size = intermediate_size //
-2`, the SwiGLU tail's output width — that produces the operand the assertion
-rejects. The gate asserts all three numbers rather than describing them, so the
-distinction is executable.
+It is NOT `vllm/utils/deep_gemm.py:662-681`, and the proof is mechanical rather
+than a preference: that function's signature is
+`per_block_cast_to_fp8(x, block_size: list[int] = DEFAULT_BLOCK_SIZE, use_ue8m0:
+bool = False)` and it has no `gran_k` parameter, while `vision.py:238` passes
+`gran_k=block_size`. A call into that module would raise `TypeError`. The two
+bodies also differ: the vendored one hard-codes `448.0`, vLLM's calls
+`get_fp8_min_max()`.
 
-**The assertion is unconditional.** It sits at `per_token_group_quant_fp8`'s top
-(`fp8_utils.py:563-566`), after only the `use_ue8m0` resolution (`:560-561`) and
-the dtype default (`:562`), and above every branch in the function — the
-CUDA-alike custom-op fast path at `:602-617`, the Triton fallback at `:619-658`,
-and the `column_major_scales` / `tma_aligned_scales` layout choices at
-`:576-598`. No padded variant guards it and `activated` is allocated at exactly
-`activated_size` (`vision_moe.py:71-75`), so nothing rounds the width up before
-the call. Re-derived independently by the operator at the same SHA.
+**The arithmetic that follows, for the released `moe_intermediate_size` 2112 and
+`embed_dim` 1536:**
+
+| step | anchor | value |
+|---|---|---|
+| `fc1.weight` on disk | `vision.py:131` | `[2112, 1536]` |
+| after `_per_block_cast_to_fp8_padded` | `vision.py:230-235` | `[2176, 1536]` — **padded, not sliced back** |
+| `w13 = cat((w1, w3), dim=0)` | `vision.py:258` | `[4352, 1536]` |
+| `intermediate_size = w13.shape[1]` | `vision_moe.py:47` | **4352** (not 4224) |
+| `activated_size = intermediate_size // 2` | `vision_moe.py:70` | **2176** (not 2112) |
+| `assert x.shape[-1] % group_size == 0` | `fp8_utils.py:563` | `2176 % 128 == 0` — **passes** |
+
+**The pad is load-bearing, not decoration.** It is what makes the `w13`
+concatenation representable at all, because a block scale is indexed by
+`n / block_n`:
+
+| reading | scale rows per shard | stacked | `cdiv(merged N, 128)` | merge |
+|---|---|---|---|---|
+| unpadded (2112) | `cdiv(2112,128)` = 17 | 34 | `cdiv(4224,128)` = **33** | MISMATCH |
+| padded (2176) | `cdiv(2176,128)` = 17 | 34 | `cdiv(4352,128)` = **34** | exact |
+
+and every shard but the last must start the next on a block boundary, which
+2176 satisfies and 2112 does not. This tree's own
+`dense_fp8_block::CheckFp8BlockMergeable` refuses the unpadded geometry by name,
+and mutation N1 in §4.20.4.1 is that refusal fired on purpose.
+
+**The pad is numerically inert, for two structural reasons rather than a
+tolerance.** `x_padded` is zero-filled and amax is a max of ABSOLUTE values, so
+a pad lane never raises a block's amax and no scale moves. And
+`(0 * (1/sf))` encodes to the e4m3 zero byte, so a pad ROW of the gate half and
+of the up half give `SiLU(0) * 0 = 0`, against pad COLUMNS of `w2` that are zero
+as well — inert twice over. Both are asserted on the bytes in G0b.
+
+**What still cannot run, and it is one width.** `note_vision_fused_moe_fp8`
+quantizes twice. The SECOND call is over `activated`, whose width is derived
+from the padded `w13` and is therefore 128-aligned by construction. The FIRST
+(`vision_moe.py:77-81`) is over `hidden_states`, whose last dimension is
+`embed_dim` — an ACTIVATION the tower hands in, not a weight, and no pad reaches
+it. So `enable_fp8_moe` true with `embed_dim % 128 != 0` is the one config on
+which upstream's default class raises, and it is the one state
+`ResolveDots3NoteVisionMoeArm` still records. The released `embed_dim` is 1536.
 
 This is **source-derived, not run**. §6.4 option B stands: no oracle for this
 model runs on any hardware this project owns, and the vLLM import chain in the
-local clone does not resolve here either (`ModuleNotFoundError: No module named
-'zmq'` on `vllm.model_executor`), so `per_token_group_quant_fp8` was not
-executed on either side. What is established is the assertion's text, the width
-that reaches it, and the arithmetic `2112 % 128 == 64`. None of those needs a
-run, and none of them is a parity claim.
+local clone does not resolve here either, so neither
+`_per_block_cast_to_fp8_padded` nor `per_token_group_quant_fp8` was executed on
+either side. What is established is the two functions' text at their pinned
+revisions and the arithmetic over the released config. **None of that is a
+parity claim.** Removing a false statement about upstream is not the same as
+gaining a measured agreement with it, and nothing in this section claims one.
 
-**What follows for W6b.** #2881 reads as "W6b may have ported the wrong class".
-On the released checkpoint the answer is no: the class W6b ported,
-`MoESwiGLUFFN`, is upstream's own `enable_fp8_moe=False` branch and it is the
-only one of the two that computes anything on this geometry. R5 and §7's W9
-entry were wrong about WHY the FP8 formula is out of reach — they said the
-checkpoint carries no scale tensors, and #2881 correctly answered that the
-formula is selected by a config default rather than by the checkpoint's
-tensors — but the conclusion they reached is right for a reason neither
-document had. §8's R5 is corrected in place below rather than deleted, because
-the memory-format obligation it names is undiminished.
+#### 4.20.1.1 The error W9d shipped, and why it is recorded here
+
+W9d read `_per_block_cast_to_fp8_padded` as a cast that pads for tiling and
+returns the ORIGINAL extent. Everything downstream followed from that single
+misreading: `w13` was taken as `[4224, 1536]`, `activated_size` as 2112,
+`2112 % 128 == 64`, and `per_token_group_quant_fp8` therefore as raising. A
+three-state resolver was built around the conclusion, a stderr notice was
+written for every load of the released checkpoint, and `docs/FEATURES.md`,
+`docs/USAGE.md` and this section all repeated it.
+
+Two things made it survivable for a whole review cycle and both are now closed:
+
+1. **The header argued the pad away in prose.** It said "THE PADDING CANNOT MOVE
+   A SCALE and is ported anyway", which is true of the scale VALUES and false
+   about the SHAPE — and `fp8_utils.py:563` reads the shape. The caster then
+   emitted `[n, k]`.
+2. **No fixture could see it.** `Fp8MoeSpec` uses `embed_dim =
+   moe_intermediate_size = 256`, both 128-aligned, so the pad is the identity
+   everywhere the suite exercised it; and the resolver sent every ragged width
+   to the bf16 class before the caster ran. The reviewer inserted
+   `VT_CHECK(n % 128 == 0 && k % 128 == 0)` INSIDE the caster and both suites
+   stayed fully green. That probe is mutation N2 and it now reds both.
+
+`Fp8MoeUnalignedSpec` — the released 2112 against an aligned 256 `embed_dim` —
+is the fixture that closes (2), and G0b is the case that reads it.
 
 #### 4.20.2 What W9d ships
 
@@ -8039,34 +8091,44 @@ the memory-format obligation it names is undiminished.
 2. **The class selection, as a resolved value.**
    `ResolveDots3NoteVisionMoeArm` answers `vision.py:369` and, when the answer
    is the FP8 class, whether this build can execute what that class does. It
-   returns three states and never a fourth:
+   returns **two** states:
    - `enable_fp8_moe` false → the bf16 class, no notice. This is upstream's
      other branch and W6b's arm, unchanged byte for byte.
-   - `enable_fp8_moe` true and `embed_dim` or `moe_intermediate_size` not a
-     multiple of 128 → the bf16 class, **with a notice naming
-     `fp8_utils.py:563-566` and the width that fails it.** This is the released
-     checkpoint's state.
-   - `enable_fp8_moe` true and both widths 128-aligned → the FP8 class.
+   - `enable_fp8_moe` true and `embed_dim` a multiple of 128 → the FP8 class.
+     **This is the released checkpoint's state**, because `embed_dim` is 1536.
+   - `enable_fp8_moe` true and `embed_dim` NOT a multiple of 128 → the bf16
+     class, **with a notice naming `fp8_utils.py:563-566`, the width, and the
+     fact that no pad reaches it.**
 
-   The middle state is a **recorded divergence and not a silent fallback**: it
-   is a value on the weights, the served checkpoint's notice text is asserted
-   verbatim by the gate, and it is written to `stderr` once at materialization
-   so an operator sees it without reading this file. It is a divergence because
-   upstream raises there and this tree answers; the alternative is to refuse an
-   image request that W6b serves correctly today, which trades a working
-   capability for an upstream defect. Whoever disagrees with that polarity
-   should reverse it in one place — `ResolveDots3NoteVisionMoeArm` — and the
-   gate will tell them what moved.
+   `moe_intermediate_size` appears in no branch of this predicate at any value,
+   because `_per_block_cast_to_fp8_padded` owns that width (§4.20.1). G0 sweeps
+   the residues either side of a 128-block and asserts every one of them
+   resolves to the FP8 class.
+
+   The last state is a **recorded divergence and not a silent fallback**: it is
+   a value on the weights, its notice text is asserted by the gate, and it is
+   written to `stderr` once at materialization so an operator sees it without
+   reading this file. It is a divergence because upstream raises there and this
+   tree answers; the alternative is to refuse an image request that W6b serves
+   correctly today, which trades a working capability for an upstream defect.
+   Whoever disagrees with that polarity should reverse it in one place —
+   `ResolveDots3NoteVisionMoeArm` — and the gate will tell them what moved.
+
+   **What this state is NOT is the released checkpoint.** W9d put the released
+   checkpoint here and that was the error §4.20.1.1 records; the state now
+   covers only a config no published dots3-note checkpoint carries.
 
 3. **The weight-side caster.** `Dots3NoteVisionBlockCastFp8` is
-   `_per_block_cast_to_fp8_padded` (`vision.py:225-239`) over
-   `per_block_cast_to_fp8` (`vllm/utils/deep_gemm.py:660-681`, itself a copy of
-   DeepGEMM's `deep_gemm/utils/math.py`), in upstream's own order and with
-   upstream's own constants: zero-pad both axes up to a multiple of 128, amax
-   over each `128x128` block in **f32**, `clamp(1e-4)`, `sf = amax / 448`,
-   **multiply by the reciprocal** `x * (1.0 / sf)` rather than divide, round
-   once to e4m3fn, and return the packed bytes sliced back to the unpadded
-   `[N, K]` beside an f32 `[cdiv(N,128), cdiv(K,128)]` scale grid.
+   `_per_block_cast_to_fp8_padded` (`vision.py:225-239` @ `9035151d6`) over
+   `per_block_cast_to_fp8` (`deep_gemm/utils/math.py:51-61` @ DeepGEMM
+   `e21c821f39a2056d68067a466c64ddc942200106`, vendored by
+   `cmake/external_projects/deepgemm.cmake:33,168-176`), in upstream's own order
+   and with upstream's own constants: zero-pad both axes up to a multiple of
+   128, amax over each `128x128` block in **f32**, `clamp(1e-4)`,
+   `sf = amax / 448`, **multiply by the reciprocal** `x * (1.0 / sf)` rather
+   than divide, round once to e4m3fn, and return the packed bytes **at the
+   PADDED `[align(N,128), align(K,128)]`** beside an f32
+   `[cdiv(N,128), cdiv(K,128)]` scale grid.
 
    Three of those are places a plausible rewrite would differ and the byte gate
    would not forgive: the `1e-4` amax floor is not `QuantFp8Group`'s `1e-10`
@@ -8074,9 +8136,15 @@ the memory-format obligation it names is undiminished.
    reciprocal multiply is not the divide `QuantFp8Group` ships, and this file's
    own note on that op says why a divide there must not be "corrected" into a
    multiply — here upstream ships the multiply and the polarity is reversed;
-   and the padding cannot be dropped even though it provably cannot move a
-   scale, because reading it as droppable is one edit away from also dropping
-   the `cdiv` that owns the ragged final block.
+   and **the pad is EMITTED rather than sliced away**, which is the correction
+   PR #2947 made. W9d returned `[N, K]` and argued the pad away as inert. It IS
+   inert in value and it is load-bearing in shape: §4.20.1's two tables carry
+   the arithmetic, and mutations N1 and N2 carry the proof that the gate now
+   sees a caster that drops it.
+
+   `Dots3NoteVisionFp8PadTo128` is exported beside the caster so the forward's
+   merged width and the caster's extents come from one function rather than two
+   derivations that can drift.
 
    `use_ue8m0` is **false** at this call site and at both `vision_moe.py` sites
    (`vision.py:237`, `vision_moe.py:80`, `:122`), so no e8m0 rounding is applied
@@ -8164,14 +8232,28 @@ question.
 
 An output-level direction test was written, run, and **cannot work**, and the
 numbers are recorded here rather than the threshold being tuned until it passed.
-At the tower output the two reference towers differ by 0.0790 over a scale of
-71.16 (relative 1.11e-3), because the residual around the MoE block and the
-adapter after it dilute the block's 6.1e-3. The implementation is 3.4275 from
-the F32 reference and 3.4395 from the BF16 one — the right ordering, and **43.4x
-the separation being tested**, because this arm QUANTIZES: a bf16 activation and
-a double activation land on different e4m3 codes near a boundary, which is about
-half an e4m3 ULP at each of the four GEMMs. Asserting that ordering would be
-asserting a coin flip.
+**Every number in this paragraph was RE-MEASURED by the PR #2947 repair.** The
+M3 fixture move from 128 to 256 changed all of them and the prose was never
+re-run against it; the values that stood here (0.0790 / 71.16 / 3.4275 / 3.4395
+/ 43.4x) were the pre-move readings.
+
+At the tower output the two reference towers differ by **0.0273453** over a
+scale of **144.154** (relative 1.897e-4), because the residual around the MoE
+block and the adapter after it dilute the block's 6.1e-3. The implementation is
+**4.25719** from the F32 reference and **4.25394** from the BF16 one, which is
+**155.68x the separation being tested**, because this arm QUANTIZES: a bf16
+activation and a double activation land on different e4m3 codes near a boundary,
+which is about half an e4m3 ULP at each of the four GEMMs.
+
+**And the ordering is the WRONG way round.** 4.25719 (F32) is larger than
+4.25394 (BF16): on this fixture the implementation sits nearer the reference it
+did NOT take. The earlier text asserted "the right ordering is visible (3.4275 <
+3.4395)" and that claim is falsified. Nothing about which denominator ran
+follows from it — the two distances differ by 3.25e-3, 0.08% of either and two
+orders below the noise that dominates both — and that is the point the
+correction sharpens rather than blunts: a direction test at the tower output is
+a coin flip in BOTH directions, and it happened to land tails. The capture
+assertion is what separates the two arms, by five orders of magnitude.
 
 So the denominator gate is a CAPTURE assertion for the same reason G1 is a BYTE
 assertion: the defect is invisible to every value comparison this fixture can
@@ -8187,13 +8269,21 @@ is the honest boundary of this instrument.
 The production entry point is `ApiServer::handle_chat_completions` on the
 default configuration.
 
-- The **released geometry** reaches the parse, the resolution, the notice and
-  the bf16 arm on every served image. Its served answer is unchanged from W6b's,
-  which is asserted rather than assumed.
-- The **FP8 arm** is reached from the same entry point on a served checkpoint
-  whose vision tower is 128-aligned. No published checkpoint is, so the gate
-  builds one, exactly as every other brick on this row gates its arm on a
-  synthetic tower served through the real `ApiServer`.
+- The **FP8 arm** is reached from the same entry point on every served image of
+  a checkpoint whose `embed_dim` is 128-aligned, which the released one is. The
+  gate serves two such towers: one whose expert width is aligned as well
+  (`Fp8PyramidSpec`, `E = Im = 256`) and one whose expert width is RAGGED
+  (`E = 128`, `Im = 100 -> 128`), which is the released shape. Both enter the
+  block-FP8 GEMM and the count is asserted; the ragged one is the served proof
+  that a PADDED operand reaches the kernel, because a caster that dropped the
+  pad makes `dense_fp8_block::CheckFp8BlockMergeable` refuse the request instead
+  of answering it.
+- The **bf16 arm** is reached on `enable_fp8_moe = false` and on a ragged
+  `embed_dim` (`E = 120`), and the served case asserts that NOTHING enters the
+  block-FP8 GEMM on that path.
+- No published checkpoint carries a ragged `embed_dim`, so the gate builds one,
+  exactly as every other brick on this row gates its arm on a synthetic tower
+  served through the real `ApiServer`.
 
 Each mutation below is RED-first, restored byte for byte, and reported with the
 binary sha AND the case counts — a changed sha alone does not prove a mutation
@@ -8202,16 +8292,42 @@ inert mutation read as one the tests survived.
 
 #### 4.20.4.1 The mutation table
 
-Baseline at the reviewed head: `test_dots3_note_vision` **19 cases / 21683 assertions**, sha `f5578787489113ec`; `test_openai_api_server_dots3_mm_forward` **31 cases / 16491 assertions**, sha `444317f9b8518c52`. Both rc 0.
+**RE-RUN IN FULL BY THE PR #2947 REPAIR**, on the merge of the PR head with
+`origin/main`, in a `/dev/shm` build with `TMPDIR` inside the build directory.
+Baseline: `test_dots3_note_vision` **20 cases / 21843 assertions**, sha
+`d5fccd922dcbd603`; `test_openai_api_server_dots3_mm_forward` **32 cases / 16499
+assertions**, sha `dbfd649af72afb26`. Both rc 0. Every mutation below was
+restored byte-for-byte (source sha
+`e67a97754e2266c91efe48e0845e8324d1644ecf285667e200940220ce80b4f1`) and both
+baseline binary shas were reproduced after EVERY one of them, not only the last.
 
 | # | what it changes | `test_dots3_note_vision` | `test_openai_api_server_dots3_mm_forward` |
 |---|---|---|---|
-| M1 | force `enable_fp8_moe` FALSE at the parse, so the bf16 class is selected | **RED** 4/19 cases, 5/21403 assertions<br>sha `c12b4f831cba3388` | **RED** 2/31 cases, 2/16491 assertions<br>sha `149367378fc7783c` |
-| M2 | use the BF16 arm's denominator (`bf16 accumulation + 1e-9`) in the FP8 path | **RED** 1/19 cases, 2/21683 assertions<br>sha `31de96f2842228b1` | green 0/31 cases, 0/16491 assertions<br>sha `7110c958097dfc0a` |
-| M2c | apply the BF16 denominator and leave the CAPTURE line untouched | **RED** 1/19 cases, 2/21683 assertions<br>sha `3eef586a82168d3b` | green 0/31 cases, 0/16491 assertions<br>sha `74f6e2099a04ff66` |
-| M3 | the weight-side cast stops being PER-BLOCK: one whole-tensor amax, repeated | **RED** 2/19 cases, 13/21683 assertions<br>sha `de1a49d621713986` | green 0/31 cases, 0/16491 assertions<br>sha `4f132a1c7f6c83a4` |
-| M4 | insert `_ceil_to_ue8m0` on the weight scale | **RED** 2/19 cases, 2/21683 assertions<br>sha `f5357058f6f98221` | green 0/31 cases, 0/16491 assertions<br>sha `901221c81528ce27` |
-| M5 | delete the FP8 production call site: both expert GEMMs take the bf16 method | **RED** 1/19 cases, 1/21683 assertions<br>sha `b77ba55123d4ac56` | **RED** 2/31 cases, 2/16491 assertions<br>sha `6ec86b07cd5e3483` |
+| N1 | the caster SLICES BACK to `[n, k]` — W9d's defect, the F1 finding | **RED** 1/20 cases, 0/21717 assertions (the case THREW: `CheckFp8BlockMergeable` refuses `out_features 2112`)<br>sha `765a005848d75530` | **RED** 1/32 cases, 1/16495 assertions<br>sha `d3e710b32ca4d4ba` |
+| N2 | `VT_CHECK(n % 128 == 0 && k % 128 == 0)` INSIDE the caster — the reviewer's own probe, which was GREEN on both suites at the W9d head | **RED** 1/20 cases, 0/21712 assertions<br>sha `5a0f17790d17a1ac` | **RED** 1/32 cases, 0/16491 assertions<br>sha `6efc9dbdcc08d175` |
+| R1 | the resolver reads the STORED width `2 * moe_intermediate_size` instead of `embed_dim` | **RED** 1/20 cases, 10/21829 assertions<br>sha `09d9842ce1b01f74` | **RED** 2/32 cases, 1/16493 assertions<br>sha `066db7aee589ba7b` |
+| R3 | drop the refusal notice: return an empty `upstream_raises` | **RED** 1/20 cases, 1/21829 assertions<br>sha `f5f6e1e1b3a35619` | green 0/32 cases, 0/16499 assertions<br>sha `6b3fa760e4fd37f5` |
+| M2c | apply the BF16 denominator and leave the CAPTURE line untouched | **RED** 1/20 cases, 2/21843 assertions<br>sha `9ea0cb821fb5e1de` | green 0/32 cases, 0/16499 assertions<br>sha `9507de529e79ee58` |
+| M4 | insert `ceil_to_ue8m0` on the weight scale | **RED** 3/20 cases, 5/21843 assertions<br>sha `5914c1d375cdec85` | green 0/32 cases, 0/16499 assertions<br>sha `9e15bf1ba452a9bb` |
+| M5 | delete the FP8 production call site: both expert GEMMs take the bf16 method | **RED** 1/20 cases, 1/21843 assertions<br>sha `20fdb780b136bbb6` | **RED** 3/32 cases, 3/16499 assertions<br>sha `cdb58a15e23933ed` |
+
+**N1 and N2 are the F1 and F2 findings, executed.** N1 is the defect W9d
+shipped: it reds because `dense_fp8_block::CheckFp8BlockMergeable` refuses a
+2112-row non-final shard by name, which is the concrete failure the pad
+prevents. N2 is the probe the fresh reviewer used to establish that no fixture
+could see the pad at all — it was green on 19/21683 and 31/16491 at the W9d
+head, and it reds both suites now. G0b (`Fp8MoeUnalignedSpec`, the released
+`moe_intermediate_size` 2112 against an aligned `embed_dim`) is what changed.
+
+**What N1's red does NOT reach.** Only the value bound in G0b is loose enough to
+survive M5, whose forward-path deletion is caught by G2 and by three served
+cases instead. G0b's gate is the STRUCTURE — extents, scale-grid rows, pad
+bytes, the merge checker asked directly, and the exact routing set — and its
+tower comparison is there to catch an operand that computes garbage, at a 1e-1
+bound against a measured 0.0492 (G2's aligned fixture reads 0.0295 at 5e-2; the
+down GEMM here reduces over 2176 e4m3 products instead of 256).
+
+The rows below are earlier findings from the W9d cycle, retained.
 
 **Two of these mutations SURVIVED when they were first run, and both survivals
 were defects in the GATE rather than facts about the port.** Neither is reported
@@ -8256,9 +8372,11 @@ strictly above 1.0 and that the grid has more than one cell, and M3 reds.
 are out of W6's reach because the released checkpoint ships no scale tensors.
 #2881 answered that the FP8 formula is selected by a config default and not by
 the checkpoint's tensors, which is correct. W9d adds the part neither had: on
-the released `moe_intermediate_size` the selected class raises. The risk is
-**not waived** — its memory-format obligation binds this brick, and G1 is how
-W9d discharges it — but its owner is now W9d and its reason is §4.20.1.
+the released `moe_intermediate_size` the selected class raises — **and that
+addition was wrong, retracted in §4.20.1.1: the cast pads and the class runs.**
+The risk is **not waived** — its memory-format obligation binds this brick, and
+G1 is how W9d discharges it — but its owner is now W9d and its reason is
+§4.20.1.
 
 **`use_ue8m0` does NOT bite the vision arm.** The `## Owed` entry recorded at W5
 says it "probably does bite at W9, because upstream's blockwise-FP8 MoE routes
@@ -8852,9 +8970,13 @@ dispatchable in order, under the constraints that answer imposes.
 - **W9 — quantized arms.** Blockwise FP8 and the owed GGUF k-quant arm +
   converter. **W9a DONE** (#2882): the GGUF refusal is reachable and true.
   **W9d DONE** (#2881, §4.20): the tree reads `vision_config.enable_fp8_moe`,
-  ports `MoESwiGLUFFNFP8` onto the shared block-FP8 seams, and records the
-  finding that the class upstream selects by default RAISES on the released
-  `moe_intermediate_size` of 2112 (`fp8_utils.py:563-566` @ `9035151d6`).
+  ports `MoESwiGLUFFNFP8` onto the shared block-FP8 seams — including
+  `_per_block_cast_to_fp8_padded`'s PAD, which is what makes the released
+  `moe_intermediate_size` of 2112 run rather than raise — and keeps one narrow
+  refusal, a ragged `embed_dim`, which is the one width no pad reaches
+  (`fp8_utils.py:563-566` @ `9035151d6` over `vision_moe.py:77-81`). W9d's
+  original claim that the released width RAISES was false and is corrected in
+  §4.20.1.1.
   **This paragraph's earlier reasoning is superseded and is kept only as the
   history of the correction.** It said the FP32-scale FP8 formula belongs to W9
   rather than W6 because the released bf16 checkpoint ships no scale tensors at
@@ -8896,9 +9018,11 @@ dispatchable in order, under the constraints that answer imposes.
   `vision.py:69`) and not from the checkpoint's tensors, and
   `MoESwiGLUFFNFP8.process_weights_after_loading` casts bf16 experts to block
   FP8 at load, so the FP32 activation scales are reachable on the artifact W6b
-  already loads. W9d then established the part neither document had: on the
-  released `moe_intermediate_size` of 2112 the selected class RAISES before any
-  GEMM (§4.20.1). The RISK is unchanged and is not waived; W9d's G1 is where
+  already loads. W9d then claimed the part neither document had — that on the
+  released `moe_intermediate_size` of 2112 the selected class raises before any
+  GEMM — and **that claim was itself false and is retracted** (§4.20.1.1): the
+  cast PADS 2112 to 2176 and the class runs. The RISK is unchanged and is not
+  waived; W9d's G1 is where
   this row discharges the memory-format obligation for the FP8 arm, and W6a
   discharged its own share of it in §4.11.4.
 - **R6 — no llama.cpp comparison** for the GGUF arm, so the quantized floor has
@@ -9545,19 +9669,31 @@ Carried openly under option B (§6.4), not waived:
 
 ## Now
 
-**W9d LANDED (#2881, §4.20): the tree reads `enable_fp8_moe`, and the class
-upstream selects by default turns out not to run on the released checkpoint.**
+**W9d LANDED (#2881, §4.20): the tree reads `enable_fp8_moe` and ports the
+class it selects, which on the released checkpoint is the FP8 one.**
 `DotsMoEVitConfig` defaults `enable_fp8_moe` to true (`vision.py:69` @
 `9035151d6`) and the released `vision_config` omits it, so upstream builds
-`MoESwiGLUFFNFP8` for all 17 pyramid blocks — and that class quantizes an
-activation of width `moe_intermediate_size = 2112` in groups of 128, which
-`fp8_utils.py:563-566` asserts against. W9d ports the class onto
-`layers::Fp8BlockLinearMethod`, ports `_per_block_cast_to_fp8_padded` as a
-weight-side caster, mirrors the `clamp_min` denominator, and REPORTS the
-released checkpoint's state rather than either pretending or refusing an image
-W6b serves correctly. Nothing here is compared against vLLM: §6.4 option B
-stands and the size of the divergence between the two upstream classes is
-unmeasured. R5 and the `use_ue8m0` `## Owed` entry are corrected in place
+`MoESwiGLUFFNFP8` for all 17 pyramid blocks. W9d ports it onto
+`layers::Fp8BlockMlpGateUpMethod` + `layers::Fp8BlockLinearMethod`, ports
+`_per_block_cast_to_fp8_padded` as a weight-side caster **including its PAD**,
+and mirrors the `clamp_min` denominator. One narrow refusal remains and it is
+not the expert width: a ragged `embed_dim` is the one width no pad reaches
+(`vision_moe.py:77-81` into `fp8_utils.py:563-566`), and such a tower runs
+upstream's other class and says so.
+
+**W9d's first landing claimed the opposite and it was FALSE**, found by the
+fresh review of [PR #2947](https://github.com/mudler/vllm.cpp/pull/2947) and
+corrected in the same pull request. It read
+`_per_block_cast_to_fp8_padded` as returning the unpadded extent, concluded
+`activated_size` was 2112 rather than 2176, and shipped a three-state resolver
+whose middle state routed the released checkpoint to bf16 with a stderr
+warning. `per_block_cast_to_fp8` slices to the shape of ITS input, which the
+outer function already padded, so the slice is the identity. §4.20.1.1 keeps the
+error and §4.20.4.1's N1/N2 are the mutations that would now catch it.
+
+Nothing here is compared against vLLM: §6.4 option B stands, nothing ran
+upstream end to end, and **removing a false claim about upstream is not a parity
+claim**. R5 and the `use_ue8m0` `## Owed` entry are corrected in place
 (§4.20.5).
 
 **W8a LANDED (#2860): ONE dots3-note request now carries TWO `mm_features`, the
