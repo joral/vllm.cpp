@@ -18,6 +18,9 @@ pin. This checker is what stops that rule decaying into prose:
     ungateable lane visible debt instead of a mid-campaign discovery;
   * the `vllm` record's `pin` and `pin_label` AGREE with the ```parity-pin
     block in `.agents/upstream-sync.md`, which is the authority (#2829).
+  * every `pin:commit` / `pin:label` span in the PROSE surfaces named by
+    `PIN_SURFACES` agrees with that same authority, and each of those paths
+    carries at least one `commit` span (#2883).
 
 THE PARITY RECONCILIATION, because it reverses what this docstring used to say.
 
@@ -54,6 +57,29 @@ WHAT IT DOES NOT DO, so nobody cites it for more than it delivers:
     that fired on the word "SGLang" would go red on hundreds of files that are
     doing nothing wrong and would be silenced within a week.
 
+THE PROSE SURFACES, and why they are delimited rather than parsed (#2883).
+
+`.agents/NOW.md`, `docs/FEATURES.md` and `docs/benchmarks/how-we-measure.md`
+restate the abbreviated revision and the release label in sentences. #2880
+declined to gate them and its argument was narrower than it read: a grep for the
+two prior pins returns 286 files that name them ON PURPOSE, which rules out a
+REGEX OVER PROSE and does not rule out a rule over NAMED PATHS.
+
+A token rule over unmarked prose was built far enough to reject it, and it fails
+on real content in both directions. `docs/FEATURES.md` names the llama.cpp pin
+`b10451` one line below the vLLM pin, six characters drawn entirely from
+[0-9a-f], so a "backticked hex word" heuristic reads a second project's pin as a
+malformed vLLM revision; and a containment rule asking whether the public
+version appears in the sentence passes a surface reading `0.28.1rc1.dev1320`.
+
+So the surfaces are DELIMITED instead. An inline `<!--pin:commit-->` /
+`<!--pin:label-->` span makes the span content the value: no token regex, no
+sentence shape, no positional assumption, and nothing outside a span is read, so
+the rule cannot fire when somebody rewraps a paragraph. HTML comments are
+stripped when Markdown renders, so the public prose is unchanged in a browser.
+The markers' ABSENCE from a named path is an error, which is what stops the rule
+being silenced by deleting them.
+
 Run with `--self-test` to sweep the FIXTURES corpus below in both directions:
 every `bad=True` fixture must be reported and every `bad=False` one must not.
 """
@@ -75,6 +101,29 @@ DECLARATION_ROOTS = (ROOT / ".agents",)
 # this same block and `tools/bench/online_gate.py` refuses a mismatched oracle
 # on it, so it is what a measurement actually ran against.
 UPSTREAM_SYNC = ROOT / ".agents/upstream-sync.md"
+
+# The PROSE surfaces (#2883). The pin is restated in public projections, and
+# until now nothing reconciled them against the authority above. They are read
+# ONLY inside a `<!--pin:...-->` span, so the 286 files that name a PRIOR pin on
+# purpose are never looked at, and neither is any unmarked sentence in these
+# files -- `docs/FEATURES.md` restates the current pin a second time at line 46
+# and that sentence is deliberately free prose.
+# Each of these must exist and carry at least ONE `commit` span, and every span
+# in them is validated. The rule reads THESE PATHS AND NOTHING ELSE.
+#
+# A GLOB OVER `.agents/` AND `docs/` WAS BUILT FIRST AND REJECTED, on evidence.
+# It reddened on this rule's OWN SPEC, which quotes the marker in a fenced block
+# to explain it -- 4 openers, 2 spans, and a "not a hexadecimal revision" whose
+# value was half the document. Documentation of a marker is not a surface
+# carrying one, and no cheap rule tells them apart. Scanning named paths is also
+# exactly what #2883 proposed. The cost is one line here when a fourth surface
+# is marked, and `docs/benchmarks/speculative-decoding.md` and
+# `docs/benchmarks/vllm-online-serving.md` are the two that owe it.
+PIN_SURFACES = (
+    ROOT / ".agents/NOW.md",
+    ROOT / "docs/FEATURES.md",
+    ROOT / "docs/benchmarks/how-we-measure.md",
+)
 
 REQUIRED_KEYS = (
     "id",
@@ -109,6 +158,30 @@ REGISTRY_REGION = re.compile(
 )
 TABLE_ID = re.compile(r"^\|[^|]*\|\s*`([a-z0-9-]+)`\s*\|")
 DECLARATION = re.compile(r"\*\*Secondary oracle:\*\*\s*`([a-z0-9-]+)`")
+
+# The pin-surface delimiters. `PIN_SPAN` matches a COMPLETE span; `PIN_OPEN`
+# matches any opener at all, including a kind nobody defined. Counting the two
+# against each other is what turns an unclosed or misspelled marker into an
+# error instead of a span that quietly stops existing.
+PIN_SPAN = re.compile(r"<!--\s*pin:(commit|label)\s*-->(.*?)<!--\s*/pin\s*-->", re.S)
+PIN_OPEN = re.compile(r"<!--\s*pin:([a-z]*)\s*-->")
+HEX = re.compile(r"^[0-9a-f]+$")
+# The FLOOR on an abbreviated revision, and the whole of what it is for.
+#
+# #2883 asks a rule to settle the abbreviation length, and observes that
+# accepting any prefix accepts `e1`. The length is NOT pinned, because this tree
+# has no such convention to pin: it writes the prior pin as EIGHT characters in
+# `docs/benchmarks/how-we-measure.md`, NINE in `docs/FEATURES.md` and FORTY in
+# `.agents/oracles/vllm.md`. A fixed length would invent a convention and go red
+# on the shape the repository already uses, and AGENTS.md is explicit that a
+# gate which fires on ordinary work is the defect.
+#
+# Correctness is therefore "is a prefix of vllm_commit". The floor exists for
+# ONE reason: below eight hex characters an abbreviation can collide with a
+# DIFFERENT commit by accident, and the rule would then pass a stale surface.
+# Eight is 4.3e9 values and is the shortest abbreviation this tree writes, so
+# the floor rejects `e1` without rejecting anything anybody does today.
+MIN_ABBREV = 8
 
 
 @dataclass
@@ -278,6 +351,106 @@ def check_parity_reconciliation(
                 f"{name}: pin_label {record.fields.get('pin_label')!r} does not match "
                 f"the public version {expected!r} of {authority} "
                 f"vllm_runtime_version {runtime!r}"
+            )
+
+
+def surface_label(path: Path) -> str:
+    """A path as it is reported: repo-relative when it is inside the tree."""
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def check_pin_surfaces(
+    surfaces: dict[Path, str],
+    required: tuple[Path, ...],
+    parity: dict[str, str] | None,
+    errors: list[str],
+) -> None:
+    """The pin's PROSE surfaces agree with the authority (#2883).
+
+    *surfaces* is `{repo-relative path: text}`, *required* the paths that must
+    each carry at least one `commit` span, and *parity* the fields read from
+    `.agents/upstream-sync.md`. Like `check_parity_reconciliation`, this
+    function opens NO file: the expectation arrives as a parameter, because a
+    checker that reads its expectation out of the file it is checking is a
+    tautology and this repository has shipped that shape.
+
+    NOTHING OUTSIDE A MARKED SPAN IS READ. That is the whole reason the surfaces
+    were structured first rather than parsed. A token rule over an unmarked
+    sentence reads `b10451` -- the llama.cpp pin, one line below the vLLM pin in
+    `docs/FEATURES.md`, and six characters drawn entirely from [0-9a-f] -- as a
+    malformed vLLM revision; a containment rule over the same sentence accepts a
+    surface reading `0.28.1rc1.dev1320`. Both failures are unreachable here
+    because the span content IS the value.
+    """
+    if parity is None:
+        return  # parse_parity_pin already reported why, and it reported it once.
+
+    commit = parity.get("vllm_commit")
+    runtime = parity.get("vllm_runtime_version")
+    expected_label = public_version(runtime) if runtime else None
+
+    seen_commit_spans: dict[Path, int] = {}
+    for path in sorted(surfaces):
+        text = surfaces[path]
+        label = surface_label(path)
+        spans = PIN_SPAN.findall(text)
+        openers = PIN_OPEN.findall(text)
+        if len(openers) != len(spans):
+            errors.append(
+                f"{label}: {len(openers)} `<!--pin:...-->` opener(s) but "
+                f"{len(spans)} complete span(s) -- an unclosed or misspelled "
+                "marker is an error, not a span that stops existing"
+            )
+        seen_commit_spans[path] = sum(1 for kind, _ in spans if kind == "commit")
+        for kind, raw in spans:
+            value = raw.strip().strip("`").strip()
+            if not value:
+                errors.append(f"{label}: empty `{kind}` pin span")
+                continue
+            if kind == "commit":
+                if commit is None:
+                    continue  # parse_parity_pin already reported the omission.
+                if not HEX.match(value):
+                    errors.append(
+                        f"{label}: pin span {value!r} is not a hexadecimal revision"
+                    )
+                elif len(value) < MIN_ABBREV:
+                    errors.append(
+                        f"{label}: pin span {value!r} is {len(value)} characters, "
+                        f"under the {MIN_ABBREV}-character floor -- a shorter "
+                        "abbreviation can collide with a different commit"
+                    )
+                elif not commit.startswith(value):
+                    errors.append(
+                        f"{label}: pin span {value!r} is not a prefix of "
+                        f"{UPSTREAM_SYNC.name} vllm_commit {commit!r} -- the "
+                        "parity-pin block is the authority, and this surface "
+                        "restates it"
+                    )
+            else:  # kind == "label"; PIN_SPAN admits no third kind.
+                if expected_label is None:
+                    continue  # parse_parity_pin already reported the omission.
+                if value != expected_label:
+                    errors.append(
+                        f"{label}: pin span {value!r} does not match the public "
+                        f"version {expected_label!r} of {UPSTREAM_SYNC.name} "
+                        f"vllm_runtime_version {runtime!r}"
+                    )
+
+    for path in required:
+        label = surface_label(path)
+        if path not in surfaces:
+            errors.append(
+                f"{label}: a declared pin surface, but it is unreadable -- it "
+                "restates the pin and must carry a `<!--pin:commit-->` span"
+            )
+        elif not seen_commit_spans.get(path):
+            errors.append(
+                f"{label}: carries no `<!--pin:commit-->` span, so the pin it "
+                "restates is unchecked against " + UPSTREAM_SYNC.name
             )
 
 
@@ -474,6 +647,69 @@ PARITY_FIXTURES: tuple[tuple[str, str, str, bool], ...] = (
 )
 
 
+# The pin-surface corpus (#2883), swept in both directions beside the two above.
+# `_PIN_GOOD` is a whole sentence, not a bare span, because the rule's central
+# claim is that the prose AROUND a span is free: the benign fixtures rewrap it,
+# add a second project's pin (`b10451`, six characters of [0-9a-f], the exact
+# token that killed the prose-parsing design) and name the PRIOR pin on purpose.
+_PIN_GOOD = (
+    "**Oracle pin.** vLLM <!--pin:label-->9.9.9rc1.dev1<!--/pin--> "
+    "(<!--pin:commit-->`1111111111`<!--/pin-->) since 2026-09-03.\n"
+)
+
+PIN_SURFACE_FIXTURES: tuple[tuple[str, str, bool], ...] = (
+    ("agrees", _PIN_GOOD, False),
+    # The prose around the spans is free. These three are the "a gate that fires
+    # on correct work is the defect" cases, and they are fixtures, not comments.
+    (
+        "benign rewrap and neighbouring prose",
+        "Reference versions: llama.cpp `b10451`, MLX-LM as of 2026-07.\n"
+        "Rows were read at the PRIOR pin `555967922` unless they say\n"
+        "otherwise.\n\n" + _PIN_GOOD.replace(") since", ")\nsince"),
+        False,
+    ),
+    ("a full 40-character revision", _PIN_GOOD.replace("1111111111", "1" * 40), False),
+    ("an 8-character revision, the floor", _PIN_GOOD.replace("1111111111", "11111111"), False),
+    ("two commit spans that both agree", _PIN_GOOD + _PIN_GOOD, False),
+    # The #2829 shape, in prose this time: the authority advanced, the surface
+    # did not.
+    ("a stale revision", _PIN_GOOD.replace("1111111111", "2222222222"), True),
+    ("a stale label", _PIN_GOOD.replace("9.9.9rc1.dev1<", "9.8.0<"), True),
+    # A PROPER PREFIX of the right label, which a substring rule accepts.
+    ("a truncated label", _PIN_GOOD.replace("9.9.9rc1.dev1<", "9.9.9rc1.dev<"), True),
+    # And the other direction: the right label with a character appended, which
+    # a CONTAINMENT rule accepts because the expectation is a substring of it.
+    ("a label with a suffix", _PIN_GOOD.replace("9.9.9rc1.dev1<", "9.9.9rc1.dev1320<"), True),
+    (
+        "a label carrying the local segment",
+        _PIN_GOOD.replace("9.9.9rc1.dev1<", "9.9.9rc1.dev1+g1111111111<"),
+        True,
+    ),
+    # The degenerate prefix #2883 names by hand.
+    ("a two-character abbreviation", _PIN_GOOD.replace("`1111111111`", "`11`"), True),
+    ("a seven-character abbreviation", _PIN_GOOD.replace("`1111111111`", "`1111111`"), True),
+    ("a non-hexadecimal revision", _PIN_GOOD.replace("1111111111", "zzzzzzzzzz"), True),
+    ("an empty span", _PIN_GOOD.replace("`1111111111`", ""), True),
+    ("an unclosed marker", _PIN_GOOD.replace("`<!--/pin-->) since", "`) since"), True),
+    ("a marker kind nobody defined", _PIN_GOOD.replace("pin:commit", "pin:sha"), True),
+    ("no marker at all", "**Oracle pin.** vLLM 9.9.9rc1.dev1 (`1111111111`).\n", True),
+    (
+        "only a label span, so the revision is unchecked",
+        "**Oracle pin.** vLLM <!--pin:label-->9.9.9rc1.dev1<!--/pin-->.\n",
+        True,
+    ),
+)
+
+
+def pin_surface_errors(surface_text: str) -> list[str]:
+    """Only the pin-surface rule's complaints, for one synthetic surface."""
+    errors: list[str] = []
+    parity = parse_parity_pin(UPSTREAM_SYNC.name, _PARITY_SYNC, errors)
+    path = Path("NOW.md")
+    check_pin_surfaces({path: surface_text}, (path,), parity, errors)
+    return errors
+
+
 def parity_errors(record_text: str, sync_text: str) -> list[str]:
     """Only the reconciliation's own complaints, for one synthetic pair."""
     errors: list[str] = []
@@ -485,6 +721,12 @@ def parity_errors(record_text: str, sync_text: str) -> list[str]:
 
 def self_test() -> int:
     failures: list[str] = []
+    for name, surface_text, bad in PIN_SURFACE_FIXTURES:
+        errors = pin_surface_errors(surface_text)
+        reported = bool(errors)
+        if reported != bad:
+            verb = "was not reported" if bad else "was reported"
+            failures.append(f"pin-surface fixture {name!r} {verb}: {errors}")
     for name, record_text, sync_text, bad in PARITY_FIXTURES:
         errors = parity_errors(record_text, sync_text)
         reported = bool(errors)
@@ -502,13 +744,14 @@ def self_test() -> int:
             failures.append(f"fixture {name} {verb}: {errors}")
     for failure in failures:
         print(f"self-test: {failure}", file=sys.stderr)
-    total = len(FIXTURES) + len(PARITY_FIXTURES)
+    total = len(FIXTURES) + len(PARITY_FIXTURES) + len(PIN_SURFACE_FIXTURES)
     if failures:
         print(f"self-test FAILED ({len(failures)} of {total})", file=sys.stderr)
         return 1
     print(
         f"self-test ok ({len(FIXTURES)} record fixtures, "
-        f"{len(PARITY_FIXTURES)} parity fixtures)"
+        f"{len(PARITY_FIXTURES)} parity fixtures, "
+        f"{len(PIN_SURFACE_FIXTURES)} pin-surface fixtures)"
     )
     return 0
 
@@ -566,6 +809,17 @@ def main(argv: list[str] | None = None) -> int:
         for path in sorted(root.rglob("*.md"))
     }
     errors.extend(check_declarations(declarations, registry_ids))
+
+    # The pin's PROSE surfaces (#2883). Read from the module-level tuple so the
+    # whole rule can be pointed at a synthetic tree by the through-`main` tests,
+    # which is what proves this call site exists.
+    pin_surfaces: dict[Path, str] = {}
+    for path in PIN_SURFACES:
+        try:
+            pin_surfaces[path] = path.read_text(encoding="utf-8")
+        except OSError:
+            continue  # check_pin_surfaces reports the absence, with the reason.
+    check_pin_surfaces(pin_surfaces, PIN_SURFACES, parity, errors)
 
     for error in errors:
         print(f"oracle-pins: {error}", file=sys.stderr)
