@@ -1,16 +1,23 @@
 # ROCM-MLA-ATTENTION — the two attention ops GLM-5.3 non-flash refuses on `gfx1151`
 
 Row: `BACKEND-ROCM`
-Issue: [#2926](https://github.com/mudler/vllm.cpp/issues/2926)
+Issue: [#2926](https://github.com/mudler/vllm.cpp/issues/2926) (the two
+kernels; CLOSED by `967c1906f`) and
+[#2965](https://github.com/mudler/vllm.cpp/issues/2965) (generation, which
+they did not restore; OPEN, and it owns everything under `## Owed`)
 Base SHA: `d023e3357b907927fb6d459f83d21b4729b78d84`
 
 ## Now
 
 `ACTIVE`. The kernels are registered, native, gated and REACHED on the model
 (`op=33 ... selected=vt-native`, and MUT-R1 reproduces `main`'s refusal by
-name). **Generation is NOT re-established**: no token was observed, and the run
-that could have shown one spent ~41 of its 50 minutes loading. That is an open
-question attributed to the loader/allocator lane, not to these kernels -- see
+name), and all FIVE numeric guarantees are now killed by the gate rather than
+by the compiler. **Generation is NOT re-established**: no token has been
+observed on a post-`6b97a6800` tree. The allocator explanation is now REFUTED
+rather than untested -- the managed-allocator leg the refusal message names
+loaded, entered the forward, and dumped core at 4118 s -- so the open question
+has moved from the loader to a crash inside the forward. No default-allocator
+control has run beside it, so the allocator is still not isolated. See
 `## Evidence` and `## Owed`.
 
 ## Scope
@@ -270,7 +277,7 @@ further along:
   change did not write is `main` red under its own flag and is reported as
   such.
 
-## Evidence (`strix:gpu0`, gfx1151, ROCm 7.2.4, rc job `943ca573`, tree `56fd248e9`)
+## Evidence (`strix:gpu0`, gfx1151, ROCm 7.2.4, rc jobs `943ca573` and `a77aa104`, tree `56fd248e9`)
 
 `-DVLLM_CPP_HIP=ON -DVLLM_CPP_HIP_ARCHITECTURES=gfx1151`, `ninja -j 4`, no
 ccache. Three earlier jobs bought nothing and each failure was in the harness,
@@ -338,16 +345,22 @@ two cases into one number:
 
 | # | mutation | build | gate | verdict |
 |---|---|---|---|---|
-| N1 | prefill drops the bottom-right causal shift | **rc=1** | -- | **NOT PROVEN** -- `error: unused variable 'len_q' [-Werror,-Wunused-variable]` |
+| N1 | prefill drops the bottom-right causal shift | rc=1 -> **rc=0** | rc=1, `117 assertions | 113 passed | 4 failed` | **KILLED** (job `a77aa104`) |
 | N2 | decode drops the attention-sink seed | rc=0 | rc=1, `119 assertions | 115 passed | 4 failed` | **KILLED** |
-| N3 | decode ignores the sliding-window start | **rc=1** | -- | **NOT PROVEN** -- `unused parameter 'win_left'` |
-| N4 | decode ignores the DSA selection list | **rc=1** | -- | **NOT PROVEN** -- `unused parameter 'sel_s0'` |
+| N3 | decode ignores the sliding-window start | rc=1 -> **rc=0** | rc=1, `117 assertions | 115 passed | 2 failed` | **KILLED** (job `a77aa104`) |
+| N4 | decode ignores the DSA selection list | rc=1 -> **rc=0** | rc=1, `117 assertions | 113 passed | 4 failed` | **KILLED** (job `a77aa104`) |
 | N5 | drop the online-softmax rescale, BOTH kernels | rc=0 | rc=1, `119 assertions | 103 passed | 16 failed` | **KILLED** |
 
-So **two** guarantees are proven by the test, not five. N1/N3/N4 each deleted
-the last use of an operand; they are re-expressed to multiply by zero so every
-operand stays used and the GATE has to catch them. Until that lands, the
-sliding-window, selection and causal-shift guarantees are **unproven**.
+**All five guarantees are now proven by the test.** In job `943ca573` three of
+the five proved nothing, because each deleted the last use of an operand and
+`-Werror,-Wunused-*` killed the build; a mutation the COMPILER rejects says
+nothing about the TEST. Job `a77aa104` re-expressed N1/N3/N4 to multiply the
+operand by zero instead of deleting the reference, so every operand stays used,
+the translation unit builds (`NINJA rc=0` on each), and the GATE is what has to
+catch them. It did, in all three cases. The base and the restored tree both
+read `3 test cases | 3 passed`, `117 assertions | 117 passed`, with
+`ALL FILES RESTORED BYTE-FOR-BYTE` by sha256 between them
+([job7 log](rocm-mla-attention-nonflash-job7.log)).
 
 **Restore.** `ALL FILES RESTORED BYTE-FOR-BYTE` by sha256 against a manifest
 taken before any mutation, and `GATE1[final] rc=0` on the restored tree.
@@ -363,6 +376,54 @@ into green.
 unregistered, so a sparse step refuses, and `docs/ROCM.md:60-61` applies. The
 ROCm GLM-5.3 speed axis stays **VOID**.
 
+### The managed-allocator leg CRASHED, and its instrument reported success
+
+Job `a77aa104` ran the model leg under `VT_ROCM_MANAGED_ALLOC=1` — the
+pre-`6b97a6800` behaviour, which the refusal message itself names — at a 3 h
+timeout. **It did not generate a token. It dumped core.**
+
+```
+LEG[managed] rc=0 wall=4118s
+[  4118s] vllm-cli: loading model from .../GLM-5.3-UD-IQ1_S-00001-of-00006.gguf
+[  4118s] engine: device placement INSTALLED: 78 layers ... experts on cpu ...
+[  4118s] vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+[  4118s] timeout: the monitored command dumped core
+```
+
+Read the two lines together, because they disagree. `timeout` prints
+`the monitored command dumped core` when its child dies on a core-producing
+signal, and `wall=4118s` is well under the 10800 s budget, so the timeout did
+not fire — **the process crashed on its own**. `LEG[managed] rc=0` is not that
+process's status: the runner captured `$?` after `( … | awk … ) > log`, and in
+a pipeline `$?` is the LAST command's status, which is `awk`'s. The instrument
+therefore printed a green rc over a core dump. This is the repository's own
+`$?`-after-a-pipe failure, and it is the reason the verdict here is read off the
+`timeout` line rather than off the rc.
+
+**The load/forward split this job was built to measure was NOT measured.** Every
+captured line carries the same `[  4118s]` stamp, including the first line of
+the load. `vllm-cli` block-buffers its stdout when that stdout is a pipe, so the
+whole stream reached `awk` at flush time and `awk` stamped it all at once. The
+next attempt has to defeat the buffering (`stdbuf -oL`, or a pty) rather than
+stamp downstream of it. Until then the "~41 min load" in `## Owed` stays an
+observation.
+
+**What the crash does establish** is narrow and it is a NEGATIVE: the managed
+allocator is not the escape hatch. The working hypothesis that #2511's allocator
+change alone explains the missing token predicted that a managed leg would
+generate. It crashed instead, which is consistent with #2511's own measurement
+of 17 GPU faults in 21 managed legs, and which is why that flag is a diagnostic
+lever and never a shipping default. The `first op-provider line` is present
+(`op=4 device=5 selected=vt-native`), so the load completed and the forward had
+begun; the crash is inside the forward, not in the loader.
+
+**LEG B, the default-allocator control, never ran.** The CIFS share dropped
+after leg A (`job7.sh: error reading input file: Host is down` — `bash` reads a
+script lazily by byte offset and the script lives on `/workspace`), and the job
+idled to its 8 h `max_runtime` kill. So there is **no A/B**, and the allocator
+is still not isolated from the kernels. A future job stages its own script into
+`/tmp` before running it, exactly as it already stages the source tree.
+
 ## Stop conditions
 
 - A numeric arm that needs a widened tolerance to pass stops the wave. The
@@ -375,35 +436,39 @@ ROCm GLM-5.3 speed axis stays **VOID**.
 
 ## Owed
 
-- **Three UNPROVEN guarantees**, and they are unproven because the COMPILER
-  killed the mutation rather than the test: the prefill bottom-right causal
-  shift (N1), the decode sliding-window start (N3), and the decode DSA
-  selection map (N4). Each deleted the last use of an operand and hit
-  `-Werror,-Wunused-*`. Re-expressed to multiply by zero so the TU builds and
-  the gate must catch them. Owner `BACKEND-ROCM`, issue
-  [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
 - **Whether GLM-5.3 generates on `gfx1151` at all after #2511.** No token has
-  been observed on a tree carrying `6b97a6800`. The load COMPLETES but takes
-  ~41 min under plain `hipMalloc` against a managed-era 1372 s, so every leg so
-  far spent its budget loading. The next measurement runs the leg under
-  `VT_ROCM_MANAGED_ALLOC=1` -- which the refusal message itself names -- beside
-  a default-allocator leg at a 3 h timeout, so the allocator is isolated from
-  the kernels. `VT_ROCM_MANAGED_ALLOC=1` is a DIAGNOSTIC LEVER and never a
-  shipping default: #2511 measured 17 GPU faults in 21 managed legs against 0
-  in 21 without. Owner `BACKEND-ROCM`, issue
-  [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
-- **The ~41 min load under plain `hipMalloc`** is recorded as an observation,
-  not a measurement: it is bracketed by 120 s heartbeats on a contended CIFS
-  share and no A/B against the managed allocator has been run. Owner
-  `BACKEND-ROCM`, issue [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
+  been observed on a tree carrying `6b97a6800`, and the leading hypothesis is
+  now REFUTED rather than untested. Job `a77aa104` ran the managed-allocator
+  leg the refusal message names, at a 3 h timeout; the load completed, the
+  forward began (`op=4 device=5 selected=vt-native`) and the process **dumped
+  core** at 4118 s. So `VT_ROCM_MANAGED_ALLOC=1` is not the way back to a token,
+  which is consistent with #2511's own 17 GPU faults in 21 managed legs and is
+  why that flag stays a DIAGNOSTIC LEVER and never a shipping default. The next
+  hypothesis is the crash itself: it is inside the FORWARD, on a board #2546
+  measured resetting 12/12 under a gate-sized native run, so separating a board
+  fault from a kernel fault is the next traceable step. Owner `BACKEND-ROCM`,
+  issue [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
+- **The default-allocator control leg.** Job `a77aa104`'s LEG B never ran: the
+  CIFS share dropped after leg A, `bash` could not read the rest of its own
+  script off `/workspace`, and the job idled to its 8 h kill. There is still no
+  A/B, so the allocator is not isolated from the kernels. The rerun stages its
+  script into `/tmp` first. Owner `BACKEND-ROCM`, issue
+  [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
+- **The ~41 min load under plain `hipMalloc`** is STILL an observation, not a
+  measurement. Job `a77aa104` carried a per-line timestamper meant to settle it
+  and the timestamper did not work: `vllm-cli` block-buffers behind a pipe, so
+  every line — the first line of the load included — reached `awk` at flush and
+  was stamped `[  4118s]`. Defeat the buffering at the source (`stdbuf -oL`, or
+  a pty) rather than stamping downstream of it. Owner `BACKEND-ROCM`, issue
+  [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
 - `kDsaIndexerLogits` + `kDsaTopkSelect` on ROCm — #2715's W2, still owed. Not
   generation-blocking on a dense step; a SPARSE step (a prompt longer than
   `index_topk`) still refuses. Owner `BACKEND-ROCM`, issue
-  [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
+  [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
 - `kMergeAttnStates` on ROCm — chunked-context prefill only. Owner
-  `BACKEND-ROCM`, issue [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
+  `BACKEND-ROCM`, issue [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
 - `kFusedChain` on ROCm — non-gating (`VT_FUSED_TIER=1` only). Owner
-  `BACKEND-ROCM`, issue [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
+  `BACKEND-ROCM`, issue [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
 - The **split-KV decode schedule** on ROCm, as a performance wave. Owner
-  `BACKEND-ROCM`, issue [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
+  `BACKEND-ROCM`, issue [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
 - The ROCm GLM-5.3 speed axis stays **VOID**.
