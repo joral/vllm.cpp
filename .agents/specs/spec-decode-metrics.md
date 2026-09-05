@@ -108,8 +108,10 @@ anchor below is the `e126687a9` one.
 
 ## Our baseline
 
-State at `c796fea41`, the base this row branched from. Both headers named the
-gap themselves, so nothing here had to be discovered:
+State at `c796fea41`, the base this row branched from, and re-verified at
+`dfd38059a` after merging 32 commits of `main` into it -- both headers still
+say this, and the scheduler still carries the deferral comment. Both headers
+named the gap themselves, so nothing here had to be discovered:
 
 - `include/vllm/v1/metrics/loggers.h` listed "spec-decoding metrics" as DEFERRED
   in the same sentence as the other three config-gated families.
