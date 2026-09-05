@@ -1451,6 +1451,10 @@ target_include_directories(test_deepseek_v2_paged_engine PRIVATE
 # query branch AND the noaux_tc grouped router. Loader gate (host, MTP-tail skip)
 # + the SACRED paged-engine greedy gate (checkpoint-gated, dgx-only).
 vllm_cpp_add_test(test_glm4_moe_lite_load vllm/models/test_glm4_moe_lite_load.cpp)
+# The MoE ROUTER DTYPE gate (#2928): GLM's fp32 router is a property of
+# `Glm4MoE`, not a config key, and the difference is measured through the CPU
+# forward at GLM's top-4-of-64 `noaux_tc` shape. Host-only, no checkpoint.
+vllm_cpp_add_test(test_glm4_moe_lite_router_dtype vllm/models/test_glm4_moe_lite_router_dtype.cpp)
 vllm_cpp_add_test(test_glm4_moe_lite_paged_engine vllm/models/test_glm4_moe_lite_paged_engine.cpp)
 target_compile_definitions(test_glm4_moe_lite_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
@@ -1875,6 +1879,11 @@ target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src
 
 vllm_cpp_add_test(test_attention_window_adoption
   vllm/model_executor/layers/attention/test_attention_window_adoption.cpp)
+
+# ENG-ATTENTION-WINDOW W3 (#2388): the kill switch itself, which had no test in
+# either of the two environment spellings it replaced.
+vllm_cpp_add_test(test_disable_sliding_window
+  vllm/model_executor/layers/attention/test_disable_sliding_window.cpp)
 target_include_directories(test_attention_window_adoption PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # `vllm-cli`'s `--offload-config` (#1135). It runs the BINARY, because that is the
 # only thing that proves the FLAG arrives: `test_weight_residency_reach` already
@@ -1992,6 +2001,10 @@ vllm_cpp_add_test(test_combine_row_predicate vllm/v1/worker/test_combine_row_pre
 # per-STEP reduction both sampling entry points and the input-combine refusal
 # turn on. Same shape and same reason as the row predicate above.
 vllm_cpp_add_test(test_verify_route_predicate vllm/v1/worker/test_verify_route_predicate.cpp)
+# SPEC-DFLASH2 A2-3 (#2911): the async placeholder fill's per-request rule, read
+# off the same per-req_state draft buffer the combine's scatter reads. Same shape
+# and same reason as the two predicates above -- one rule, one expression.
+vllm_cpp_add_test(test_draft_fill vllm/v1/worker/test_draft_fill.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
 vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
 # ENG-POOL-BEST-FIT (#1922): the shared scratch pool must reach a steady state
