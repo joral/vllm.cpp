@@ -137,6 +137,48 @@ selection on roughly a third of token positions, which is the order of the
 SACRED gate's 59 divergent positions — but the real logit distribution is not
 this one, and nothing here measures the checkpoint.
 
+### The per-prompt distribution, and what it rules out
+
+Read from the committed artifacts alone, no checkpoint. The per-prompt mismatch
+counts `[2,6,6,12,12,11,10,0]` are almost entirely explained by ONE variable —
+where the prompt first diverges — because after that it barely re-converges:
+
+| prompt | prompt len | first divergent generated index | absolute position | mismatches | `16 - first` | re-converged |
+|---|---|---|---|---|---|---|
+| 0 | 5 | 14 | 19 | 2 | 2 | 0 |
+| 1 | 4 | 6 | 10 | 6 | 10 | 4 |
+| 2 | 14 | 6 | 20 | 6 | 10 | 4 |
+| 3 | 12 | 4 | 16 | 12 | 12 | 0 |
+| 4 | 6 | 4 | 10 | 12 | 12 | 0 |
+| 5 | 11 | 4 | 15 | 11 | 12 | 1 |
+| 6 | 6 | 6 | 12 | 10 | 10 | 0 |
+| 7 | 9 | — | — | 0 | — | — |
+
+Two things follow, and both bear on what kind of defect this is.
+
+**It is not positional or structural.** The absolute positions of the first
+divergence are 19, 10, 20, 16, 10, 15, 12. They share no page, block or layer
+boundary — only prompt 3's 16 lands on one — and they do not track prompt length
+(prompt 2 is the longest at 14 and diverges at generated index 6, prompt 1 is the
+shortest at 4 and diverges at the same index). A defect keyed to a position, a
+cache page or a layer count crossing a boundary would leave a common divisor
+here, and there is none.
+
+**No prompt diverges before generated index 4, and that is not chance.** Under
+any per-step flip probability `q` fitted to a first-divergence set of
+`{4,4,4,6,6,6,14}` plus one 16-token survivor, all eight prompts surviving their
+first four steps has probability of order `1e-3`. The natural reading is the one
+a SMALL NUMERICAL perturbation predicts: while the continuation is
+high-confidence the logit margin swamps the noise, and once the margin narrows
+the noise decides. Prompt 7 — `To be or not to be, that is` — is a memorised
+quotation whose margin never narrows, and it is the one prompt that survives all
+16 tokens.
+
+This is consistent with the router-dtype divergence and is evidence AGAINST a
+structural bug in the MLA block, the cache or the schedule, which would not wait
+for the margin to narrow. It is not proof that the router dtype is the whole gap,
+and O1 stands.
+
 ### Mutations
 
 Each rebuilt (`BUILD_RC=0` every time, so no mutation was caught by the
