@@ -185,11 +185,31 @@ that engine's mean time per output token, 18.4 against 18.6 and 22.3 against
 is why this harness reports time per output token as the primary inter-token
 axis and prints the chunk statistics beside the raw gaps.
 
+### Correcting time to first token for the chunking, as far as these files allow
+
 The same chunking inflates our time to first token, because our first chunk
-carries about 4.5 tokens where theirs carries about 1. The correction that
-removes it needs the first chunk's character count, which the predecessor's
-client did not record, so it is **absent here rather than estimated**. The
-queued sweep records it.
+carries about 4.5 tokens where theirs carries about 1. The correction the
+harness applies needs the first chunk's own character count, which the
+predecessor's client did not record, so `report.py` prints the corrected column
+as absent for these legs rather than inventing it. The queued sweep records it.
+
+A weaker correction is available from what the files do hold, and it is a
+**bound, not the harness's estimate**. Subtract `(mean tokens per chunk - 1) x
+mean time per output token` from each engine's raw figure: 64.5 ms from ours and
+1.7 ms from theirs. It assumes the first chunk carries that engine's average
+number of tokens, which the harness does not assume.
+
+| percentile | ours raw | ours bounded | theirs raw | theirs bounded | raw ratio | bounded ratio |
+|---|---|---|---|---|---|---|
+| p50 | 863.1 | 798.5 | 762.7 | 761.0 | 1.132 | 1.049 |
+| p90 | 1219.0 | 1154.4 | 1739.2 | 1737.5 | 0.701 | 0.664 |
+| p95 | 1371.6 | 1307.0 | 1959.9 | 1958.2 | 0.700 | 0.667 |
+| p99 | 1535.8 | 1471.2 | 2850.8 | 2849.0 | 0.539 | 0.516 |
+
+Chunking accounts for about two thirds of their median lead and none of our tail
+lead. Their median advantage survives the correction at 1.049 rather than 1.132,
+so it is real and it is smaller than the raw figure says. Every number in this
+table is in milliseconds.
 
 ### What this section does not do
 
