@@ -46,11 +46,31 @@
 //     PixelShuffleAdapter        :419  -> the `pixel_shuffle_mlp` adapter arm
 //       _pixel_shuffle           :401
 //
-// WHAT THIS FILE IS STILL NOT. `nvidia/vision_moe.py` @ `9035151d6` (149 lines)
-// and `MoESwiGLUFFNFP8` (`vision.py:242-315`) are the FP32-scale blockwise-FP8 arm
-// and are W9's, not W6b's; `Dots3NoteVisionRefusal` names W9 for a blockwise
-// checkpoint before it looks at anything else. See
-// `.agents/specs/dots3-note.md` §4.11 and §4.12.
+// THE FP8 ARM, ADDED BY W9d (#2881). This paragraph used to say the arm was
+// "W9's, not W6b's" and that is now false, which is why it is rewritten rather
+// than left standing.
+//   vllm/models/dots3_note/nvidia/vision.py @ 9035151d6
+//     enable_fp8_moe (default TRUE)  :69   -> Dots3NoteVisionParams
+//     mlp_cls selection              :369  -> ResolveDots3NoteVisionMoeArm
+//     _per_block_cast_to_fp8_padded  :225-239 -> Dots3NoteVisionBlockCastFp8
+//     MoESwiGLUFFNFP8                :242
+//       process_weights_after_loading :245-283 -> MaterializeDots3NoteVision's
+//                                         cast, including `del self.experts`
+//       forward                      :285-315 -> the fp8 branch of VisionMoeFfn
+//   vllm/models/dots3_note/nvidia/vision_moe.py @ 9035151d6 (149 lines)
+//     note_vision_fused_moe_fp8      :25   -> layers::Fp8BlockMlpGateUpMethod
+//                                         + layers::Fp8BlockLinearMethod, one
+//                                         expert at a time (no `vt` grouped
+//                                         block-FP8 MoE op exists)
+//
+// AND WHAT IT STILL IS NOT: a tower that takes that arm on the RELEASED
+// checkpoint. `note_vision_fused_moe_fp8` quantizes an activation of width
+// `moe_intermediate_size` in groups of 128, the released value is 2112, and
+// `per_token_group_quant_fp8` asserts divisibility, so upstream's own default
+// class raises there. `ResolveDots3NoteVisionMoeArm` is where that is decided
+// and said; `Dots3NoteVisionRefusal` still names W9 for a blockwise-QUANTIZED
+// CHECKPOINT, which is a different thing and is still owed. See
+// `.agents/specs/dots3-note.md` §4.11, §4.12 and §4.20.
 //
 // WHY IT SHARES NO CODE WITH `qwen3_vl_vision`. The two towers agree on the
 // block OUTLINE and on almost nothing below it: RMSNorm vs LayerNorm, no bias
