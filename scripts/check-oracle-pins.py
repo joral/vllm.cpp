@@ -370,9 +370,10 @@ def check_pin_surfaces(
 ) -> None:
     """The pin's PROSE surfaces agree with the authority (#2883).
 
-    *surfaces* is `{repo-relative path: text}`, *required* the paths that must
-    each carry at least one `commit` span, and *parity* the fields read from
-    `.agents/upstream-sync.md`. Like `check_parity_reconciliation`, this
+    *surfaces* is `{path: text}` and *required* the paths that must each carry
+    at least one `commit` span; the two are keyed the same way, and `main`
+    passes absolute paths that `surface_label` reports relative to `ROOT`.
+    *parity* is the fields read from `.agents/upstream-sync.md`. Like `check_parity_reconciliation`, this
     function opens NO file: the expectation arrives as a parameter, because a
     checker that reads its expectation out of the file it is checking is a
     tautology and this repository has shipped that shape.
