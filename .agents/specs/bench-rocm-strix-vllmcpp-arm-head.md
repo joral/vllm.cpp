@@ -40,9 +40,14 @@ whether the current head completes this workload on `gfx1151`. #2511's own
 "0 faults in 21 legs" was a different workload against a branch build in a
 different lease, so it does not answer this either.
 
-One question, then: **on a binary built inside the lease from `main`'s head,
-with the revision asserted rather than printed, what is the fault rate, and if
-any leg completes, what is the throughput?**
+One question, then: **on a binary built inside the lease from the declared
+revision, with that revision asserted rather than printed, what is the fault
+rate, and if any leg completes, what is the throughput?**
+
+The declared revision is `c796fea41`, which was `main`'s head when this row
+claimed its lease. `main` moves faster than a lease can be scheduled, so the
+figure names that revision and never "main", which is not a reproducible
+identifier. §3 records why chasing the newer head would measure the same bytes.
 
 ## 2. Scope
 
@@ -78,6 +83,27 @@ an inherited build:
 - The `vllm-cli` sha256 must **not** be
   `a703b83dd8954ba6dd3cbe82efcd38083c1d55492bbbaecf5c406f7c6efd646f`, the exact
   pre-fix binary #2933 names.
+
+**`main` moved while the lease queued, and the pin deliberately did not.** By
+the time the board was free, `main` had advanced past `c796fea41` and this branch
+has since merged it. That does not change what is measured, and the claim is
+checked rather than asserted:
+
+```sh
+git diff --name-only c796fea41..HEAD \
+  -- src/vt/rocm include/vt/rocm src/vt/op_provider.cpp examples/cli   # EMPTY
+git diff --stat c796fea41..HEAD -- src/ include/ CMakeLists.txt examples/cli
+#   CMakeLists.txt | 5 +++++
+```
+
+That single hunk is `if(TARGET test_bench_eos_chat_template AND TARGET
+vllm-bench) add_dependencies(...)`. This build configures
+`-DVLLM_CPP_BUILD_TESTS=OFF`, so the target does not exist and the block never
+fires; it orders two test targets and touches neither `vllm-cli` nor
+`libvllm.so`. The two revisions therefore produce the same measured bytes, and
+re-pinning would have cost an 88 MB bundle rebuild and the queue slot to measure
+them again. **This was re-checked after the merge**, because a merge can falsify
+prose written before it.
 
 `ccache` may serve objects on the podman route. A ccache hit is keyed on
 preprocessed source, compiler and flags, so it is byte-identical to compiling
