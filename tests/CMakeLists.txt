@@ -2631,6 +2631,11 @@ if(VLLM_CPP_HIP)
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
 vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
+# BACKEND-ROCM silu-gate dtype rounding repair (#2889 silu item, #1954): the
+# ROCm SiluAndMul/MoeSiluMul kernels narrow silu(gate) to the gate dtype before
+# the multiply, matching the CPU oracle RoundThrough and upstream vLLM silu_kernel.
+# Self-skipping without a ROCm device, mirroring test_rocm_backend.cpp guard.
+vllm_cpp_add_test(test_ops_rocm_silu_rounding vt/test_ops_rocm_silu_rounding.cpp)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
