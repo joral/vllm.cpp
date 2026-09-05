@@ -59,7 +59,7 @@ against. Tracked by #2794 (goldens predate the pin) and #2817 (the advance).
 | Embeddable behind a C ABI | ✅ | ☐ | ☐ | ✅ |
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
-| Architectures | 43 registered, 27 gated | 130+ | 100+ | 100+ |
+| Architectures | 44 registered, 27 gated | 130+ | 100+ | 100+ |
 | Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 | Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, C++20 `std::numbers` pi, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
@@ -136,7 +136,7 @@ against. Tracked by #2794 (goldens predate the pin) and #2817 (the advance).
 The supported set is exactly what the C++ registry registers: every
 architecture self-registers via `REGISTER_VLLM_MODEL`, and
 `scripts/check-supported-models.py` gates this list against the source so it
-cannot drift. Today that is **43 registered architectures**. Each row names the
+cannot drift. Today that is **44 registered architectures**. Each row names the
 checkpoint it was gated against and the verdict; caveats are in
 [Project status](../README.md#project-status), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
@@ -256,9 +256,9 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
 | `Dots3NoteMTPModel` | dots3-note nextn head (the target arch `Dots3NoteForCausalLM` IS registered; see the supported table above) | W10 owns it and it is deliberately NOT registered: a speculator that cannot propose makes the engine accept a speculative config it then dies on mid-run. The checkpoint ships exactly one nextn layer, and since W5c (#2176) its 19 tensors are a NAMED W10 deferral in the language tower's accounting rather than a refusal, which is what vLLM's own loader does with them. Blocked behind the target row: no oracle runs here, 298.67 GB fp8 against a 122 GiB ceiling, so NO number is claimable on any axis ([spec](../.agents/specs/dots3-note.md), #699) |
 
-27 of the 39 registered text-generation architectures carry a passing
+27 of the 40 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
-(The 43 registered total also covers 3 Parakeet ASR entry points and the
+(The 44 registered total also covers 3 Parakeet ASR entry points and the
 `LlamaModel` embedding arch, which are not text generation.)
 vLLM registers 130+ text architectures, so this is a curated, gated subset, not
 a breadth claim. The first EMBEDDING architecture is registered and live
