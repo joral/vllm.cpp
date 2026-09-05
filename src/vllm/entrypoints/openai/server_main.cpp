@@ -1756,8 +1756,21 @@ int VllmServerMain(int argc, char** argv) {
 
     // Prometheus /metrics (Python vLLM always-on family names).
     if (args.enable_metrics) {
+      // #2770: the spec_decode metric families are config-gated exactly as
+      // upstream gates them (loggers.py:477-481 hands the logger
+      // `vllm_config.speculative_config`). This is the ONLY production
+      // construction of a PrometheusStatLogger, so it is the call site that
+      // decides whether a served speculative engine reports acceptance at all.
+      // The RESOLVED config, not `args.speculative_config`: the loader
+      // re-resolves k against the checkpoint, and the scheduler sizes its
+      // per-position vectors from that same resolved value.
+      const int num_speculative_tokens =
+          loaded->speculative_config().has_value()
+              ? loaded->speculative_config()->ResolvedNumSpeculativeTokens()
+              : 0;
       prom_logger = std::make_unique<vllm::v1::metrics::PrometheusStatLogger>(
-          served_model_name, loaded->max_model_len(), /*engine_index=*/0);
+          served_model_name, loaded->max_model_len(), /*engine_index=*/0,
+          num_speculative_tokens);
       // BOTH frontends record into the SAME logger, so a scrape reports this
       // process whichever one served the request. The async engine is the one
       // that matters here — every HTTP route is served from
@@ -1766,7 +1779,10 @@ int VllmServerMain(int argc, char** argv) {
       loaded->engine().set_stat_logger(prom_logger.get());
       loaded->async_engine().set_stat_logger(prom_logger.get());
       server.set_metrics_logger(prom_logger.get());
-      std::cerr << "server: GET /metrics enabled (PrometheusStatLogger)\n";
+      std::cerr << "server: GET /metrics enabled (PrometheusStatLogger"
+                << (num_speculative_tokens > 0
+                        ? ", spec_decode families on)\n"
+                        : ")\n");
     }
 
     std::cerr << "server: listening on http://" << args.host << ":" << args.port

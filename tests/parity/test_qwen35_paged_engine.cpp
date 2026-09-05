@@ -9,9 +9,10 @@
 // pinned vLLM oracle (commit 555967922, runtime 0.23.1rc1.dev1511+g555967922).
 //
 // ORACLE PROVENANCE — DIFFERENT FROM THE QWEN3-DENSE GATE. There is no dgx/CUDA
-// capture for this model: the 0.8B GDN checkpoint was only ever stood up on the
-// gfx1100 box (issue #41 lane), which is also the only board that hosts a
-// vLLM-ROCm oracle. The base golden pair here is therefore ROCm-captured:
+// capture for this model. The 0.8B GDN checkpoint runs on the gfx1100 box, which
+// also hosts the vLLM-ROCm oracle. Issue #2772 refreshed the committed base
+// files from the restored immutable image in production mode. The default
+// production oracle and the local default both select wvSplitK. The files are:
 //   greedy_ids.npy  [N,T]   i32  the pinned ROCm oracle's per-prompt greedy
 //                                (K=10 per-prompt runs DETERMINISTIC in every
 //                                cell — see greedy_dist.npy).
@@ -26,13 +27,14 @@
 // forced via scripts/qwen3-neartie-gap-transformers.py — vLLM has no TT
 // backend, so `transformers` is the secondary oracle per AGENTS.md's registry).
 //
-// PROVENANCE OF THE GREEN: the committed our_ids/near-tie pair is the
-// FIXED engine's sequence, oracle-re-derived after the AttnQkNormRopeGate
-// output-dtype dispatch fix (row/ROCM-GDN-08B-FIX). The PRE-FIX capture
-// (13/16 forward-divergent, max first-divergence gap 1.062 nats) is recorded
-// as evidence in .agents/specs/rocm-m4-oracle.md and the parity ledger — the
-// gate landed green-shaped per review, with the RED capture kept as history
-// rather than as committed goldens.
+// PROVENANCE OF THE GREEN: the committed our_ids/near-tie pair is the fixed
+// engine's sequence. The oracle was re-derived after the AttnQkNormRopeGate
+// output-dtype dispatch fix in row/ROCM-GDN-08B-FIX. Issue #2772 then re-derived
+// all four ROCm arrays in production mode. The historical eager capture is
+// diagnostic evidence only. It selected a different branch of an exact tie.
+// The pre-fix capture had 13/16 forward-divergent prompts and a maximum first-
+// divergence gap of 1.062 nats. That result remains in
+// .agents/specs/rocm-m4-oracle.md and the parity ledger.
 //
 // METHODOLOGY — identical to the Qwen3-dense gate (see that file's header and
 // [[near-tie-distributional-gate]]): STRICT token-exact is reported, but the
@@ -234,7 +236,7 @@ void RunGate(const std::string& golden_subdir, const char* label) {
       vllm::entrypoints::LoadedEngine::FromModelDir(
           snap, vllm::entrypoints::EngineParams{});
 
-  // The base golden pair for this model is ROCm-captured (see the file header).
+  // The base golden pair is production-mode ROCm evidence after issue #2772.
   // The Tenstorrent device lane carries its OWN oracle-backed golden pair
   // (the Mistral gate's treatment); every other device still skips loudly.
   const vt::DeviceType run_dev = loaded->runner().device().type;
