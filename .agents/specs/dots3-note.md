@@ -8300,6 +8300,11 @@ assertions**, sha `dbfd649af72afb26`. Both rc 0. Every mutation below was
 restored byte-for-byte (source sha
 `e67a97754e2266c91efe48e0845e8324d1644ecf285667e200940220ce80b4f1`) and both
 baseline binary shas were reproduced after EVERY one of them, not only the last.
+The binary shas name a build at `origin/main` `4e748e4a7`; the tree was merged
+with `origin/main` `84cb258bb` afterwards and re-run, which reproduces the same
+20/21843 and 32/16499 at new shas `479b2b4fbc1ad0cc` and `ec245323b4b751aa`
+(`test_dots3_note_audio` 28/4206, sha `c4972c02ce8f6892`). Counts, not binary
+shas, are what carries across a base move.
 
 | # | what it changes | `test_dots3_note_vision` | `test_openai_api_server_dots3_mm_forward` |
 |---|---|---|---|
