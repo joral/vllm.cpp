@@ -15,7 +15,16 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+// rocWMMA int8 tile arm (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4, issue #2109),
+// gfx1200/gfx1201 (RDNA4) only — same gate rocm_paged_attn.hip already uses
+// for its own WMMA arm, and the same reason: a fat build also emits other
+// gfx12 targets (for example gfx1036) that must not see this include.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#include <rocwmma/rocwmma.hpp>
+#define VT_ROCM_QUANT_WMMA_OK 1
+#endif
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -28,6 +37,7 @@
 
 #include "vt/grow_only_stream_scratch.h"
 #include "vt/ops.h"
+#include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
 #include "vt/rocm/rocm_runtime.h"
@@ -378,6 +388,198 @@ __device__ inline int DotQ6KIsumRange(const BlockQ6_K* xb, const BlockQ8_K* yb, 
   int isum = 0;
   for (int l = 0; l < 8; ++l) isum += aux32[l];
   return isum;
+}
+
+// Reconstructs the 16 RAW (unscaled) int8 weights of Q6_K scale-group `grp`
+// (`grp` in [0, kQK_K/16) == [0, 16)).
+// Bit-identical to `DotQ6KIsumRange`'s own reconstruction: `grp = g*2 + t`
+// selects the same 32-wide sub-block `g` and the same upper/lower 16-wide
+// half `t` that function already walks, just returning the 16 values instead
+// of folding them into a dot product. Kept beside it rather than expressed as
+// a call into it, because that function accumulates over a *range* of groups
+// and has no seam to hand back one group's raw values without either
+// widening its contract or adding a second exit path to it.
+//
+// Guarded by VT_ROCM_QUANT_WMMA_OK (only the WMMA kernel body below calls it):
+// on the host pass and on every non-gfx1200/gfx1201 device pass that body
+// takes its stub branch, which would leave this genuinely unused and trip
+// -Werror,-Wunused-function.
+#if defined(VT_ROCM_QUANT_WMMA_OK)
+__device__ inline void DequantQ6KGroup16(const BlockQ6_K* xb, int grp, int8_t out[16]) {
+  const int g = grp >> 1;
+  const int t = grp & 1;
+  const uint8_t* q4 = xb->ql + (g / 4) * 64;
+  const uint8_t* qh = xb->qh + (g / 4) * 32;
+  const int r = g & 3;
+  const uint8_t* q4b = q4 + ((r & 1) ? 32 : 0);
+  const int nib_shift = (r >= 2) ? 4 : 0;
+  const int qh_shift = 2 * r;
+#pragma unroll
+  for (int k = 0; k < 16; ++k) {
+    const int l = t * 16 + k;
+    out[k] = static_cast<int8_t>(
+        static_cast<int8_t>(((q4b[l] >> nib_shift) & 0xF) | (((qh[l] >> qh_shift) & 3) << 4)) - 32);
+  }
+}
+#endif  // VT_ROCM_QUANT_WMMA_OK
+
+// --- RDNA4 WMMA int8 tile arm of KQuantGemmK (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4,
+// issue #2109). Q6_K only in this first cut: the row's spec lists Q4_K/Q5_K —
+// same shape, same 16-wide-group scale layout — as `## Owed` to a follow-up
+// commit, and M/N tail handling (m or n not a multiple of 16) as owed to
+// whoever generalizes the launch site below.
+//
+// One warp computes one 16x16 tile of `out[i0:i0+16, j0:j0+16]`. Q6_K's 256-
+// element superblock has exactly `kQK_K/16 == 16` independent int8 scales
+// (one per 16-wide group), which is exactly one WMMA K-tile (`WK == 16`), so
+// each group maps to one `mma_sync` with no ragged remainder — the spec's
+// `## Design` calls this out as the reason 16 was the tile width chosen.
+//
+// The scale is per (weight row, group), so it cannot be folded into the int8
+// operands ahead of the tensor-core op without overflowing int8 (a 6-bit
+// scale times a 6-bit dequant already exceeds it). It is applied in an
+// epilogue instead, exactly like the scalar `DotQ6KIsumRange` arm: the raw
+// (unscaled) tile the tensor core produces is staged to shared memory, and
+// every lane folds `isum[i][j] += raw[i][j] * scale[j]` in INTEGER
+// arithmetic. Integer addition is exact and reorders freely, so `isum` here
+// is bit-for-bit the quantity the scalar warp computes; only the
+// superblock's one f32 scale product (`d * isum`, applied once below, same as
+// every other arm in this file) is shared with the rest of the reduction.
+//
+// This first cut bounces every group's raw tile through shared memory before
+// scaling it, which is a known, NOT-yet-measured performance cost (a
+// synchronization and a shared-memory round trip every 16 K-elements) rather
+// than a correctness concern — the row's spec gate (c) (rocprofv3 total
+// kernel time) is not asserted by this commit, and closing it is follow-up
+// work once this mechanism is confirmed correct on-target.
+// Plain integer, never gated by VT_ROCM_QUANT_WMMA_OK: the host launch site
+// below needs it on every compilation pass, including the host pass, where
+// that macro is never defined.
+constexpr int kQuantWmmaWarpsPerBlock = 4;
+
+template <typename OutT>
+__global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                                   const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
+                                   int64_t nsb, int64_t n_tiles) {
+#if !defined(VT_ROCM_QUANT_WMMA_OK)
+  // Compiled for a target other than gfx1200/gfx1201, or for the host pass:
+  // never launched there (`Gfx12QuantWmmaHostOk` gates every launch site
+  // below on the actual device's runtime gcnArchName, not on this macro —
+  // the macro is only visible to a device compilation pass for gfx1200/
+  // gfx1201 itself, exactly the trap issue #785 already found and fixed for
+  // `rocm_paged_attn.hip`'s own WMMA arm).
+  (void)out; (void)weight; (void)act; (void)m; (void)n; (void)nsb; (void)n_tiles;
+  return;
+#else
+  using namespace rocwmma;
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * kQuantWmmaWarpsPerBlock +
+                       static_cast<int64_t>(threadIdx.y);
+  const int64_t m_tiles = m / 16;
+  if (tile >= m_tiles * n_tiles) return;
+  const int64_t it = tile / n_tiles;
+  const int64_t jt = tile % n_tiles;
+  const int64_t i0 = it * 16;
+  const int64_t j0 = jt * 16;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int wy = static_cast<int>(threadIdx.y);
+
+  __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16];
+  __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][16][16];
+
+  const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ6_K);
+  const BlockQ6_K* w_row_base[16];
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    w_row_base[r] =
+        reinterpret_cast<const BlockQ6_K*>(weight + static_cast<size_t>(j0 + r) * row_stride);
+  }
+  const BlockQ8_K* a_row0 = act + i0 * nsb;
+
+  float acc_f[8];
+#pragma unroll
+  for (int c = 0; c < 8; ++c) acc_f[c] = 0.0f;
+
+  for (int64_t sb = 0; sb < nsb; ++sb) {
+    const BlockQ6_K* xb_cur[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) xb_cur[r] = w_row_base[r] + sb;
+
+    int32_t isum[8];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) isum[c] = 0;
+
+    for (int grp = 0; grp < 16; ++grp) {
+      if (lane < 16) DequantQ6KGroup16(xb_cur[lane], grp, w_stage[wy][lane]);
+      __syncthreads();
+
+      fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+      fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
+      fragment<accumulator, 16, 16, 16, int32_t> acc;
+      fill_fragment(acc, 0);
+      const int8_t* a_ptr = a_row0[sb].qs + grp * 16;
+      const long a_ld = static_cast<long>(nsb) * static_cast<long>(sizeof(BlockQ8_K));
+      load_matrix_sync(a_frag, a_ptr, a_ld);
+      load_matrix_sync(b_frag, &w_stage[wy][0][0], 16);
+      mma_sync(acc, a_frag, b_frag, acc);
+      store_matrix_sync(&raw_tile[wy][0][0], acc, 16, mem_row_major);
+      __syncthreads();
+
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        const int cell = lane + c * 32;
+        const int ii = cell / 16, jj = cell % 16;
+        isum[c] += raw_tile[wy][ii][jj] * static_cast<int32_t>(xb_cur[jj]->scales[grp]);
+      }
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      const int cell = lane + c * 32;
+      const int ii = cell / 16, jj = cell % 16;
+      const float d = DF16ToF32(xb_cur[jj]->d) * a_row0[ii * nsb + sb].d;
+      acc_f[c] += d * static_cast<float>(isum[c]);
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < 8; ++c) {
+    const int cell = lane + c * 32;
+    const int ii = cell / 16, jj = cell % 16;
+    const int64_t oi = i0 + ii, oj = j0 + jj;
+    if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[c];
+    else out[oi * n + oj] = DF32ToBF16(acc_f[c]);
+  }
+#endif  // VT_ROCM_QUANT_WMMA_OK
+}
+
+// Per-device, once: launch the Q6_K WMMA tile only when this device's
+// gcnArchName is gfx1200/gfx1201 (prefix match). NEVER gated by
+// VT_ROCM_QUANT_WMMA_OK at a host call site — that macro is defined only on
+// the device compilation pass for gfx1200/gfx1201 itself, so a host-side
+// `#if` on it always compiles away the launch (issue #785's exact trap,
+// documented in `.agents/specs/rocm-sharedk-wmma-host-dispatch.md`). Reuses
+// the same HIP-free, unit-tested prefix check `rocm_paged_attn.hip`'s own
+// WMMA dispatch already established (`vt::rocm::GcnArchNameIsGfx12PrefillWmma`,
+// `include/vt/rocm/rocm_arch.h`); the name is attention-flavored but the test
+// it names is pure architecture matching, shared rather than duplicated here.
+bool Gfx12QuantWmmaHostOk(int device_index) {
+  struct Slot {
+    std::once_flag once;
+    bool ok = false;
+  };
+  static std::array<Slot, 64> slots;
+  if (device_index < 0 || static_cast<unsigned>(device_index) >= slots.size()) return false;
+  std::call_once(slots[static_cast<unsigned>(device_index)].once, [device_index] {
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, device_index) != hipSuccess) {
+      slots[static_cast<unsigned>(device_index)].ok = false;
+      return;
+    }
+    slots[static_cast<unsigned>(device_index)].ok =
+        vt::rocm::GcnArchNameIsGfx12PrefillWmma(prop.gcnArchName);
+  });
+  return slots[static_cast<unsigned>(device_index)].ok;
 }
 
 // ---- grouped kernels ----
@@ -738,6 +940,26 @@ void LaunchQ8KQuantizer(BlockQ8_K* scratch, const void* act, ActDT dtype,
 // one by construction, so no output comparison can witness the dispatch).
 std::atomic<uint64_t> g_kq_coop_dispatches{0};
 
+// How many dense Q6_K prefill dispatches took the RDNA4 WMMA tile arm
+// (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4, issue #2109). Same reason as the coop
+// counter above: the arm is designed to be bit-identical to the scalar one,
+// so the reachability gate needs a witness that does not depend on comparing
+// output values.
+std::atomic<uint64_t> g_kq_wmma_dispatches{0};
+
+// VT_ROCM_QUANT_WMMA=0 forces the scalar arm even on gfx1200/gfx1201 — the
+// A/B escape hatch every WMMA arm in this tree ships with
+// (VT_ATTN_PREFILL_SHAREDK_WMMA is the paged-attention precedent). Default
+// on: the gate below still requires the runtime architecture match and a
+// 16-aligned M/N before this path is ever reached.
+bool QuantWmmaEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_ROCM_QUANT_WMMA");
+    return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
 // VT_ROCM_Q6K_SMALL_PRIVATE=1 — the A/B arm for
 // [#2511](https://github.com/mudler/vllm.cpp/issues/2511). Every failing leg on
 // `gfx1151` ended inside `KQuantGemmK<OutT, 2>`, the Q6_K arm, with all three of
@@ -789,6 +1011,10 @@ int KQuantDecodeCoopWarps(DType wdt, int64_t m, int64_t nsb) {
 
 uint64_t KQuantCoopDispatchCount() {
   return g_kq_coop_dispatches.load(std::memory_order_relaxed);
+}
+
+uint64_t KQuantWmmaDispatchCount() {
+  return g_kq_wmma_dispatches.load(std::memory_order_relaxed);
 }
 
 void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
@@ -865,9 +1091,25 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
     const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
+    // RDNA4 WMMA tile arm: Q6_K prefill only (m > 1, since KQuantDecodeCoopWarps
+    // above already owns m == 1), tile-aligned M/N only. Every other shape and
+    // every other architecture falls through to the arms below unchanged.
+    const bool wmma_ok = fmt == 2 && m % 16 == 0 && n % 16 == 0 && QuantWmmaEnabled() &&
+                        Gfx12QuantWmmaHostOk(q.device.index);
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
+      if (wmma_ok) {
+        g_kq_wmma_dispatches.fetch_add(1, std::memory_order_relaxed);
+        const int64_t n_tiles = n / 16;
+        const int64_t m_tiles = m / 16;
+        const int64_t grid_wmma = (m_tiles * n_tiles + kQuantWmmaWarpsPerBlock - 1) /
+                                  kQuantWmmaWarpsPerBlock;
+        KQuantGemmKWmmaQ6K<OutT><<<static_cast<unsigned>(grid_wmma),
+                                   dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
+            o, w, qact, m, n, nsb, n_tiles);
+        return;
+      }
       if (coop == 8 && fmt == 2) {
         // One block per output element, eight warps deep. Only the measured
         // width is instantiated; anything else falls through to the single-warp

@@ -176,7 +176,19 @@ scale layout through the tile op.
 
 ## Now
 
-`SPIKE`. W0 (mechanism verified on target, gfx1200) is done and reproduced
-fresh in this spec. W1 (the WMMA tile kernel with the fused scale epilogue)
-and W2 (launch-site replacement) are not started. This pull request lands
-the spec only; no product code changes in this change.
+`SPIKE`. W0 (mechanism verified on target, gfx1200) is done. W1 has landed on
+`row/KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4-w1`: `KQuantGemmKWmmaQ6K`, a rocWMMA
+int8 tile arm for the Q6_K prefill GEMM, gated to gfx1200/gfx1201 and to
+tile-aligned M/N (both multiples of 16); every other shape and architecture
+keeps the scalar arm. Hardware-verified on the RX 9060 XT (gfx1200):
+correct against the CPU oracle (f32 and bf16 out), reachability-witnessed,
+mutation-proven RED-before-GREEN, zero regression on `ctest -R
+'rocm|cross_device'` (one pre-existing unrelated failure, #1513/#1954, not
+touched by this row).
+
+Not yet closed: gate (c) (`rocprofv3` total kernel time <= 20,000 ms) is
+unmeasured — this cut bounces every scale-group's raw tile through shared
+memory before scaling, a known, not-yet-tuned cost, and closing that gap is
+the next step in this wave. Q4_K/Q5_K and the M/N tail remain `## Owed`, as
+scoped above. W2 (launch-site replacement) refers to the scalar arm's
+retirement once every format is covered; today both arms coexist by design.
