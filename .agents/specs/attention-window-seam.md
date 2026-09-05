@@ -245,8 +245,24 @@ max-length cap is a real missing behaviour and is owed.
 
 ## Now
 
-W1 done. W3 done (see the outcome above). W2 (the two shared-path sites) and W3 (the kill-switch asymmetry, now
-also a coverage gap) owed.
+W1 done. W3 done (see the outcome above). **W2 is still owed**, and the previous
+revision of this paragraph said so in a sentence that also called W3 owed, which
+it no longer is — the W3 landing edited around that line instead of through it.
+
+**#2388 was closed by the W3 commit and should not have been.** Its scope is the
+generic layer and the sites that bypass it; W1 took five model sites and W3 took
+the switch, but the shared-path sites are the same issue's work and had not
+landed. Reopened rather than re-filed, because a second issue for one issue's
+remaining wave is the intake shape `AGENTS.md` asks not to create.
+
+**W2's site list in `## Work breakdown` is stale in BOTH line numbers and count.**
+It names `v1/attention/backend.cpp:323` and `mla_chunked_context.h:363`. The
+header moved to
+`include/vllm/model_executor/layers/attention/mla_chunked_context.h:363`, the
+`backend.cpp` line number no longer points at a window expression, and
+`deepseek_v4_dsa.cpp:275` is a third site of the same shape that the original
+sweep did not list. Whoever takes W2 re-derives the list with
+`git grep -n 'sliding_window - 1'` rather than trusting the three names above.
 
 W3 is no longer blocked on a decision. `## Work breakdown` above records why: the
 flag is `disable_sliding_window` on vLLM's `ModelConfig`, so the shape is
