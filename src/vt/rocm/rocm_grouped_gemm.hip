@@ -483,7 +483,13 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
   const int lane = static_cast<int>(threadIdx.x);
   const int wy = static_cast<int>(threadIdx.y);
 
-  __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16];
+  // w_stage holds ALL 16 scale-groups' dequantized tiles for the current
+  // superblock, filled once per superblock rather than once per group: the
+  // first cut synced after every single-group fill (16 barriers/superblock
+  // for that step alone), and every lane sat idle half the time doing it
+  // (only 16 of 32 lanes filled one row each). Spreading the same total work
+  // over all 32 lanes across all 16 groups removes both costs in one change.
+  __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16][16];
   __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][16][16];
 
   const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ6_K);
@@ -508,10 +514,17 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
 #pragma unroll
     for (int c = 0; c < 8; ++c) isum[c] = 0;
 
-    for (int grp = 0; grp < 16; ++grp) {
-      if (lane < 16) DequantQ6KGroup16(xb_cur[lane], grp, w_stage[wy][lane]);
-      __syncthreads();
+    // One fill for the whole superblock: 16 groups x 16 rows = 256 (row,
+    // group) pairs, 8 per lane, each call still filling that pair's 16
+    // elements via DequantQ6KGroup16 unchanged.
+    for (int t = lane; t < 16 * 16; t += 32) {
+      const int row = t / 16;
+      const int grp2 = t % 16;
+      DequantQ6KGroup16(xb_cur[row], grp2, w_stage[wy][grp2][row]);
+    }
+    __syncthreads();
 
+    for (int grp = 0; grp < 16; ++grp) {
       fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
       fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
       fragment<accumulator, 16, 16, 16, int32_t> acc;
@@ -519,7 +532,7 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
       const int8_t* a_ptr = a_row0[sb].qs + grp * 16;
       const long a_ld = static_cast<long>(nsb) * static_cast<long>(sizeof(BlockQ8_K));
       load_matrix_sync(a_frag, a_ptr, a_ld);
-      load_matrix_sync(b_frag, &w_stage[wy][0][0], 16);
+      load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
       mma_sync(acc, a_frag, b_frag, acc);
       store_matrix_sync(&raw_tile[wy][0][0], acc, 16, mem_row_major);
       __syncthreads();

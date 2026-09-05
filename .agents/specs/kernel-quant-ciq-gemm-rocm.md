@@ -186,9 +186,34 @@ mutation-proven RED-before-GREEN, zero regression on `ctest -R
 'rocm|cross_device'` (one pre-existing unrelated failure, #1513/#1954, not
 touched by this row).
 
-Not yet closed: gate (c) (`rocprofv3` total kernel time <= 20,000 ms) is
-unmeasured — this cut bounces every scale-group's raw tile through shared
-memory before scaling, a known, not-yet-tuned cost, and closing that gap is
-the next step in this wave. Q4_K/Q5_K and the M/N tail remain `## Owed`, as
-scoped above. W2 (launch-site replacement) refers to the scalar arm's
-retirement once every format is covered; today both arms coexist by design.
+**Op-level A/B, same tool both arms (`examples/quant-gemm-bench`, extended in
+this wave to run on any registered device, not only CPU), RX 9060 XT
+(gfx1200), Q6_K prefill (M=128, tile-aligned N/K), best-of-6, idle host:**
+
+| Shape | scalar (`VT_ROCM_QUANT_WMMA=0`) | WMMA v1 (per-group shared-mem bounce) | WMMA v2 (fill once per superblock) |
+|---|---|---|---|
+| N=3072 K=2048 | 120.41 GFLOP/s | 630.42 GFLOP/s (5.24x) | 1439.55 GFLOP/s (11.95x) |
+| N=12288 K=2048 | 122.48 GFLOP/s | 558.44 GFLOP/s (4.56x) | 1514.70 GFLOP/s (12.37x) |
+| N=2048 K=6144 | 115.38 GFLOP/s | 833.77 GFLOP/s (7.23x) | 1467.55 GFLOP/s (12.72x) |
+
+v1 staged one scale-group's dequantized tile per iteration (16 barriers/
+superblock for that step alone, only 16 of 32 lanes active while filling). v2
+fills all 16 groups' tiles once per superblock, spread over all 32 lanes, and
+removes those 16 barriers down to 1. That single change bought a further
+~2.3-2.7x on top of v1's already-measured 4.5-7.2x, and the WMMA arm now
+EXCEEDS this card's own Q8_0 scalar dp4a ceiling (1258-1339 GFLOP/s) — a
+result v1 did not reach. Both v1 and v2 passed the same hardware correctness
+and mutation-proof evidence above; v2 superseded v1 in the same wave, before
+either was proposed as the row's closing state, so only v2 is carried forward.
+
+Not yet closed: gate (c) (`rocprofv3` total kernel time on the Ornith-1.5-9B-
+Q4_K_M trace workload, target <= 20,000 ms) is still unmeasured — this
+device lacks `rocprofv3` and the exact checkpoint, and the op-level GFLOP/s
+above is evidence toward that gate, not a substitute for it. The remaining
+per-group shared-memory round trip (store the raw WMMA tile, sync, fold the
+scale, sync) is a smaller, not-yet-attempted next lever, but the return an
+easy win produced here is not a reason to assume there is a comparable
+amount left — the DIRECTION is recorded, not a size for it. Q4_K/Q5_K and the
+M/N tail remain `## Owed`, as scoped above. W2 (launch-site replacement)
+refers to the scalar arm's retirement once every format is covered; today
+both arms coexist by design.
