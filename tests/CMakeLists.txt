@@ -1445,6 +1445,10 @@ target_include_directories(test_deepseek_v2_paged_engine PRIVATE
 # query branch AND the noaux_tc grouped router. Loader gate (host, MTP-tail skip)
 # + the SACRED paged-engine greedy gate (checkpoint-gated, dgx-only).
 vllm_cpp_add_test(test_glm4_moe_lite_load vllm/models/test_glm4_moe_lite_load.cpp)
+# The MoE ROUTER DTYPE gate (#2928): GLM's fp32 router is a property of
+# `Glm4MoE`, not a config key, and the difference is measured through the CPU
+# forward at GLM's top-4-of-64 `noaux_tc` shape. Host-only, no checkpoint.
+vllm_cpp_add_test(test_glm4_moe_lite_router_dtype vllm/models/test_glm4_moe_lite_router_dtype.cpp)
 vllm_cpp_add_test(test_glm4_moe_lite_paged_engine vllm/models/test_glm4_moe_lite_paged_engine.cpp)
 target_compile_definitions(test_glm4_moe_lite_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
@@ -1869,6 +1873,11 @@ target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src
 
 vllm_cpp_add_test(test_attention_window_adoption
   vllm/model_executor/layers/attention/test_attention_window_adoption.cpp)
+
+# ENG-ATTENTION-WINDOW W3 (#2388): the kill switch itself, which had no test in
+# either of the two environment spellings it replaced.
+vllm_cpp_add_test(test_disable_sliding_window
+  vllm/model_executor/layers/attention/test_disable_sliding_window.cpp)
 target_include_directories(test_attention_window_adoption PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # `vllm-cli`'s `--offload-config` (#1135). It runs the BINARY, because that is the
 # only thing that proves the FLAG arrives: `test_weight_residency_reach` already

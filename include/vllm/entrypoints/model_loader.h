@@ -209,6 +209,22 @@ struct EngineParams {
   // on the server as --enable-jump-forward / --disable-jump-forward.
   std::optional<bool> enable_jump_forward = std::nullopt;
 
+  // Model-level sliding-window kill switch, mirroring vLLM's
+  // `ModelConfig.disable_sliding_window` (`vllm/config/model.py:248` @ pin
+  // `5559679229`). Tri-state on the same convention as the field above:
+  //   * nullopt (default) => sliding window ENABLED, the byte-identical default
+  //     and upstream's own `= False`;
+  //   * true  => every model's MODEL-LEVEL window is disabled;
+  //   * false => explicitly enabled.
+  // ONE switch for every model, because upstream's is one field on ModelConfig.
+  // It replaced `VT_GEMMA2_SLIDING` and `VT_GEMMA3_SLIDING`, which gave the
+  // control to two of the five families that have a window and to none of the
+  // rest. Applied through `vllm::SetDisableSlidingWindow`, which the five
+  // forwards read via `ResolveAttentionWindow`. Exposed on the C ABI as
+  // vllm_model_params.disable_sliding_window (ABI v26) and on the server as
+  // --disable-sliding-window / --enable-sliding-window.
+  std::optional<bool> disable_sliding_window = std::nullopt;
+
   // KV-EXTERNAL-CACHE (LMCache): opt-in external KV-cache connector selection.
   // Empty/absent (default) == NO connector == byte-identical production engine
   // (mirrors vLLM's --kv-transfer-config being unset). When set with a
