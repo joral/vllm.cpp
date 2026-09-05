@@ -22,6 +22,13 @@ and this model's speed axis.
 
 ## What is true at `c796fea41`
 
+**Which revision this was compared against.** Every upstream anchor below was
+read in the local checkout at `5559679229`, which is the revision the committed
+`tests/parity/goldens/glm4_moe_lite_greedy/` artifacts were captured on and the
+PRIOR parity pin. The ACTIVE pin is `e126687a9a`, at which no gate has run in
+this tree (`.agents/upstream-sync.md`, [#2794](https://github.com/mudler/vllm.cpp/issues/2794)).
+Re-reading `glm4_moe.py` at the active pin is owed as O5.
+
 **Upstream, read at `5559679229` — the pin the goldens were captured on.**
 `Glm4MoeLiteForCausalLM`'s MoE block is `Glm4MoeLite`, a bare subclass of
 `Glm4MoE` (`glm4_moe_lite.py:86-87`, instantiated at `:161-165`). `Glm4MoE`'s
@@ -86,17 +93,87 @@ sigmoid router with the correction bias, 64 experts, top-4, `norm_topk_prob`,
   the model forward, so the dtype is observable rather than merely wider, and the
   params the GLM production path resolves select the f32 arm. RED before the
   change (the production arm is the bf16 one).
-- **T3** the SACRED engine gate. **NOT RUNNABLE HERE and not claimed.** No
+- **T3** at GLM's real router configuration, the bf16 store changes the selected
+  top-4 SET. This is the MECHANISM measured directly through
+  `vt::MoeRouterTopK`; it holds independently of the repair and is not a
+  regression gate.
+- **T4** the PRODUCTION path — `ModelRegistry::Load` over a synthetic
+  GLM-4.7-Flash checkpoint on disk, then `ModelRegistry::Forward` on its default
+  configuration — produces the f32 arm and not the bf16 one. This is the
+  reachability case: it is what the loader call site owes.
+- **T5** the SACRED engine gate. **NOT RUNNABLE HERE and not claimed.** No
   `zai-org/GLM-4.7-Flash` snapshot is on this host or on the NAS.
+
+## Measured
+
+Built `-O0`, CPU only (no CUDA toolkit on this host), at `c796fea41`.
+
+RED, before the one-line repair, with the whole file in place (M1 below):
+
+```
+[doctest] test cases:  5 |  2 passed | 3 failed | 0 skipped
+[doctest] assertions: 23 | 20 passed |  3 failed
+```
+
+GREEN, after:
+
+```
+[doctest] test cases:     5 |     5 passed | 0 failed | 0 skipped
+[doctest] assertions: 16085 | 16085 passed | 0 failed
+```
+
+The three numbers the cases print:
+
+| | measurement |
+|---|---|
+| T2 | the router dtype is observable in the GLM forward at **6 of 16** fixed seeds; worst \|f32 - bf16\| logit `0.00100262` |
+| T3 | the bf16 store changes the top-4 **SET** for **34 of 4096** tokens (0.83%) at 64 experts / top-4 / sigmoid+bias / renormalize / scale 1.8 |
+| T4 | checkpoint seed 61 separates the arms; `ModelRegistry::Forward` matches the f32 arm byte for byte |
+
+T3's 0.83% is per MoE layer per token on `N(0,1)` synthetic logits, so it is the
+magnitude of the mechanism and not a prediction for the checkpoint. Taken at face
+value over GLM-4.7-Flash's 46 MoE layers it would put at least one changed
+selection on roughly a third of token positions, which is the order of the
+SACRED gate's 59 divergent positions — but the real logit distribution is not
+this one, and nothing here measures the checkpoint.
+
+### Mutations
+
+Each rebuilt (`BUILD_RC=0` every time, so no mutation was caught by the
+compiler) and each restored, with the restore verified by `sha256sum -c` against
+a baseline taken before the first mutation.
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | remove `p.router_dtype_is_f32 = true;` from `ParseGlm4MoeLiteParams` | RED `5 \| 2 passed \| 3 failed`, `assertions: 23 \| 20 passed \| 3 failed` — T1, T2 and T4 all fire |
+| M2 | delete the production loader call site `weights.params = ParseGlm4MoeLiteParams(config);` | RED `5 \| 4 passed \| 1 failed`, 2 assertions — **only T4**, and it reports the registry's output as the bf16 arm. This is the reachability proof: T1, T2 and T3 stay green without the call site |
+| M3 | remove the bf16 round trip T3's claim rests on (`logits_bf16 = logits_f32`) | RED — the SET-difference count falls to `0/4096`, so the 34 is caused by the store and by nothing else |
+| M4 | make T2's second arm f32 as well | RED — `0/16` seeds differ, `worst 0`, so T2's comparison is not vacuous |
+
+### Regression
+
+Run on the repaired tree; `DeepseekV2ForCausalLM` is byte-identical because
+`ParseDeepseekV2Params` is untouched.
+
+| suite | result |
+|---|---|
+| `test_glm4_moe_lite_router_dtype` | 5/5, 16085 assertions |
+| `test_glm4_moe_lite_load` | 3/3, 15 assertions |
+| `test_deepseek_v2_forward` | 12/12, 2061 assertions |
+| `test_deepseek_v2_load` | 4/4, 14 assertions |
+| `test_ops_moe_router_grouped` | 14/14, 941 assertions |
 
 ## Gates
 
 ```sh
 cmake --build build -j 3 --target test_glm4_moe_lite_router_dtype \
-      test_glm4_moe_lite_load test_deepseek_v2_forward
+      test_glm4_moe_lite_load test_deepseek_v2_forward test_deepseek_v2_load \
+      test_ops_moe_router_grouped
 ./build/tests/test_glm4_moe_lite_router_dtype
 ./build/tests/test_glm4_moe_lite_load
 ./build/tests/test_deepseek_v2_forward
+./build/tests/test_deepseek_v2_load
+./build/tests/test_ops_moe_router_grouped
 scripts/agent-preflight.sh
 ```
 
@@ -127,6 +204,10 @@ this host, because what it compares is a frozen `our_ids.npy`.
   ([#2929](https://github.com/mudler/vllm.cpp/issues/2929)). Established from the
   committed artifacts alone; the re-capture that would settle the cause needs the
   checkpoints.
+- O5. The upstream anchors are read at `5559679229`, not at the active pin
+  `e126687a9a`. `Glm4MoE`'s fp32 gate is a class property rather than a config
+  key, so it is unlikely to have moved, but "unlikely" is not "read". Owed to the
+  pin-reconciliation queue ([#2611](https://github.com/mudler/vllm.cpp/issues/2611)).
 - O4. `routed_scaling_factor` is applied to the routing weights rather than the
   routed output ([#2930](https://github.com/mudler/vllm.cpp/issues/2930)). It is
   a recorded deviation whose only gate vehicle had `routed_scaling_factor: 1.0`,
