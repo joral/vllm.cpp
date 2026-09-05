@@ -88,11 +88,15 @@ pattern: `src/vt/rocm/rocm_paged_attn.hip` already uses
 `fragment<matrix_a, WM, WN, WK, bfloat16_t, row_major>` for attention. The
 new int8 kernel follows that pattern rather than introducing a second one.
 
-## Upstream anchor
+## Upstream chain
 
 llama.cpp, pin `b10451` per `.agents/upstream-sync.md`. Line numbers below
 are cross-checked against a local checkout at tag `b10688`; the conditional
-compilation this cites has not changed across that span.
+compilation this cites has not changed across that span. This is the
+COMPLETE chain from source to the executed instruction: the arch-detection
+macros, the tile-selection branch they feed, and the MMQ call site that
+reaches it — every link a change here has to reconcile against, not only the
+kernel this row ports.
 
 - `ggml/src/ggml-cuda/common.cuh:265` — `AMD_MFMA_AVAILABLE` gates on
   `defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA)`.
@@ -110,6 +114,24 @@ compilation this cites has not changed across that span.
   `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`).
 - `ggml/src/ggml-cuda/mmq.cuh:181,197,472` — the quantized matmul kernel
   selects on the same `AMD_MFMA_AVAILABLE`/`AMD_WMMA_AVAILABLE` pair.
+
+## Our baseline
+
+`KQuantGemmK<OutT, Fmt>` (`src/vt/rocm/rocm_grouped_gemm.hip:446-482` at this
+row's base SHA) — a scalar warp-per-output-element GEMM: one warp owns one
+`(i,j)` output cell, strides its 32 lanes over the row's superblocks, and
+reduces each superblock's dot product with the `__ockl_sdot4`-backed `Dp4a()`
+helper (four signed `int8` multiply-adds per instruction, not a tensor-core
+op). Measured baseline (issue #2109, same-tool `rocprofv3` attribution,
+`Ornith-1.5-9B-Q4_K_M`, `-n 128 -ngl 99`, this same RX 9060 XT): prefill
+(pp512) 73.7 tok/s against the oracle's 1691 (22.9x slower); decode (tg128)
+17.44 against 48.51 (2.78x slower); total GPU time 108,817 ms against the
+oracle's 18,812 ms. This row targets the prefill (`m>1`) arm of that gap;
+the decode (`m==1`) arm already has its own row
+(`ROCM-KQUANT-NWARPS-DECODE`, PR #2086, merged) and is untouched here. Own
+measured op-level baseline (`examples/quant-gemm-bench`, RX 9060 XT): Q6_K
+115-122 GFLOP/s, Q4_K 302-448 GFLOP/s — see `## Now` for the WMMA arm's
+numbers against each.
 
 ## Design
 
@@ -129,6 +151,45 @@ accumulation, following the same shape as the existing scalar path
 because the risk below is that no library path carries the per-superblock
 scale layout through the tile op.
 
+## Port map
+
+| Upstream | Local |
+|---|---|
+| `mma.cuh:697` RDNA4 tile branch (`_gfx12` WMMA builtins) | `KQuantGemmKWmmaQ6K`/`KQuantGemmKWmmaQ4K` (`rocm_grouped_gemm.hip`), via `rocwmma`'s `fragment`/`mma_sync` rather than the raw builtins — this project's own in-tree precedent (`rocm_paged_attn.hip`), not a second pattern |
+| `common.cuh:265,269`, `vendors/hip.h:189-221` arch macros | `Gfx12QuantWmmaHostOk` (`rocm_grouped_gemm.hip`) at the host call site, reusing `vt::rocm::GcnArchNameIsGfx12PrefillWmma` (`include/vt/rocm/rocm_arch.h`) rather than the compile-time macro (issue #785's trap for a host-side WMMA gate) |
+| `DotQ4K`/`DotQ6K` block-dequant math (already ported 1:1, unchanged by this row) | `src/vt/rocm/rocm_grouped_gemm.hip:230-321` |
+| Q6_K's 16-wide scale group | `DequantQ6KGroup16` |
+| Q4_K's 32-wide scale/min sub-block | `DequantQ4KTile16` + `UnpackQ4KScalesMins` |
+
+## Dependencies
+
+- `rocwmma` (already vendored in this project's ROCm toolchain; no new
+  external dependency).
+- gfx1200/gfx1201 hardware to compile the device-pass WMMA branch and to
+  runtime-gate the host dispatch; every other ROCm target is unaffected and
+  untested by this row.
+- ROCm 7.2 / HIP 7.2.53211 / clang 22, the toolchain W0 was proven against;
+  not verified on another ROCm release.
+- The in-tree WMMA precedent `rocm_paged_attn.hip` (include/namespace
+  pattern, and the `#785` host-vs-device-macro fix this row's host gate
+  reuses directly rather than re-deriving).
+
+## Work breakdown
+
+- **W0** (done): mechanism verified on target — rocwmma int8 tile produces
+  the exact integer dot product on gfx1200.
+- **W1** (done): `KQuantGemmKWmmaQ6K`, hardware-verified, mutation-proven.
+- **W1.1/W1.2** (done): two performance passes on the same kernel (fill-once
+  staging, then batched store/fold), 11.7x-16.3x over scalar.
+- **W1.3** (done): `KQuantGemmKWmmaQ4K`, hardware-verified, mutation-proven
+  on both its correction terms.
+- **W1.4** (done): the issue's own gate (c) recipe run against the pinned
+  oracle; narrowly satisfied against its stated threshold, oracle-figure
+  reconciliation left open.
+- **W2** (not started): `M`/`N` tail handling for a non-16-multiple row
+  count.
+- **W3** (not started, separate row): Q5_K.
+
 ## Risks
 
 - **hipBLASLt may not support the per-superblock Q8_K block-scale layout**
@@ -144,16 +205,35 @@ scale layout through the tile op.
   this spec and must be designed in the implementation wave before any
   launch-site change lands.
 
-## Tests
+## Tests to port
 
-- `test_rocm_quant_dot.cpp` (mirrors `test_cuda_quant_dot`), NMSE <= 5e-4,
-  unchanged as the correctness gate for every quant-path lever on this
-  kernel (issue #2109 gate (b)).
-- `test_backend_cross_device`, NMSE <= 5e-4 vs the CPU oracle (gate (a)).
-- `rocprofv3 --kernel-trace` on the Ornith-1.5-9B-Q4_K_M trace workload
-  (gate (c)): target total kernel time <= 20,000 ms (oracle 18,812 ms;
-  current scalar arm 108,817 ms).
-- `ctest -R 'rocm|cross_device'`, zero regression (gate (d)).
+- `test_rocm_quant_dot.cpp` (mirrors `test_cuda_quant_dot`): named by the
+  issue as gate (b)'s vehicle; not authored — the row's actual correctness
+  coverage landed instead as two new `TEST_CASE`s in the existing
+  `test_backend_cross_device.cpp` (one per format, f32 and bf16 out each,
+  CPU-oracle NMSE and dispatch-count reachability), which already exercises
+  this kernel end-to-end and did not need a second, format-mirrored file.
+- `test_backend_cross_device.cpp` — the CPU-oracle NMSE cases above (gate
+  (a)), plus the pre-existing non-grouped/grouped keep-quant suites this row
+  does not modify.
+- `examples/quant-gemm-bench` (extended this wave to run any registered
+  device, not only CPU) — the op-level GFLOP/s A/B, not a `ctest` gate but
+  the vehicle for every performance table in `## Now`.
+
+## Gates
+
+- (a) `test_backend_cross_device` NMSE <= 5e-4 vs the CPU oracle: MET (both
+  formats, f32 and bf16 out).
+- (b) Correctness coverage for every quant-path lever on this kernel: MET,
+  via the cases named above rather than a separate mirrored file.
+- (c) `rocprofv3 --kernel-trace` on the Ornith-1.5-9B-Q4_K_M trace workload,
+  target total kernel time <= 20,000 ms (oracle 18,812 ms; scalar arm
+  108,817 ms): narrowly SATISFIED against the stated absolute threshold on
+  a faithful same-tool same-checkpoint same-pinned-oracle reproduction (see
+  `## Gate (c), the issue's own recipe` below) — NOT reconciled against the
+  issue's original absolute figures, which stay an open question.
+- (d) `ctest -R 'rocm|cross_device'`, zero regression: MET (one pre-existing
+  unrelated failure, #1513/#1954, present before and after this row).
 
 ## Owed
 
@@ -182,7 +262,9 @@ scale layout through the tile op.
 
 ## Now
 
-`SPIKE`. W0 (mechanism verified on target, gfx1200) is done. W1 has landed on
+`ACTIVE` (moved from `SPIKE`: real, hardware-verified kernels now sit on the
+production `MatmulBTQuant` dispatch path, not only a mechanism probe).
+W0 (mechanism verified on target, gfx1200) is done. W1 has landed on
 `row/KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4-w1`: `KQuantGemmKWmmaQ6K`, a rocWMMA
 int8 tile arm for the Q6_K prefill GEMM, gated to gfx1200/gfx1201 and to
 tile-aligned M/N (both multiples of 16); every other shape and architecture
@@ -314,7 +396,7 @@ issue's exact recipe run, oracle side included.
 ## Gate (c), the issue's own recipe
 
 **Built and ran the pinned oracle at the exact SHA the spec's `## Upstream
-anchor` cites** (`10bf611e533d81f739128304991c5e133c6aebd8`, tag `b10451`),
+chain` cites** (`10bf611e533d81f739128304991c5e133c6aebd8`, tag `b10451`),
 in a linked worktree (`/tmp/llama-cpp-b10451`) so the developer's own
 checkout was never touched, `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1200`, on the
 same RX 9060 XT. `llama-bench -m Ornith-1.5-9B-Q4_K_M.gguf -p 512 -n 128
