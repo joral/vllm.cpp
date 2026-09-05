@@ -296,6 +296,38 @@ vllm_engine_load(&mp, &engine);
 
 `vllm-cli` takes the same `--kv-cache-dtype` flag the server takes.
 
+## Disabling a model's sliding window
+
+Gemma-2, Gemma-3, Gemma-4, OLMo-2 and Muse-Glimmer apply a model-level sliding
+window to attention. `--disable-sliding-window` turns it off for whichever of them
+you load, mirroring vLLM's `ModelConfig.disable_sliding_window`
+(`vllm/config/model.py:248`):
+
+```sh
+server --model /models/gemma-3-4b-it --disable-sliding-window
+```
+
+A model with no sliding window ignores the flag, which is upstream's own
+behaviour, so it is safe to pass to any model. `--enable-sliding-window` is the
+explicit opposite; omitting both leaves the window on, which is the default and is
+byte-identical to every release before ABI v26.
+
+**Through the C ABI (v26).** `vllm_model_params.disable_sliding_window` is a
+tri-state int: `0` (the zero-initialized default) leaves the window on, `1`
+disables it, `2` explicitly enables it. Any other value fails
+`vllm_engine_load` with `VLLM_ERR_INVALID_ARGUMENT`:
+
+```c
+vllm_model_params mp = vllm_model_params_default();
+mp.model_path = "/path/to/gemma-3-4b-it";
+mp.disable_sliding_window = 1;
+vllm_engine *engine = NULL;
+vllm_engine_load(&mp, &engine);
+```
+
+This replaced the `VT_GEMMA2_SLIDING` and `VT_GEMMA3_SLIDING` environment knobs,
+which reached only two of the five families.
+
 `vllm-bench` takes it too, and its report header names the KV dtype it measured
 on -- both the value you asked for and the storage dtype the loader actually
 sized blocks from. Those two differ when the checkpoint declares
@@ -361,6 +393,37 @@ The same flag also takes one key vLLM does not have, `vllm_cpp.drafter_chain`,
 which names several speculators in preference order. It is parsed and checked
 today and **refused at startup**, because nothing resolves a chain yet; the same
 page says what the document looks like and what each rule refuses.
+
+### Read acceptance off `GET /metrics`
+
+A server started with `--speculative-config` exports four Prometheus counters
+under vLLM's own names, in addition to the always-on catalog. They are
+config-gated exactly as vLLM gates them: a server with no `--speculative-config`
+exports none of them, so an absent family means "this engine does not
+speculate" and never "it speculates and accepts nothing".
+
+| Series | What it counts |
+|---|---|
+| `vllm:spec_decode_num_drafts_total` | (request, step) pairs that carried a draft. NOT forward passes: one verify step over 8 drafted requests adds 8 |
+| `vllm:spec_decode_num_draft_tokens_total` | draft tokens verified, after subtracting positions the drafter could not fill |
+| `vllm:spec_decode_num_accepted_tokens_total` | draft tokens accepted, EXCLUDING the bonus/replacement token every verify step emits |
+| `vllm:spec_decode_num_accepted_tokens_per_pos_total{position="d"}` | acceptances at draft depth `d`, one series per configured draft position |
+
+Every series carries the `{model_name, engine}` labels the rest of the catalog
+uses. The acceptance rate and the mean acceptance length are the same PromQL
+vLLM documents:
+
+```text
+rate(vllm:spec_decode_num_accepted_tokens_total[5m])
+  / rate(vllm:spec_decode_num_draft_tokens_total[5m])
+
+1 + rate(vllm:spec_decode_num_accepted_tokens_total[5m])
+      / rate(vllm:spec_decode_num_drafts_total[5m])
+```
+
+The same figures are available in-process from the C ABI's
+`vllm_engine_spec_acceptance` (below), which reports cumulative totals for one
+engine handle rather than a scrapeable series.
 
 ## Reuse the NVFP4 tactic draw between runs
 

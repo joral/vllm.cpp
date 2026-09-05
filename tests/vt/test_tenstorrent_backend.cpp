@@ -82,9 +82,9 @@ TEST_CASE("kTENSTORRENT Platform mirrors the registered Backend") {
   // documented pre-flip opt-out) can no longer make the opt-in cell
   // vacuous. The host-free-OFF cells matter for exactly that reason
   // (#1688's lesson: the flag is read live on every call) — they are what
-  // catches a dropped HostFreeDecodeEnabled conjunct, and the capture-unset
-  // cells catch a dropped VT_TT_DECODE_CAPTURE conjunct. The env is read
-  // live per call (HostFreeDecodeEnabled's no-caching contract,
+  // catches a dropped HostFreeDecodeEnabled conjunct, and the capture=0
+  // cell catches a dropped VT_TT_DECODE_CAPTURE opt-out parse. The env is
+  // read live per call (HostFreeDecodeEnabled's no-caching contract,
   // tenstorrent_device.h), so re-resolving after each setenv proves that.
   const char* const prev_host_free = std::getenv("VT_TT_HOST_FREE_DECODE");
   const bool had_host_free = prev_host_free != nullptr;
@@ -95,18 +95,23 @@ TEST_CASE("kTENSTORRENT Platform mirrors the registered Backend") {
   const auto static_graph_mode = [] {
     return vllm::platforms::GetPlatform(DeviceType::kTENSTORRENT).support_static_graph_mode();
   };
-  // Cell 1: host-free OFF, capture unset → declined.
+  // Cell 1: host-free OFF, capture unset → declined (the host-free conjunct).
   ::setenv("VT_TT_HOST_FREE_DECODE", "0", 1);
   ::unsetenv("VT_TT_DECODE_CAPTURE");
   CHECK_FALSE(static_graph_mode());
-  // Cell 2: host-free ON, capture unset → declined (the capture conjunct).
+  // Cell 2: host-free ON, capture unset → ACCEPTED. The #1625 flip: capture
+  // is the DEFAULT, so the bare default cell asserts the flip itself.
   ::setenv("VT_TT_HOST_FREE_DECODE", "1", 1);
-  CHECK_FALSE(static_graph_mode());
-  // Cell 3: host-free ON, capture opt-in → the single accepted cell.
+  CHECK(static_graph_mode());
+  // Cell 3: host-free ON, capture explicitly "1" → accepted.
   ::setenv("VT_TT_DECODE_CAPTURE", "1", 1);
   CHECK(static_graph_mode());
-  // Cell 4: host-free OFF, capture opt-in → declined (the host-free conjunct).
+  // Cell 4: host-free ON, capture "0" → declined (the opt-out parse).
+  ::setenv("VT_TT_DECODE_CAPTURE", "0", 1);
+  CHECK_FALSE(static_graph_mode());
+  // Cell 5: host-free OFF, capture "1" → declined (the host-free conjunct).
   ::setenv("VT_TT_HOST_FREE_DECODE", "0", 1);
+  ::setenv("VT_TT_DECODE_CAPTURE", "1", 1);
   CHECK_FALSE(static_graph_mode());
   // Restore the ORIGINAL ambient state of both envs (unset if it was unset).
   if (had_host_free) {
@@ -1685,10 +1690,10 @@ TEST_CASE("kTENSTORRENT host-free helpers decline by default (inertness guard)")
   // The gate: same bytes, both shadows current -> only the env/capture gate
   // can decline. These CHECKs go RED if the gate is removed (M1) or if the
   // capture flag is stuck true (M4).
-  CHECK_FALSE(vt::tenstorrent::CopyDeviceDeviceIfCapture(m2, m1));
-  CHECK_FALSE(vt::tenstorrent::MemsetDeviceIfCapture(m2, 0));
+  CHECK_FALSE(vt::tenstorrent::CopyDeviceDeviceIfCapture(m2, m1, h1.size() * sizeof(float)));
+  CHECK_FALSE(vt::tenstorrent::MemsetDeviceIfCapture(m2, 0, h2.size() * sizeof(float)));
   // value!=0 always declines (host memset is the only path for it).
-  CHECK_FALSE(vt::tenstorrent::MemsetDeviceIfCapture(m2, 1));
+  CHECK_FALSE(vt::tenstorrent::MemsetDeviceIfCapture(m2, 1, h2.size() * sizeof(float)));
 
   // And the default host path still works: Copy m1 -> m2 yields identical
   // host bytes once materialized.
