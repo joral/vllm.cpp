@@ -3487,6 +3487,107 @@ TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
   }
   rocm.DestroyQueue(q);
 }
+
+// The M/N tail (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4's `## Owed`, closed in a
+// follow-up wave): a real prompt is essentially never a multiple of 16, and
+// the WMMA arm used to require EXACT alignment on both M and N, so it fell
+// back to scalar for the whole call whenever either dimension had a
+// remainder — losing the row's entire benefit on the common case, not just
+// the ragged edge. M=37, N=50 are chosen so NEITHER dimension is aligned
+// (floor(37/16)=32, floor(50/16)=48), exercising the WMMA corner, the
+// bottom-row remainder, and the right-column remainder all in one case.
+TEST_CASE("keep-quant GEMM matches the CPU oracle when M and N are not multiples of 16") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  constexpr int64_t M = 37, N = 50, K = 512;
+  struct Fmt {
+    vt::DType dt;
+    int64_t block_bytes;
+    int d_off, dmin_off;
+    const char* name;
+  };
+  const Fmt fmts[] = {
+      {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
+      {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
+  };
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+
+  for (const Fmt& f : fmts) {
+    CAPTURE(std::string(f.name));
+    const size_t row_bytes = static_cast<size_t>(nsb) * f.block_bytes;
+    const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+    std::mt19937 rng(3716);
+    std::vector<uint8_t> wt(wn);
+    for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+    for (int64_t r = 0; r < N; ++r)
+      for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+        uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+        const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+        auto put16 = [&](int off, float v) {
+          const uint16_t h = vt::F32ToF16(v);
+          std::memcpy(blk + off, &h, 2);
+        };
+        put16(f.d_off, 0.0125f * jitter);
+        if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+      }
+
+    const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+    const std::vector<float> act = RandomVec(an, 3717, -0.5f, 0.5f);
+
+    std::vector<float> ref(on, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ca = act;
+      std::vector<uint8_t> cw = wt;
+      Tensor tout = T2(ref.data(), cd, M, N);
+      Tensor tact = T2(ca.data(), cd, M, K);
+      Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {N, K});
+      vt::MatmulBTQuant(cq, tout, tact, twt);
+      cpu.DestroyQueue(cq);
+    }
+
+    vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+    Queue q = rocm.CreateQueue();
+    const Device d{DeviceType::kROCM, 0};
+    DevBuf da(rocm, q, an);
+    DevBufBytes dwt(rocm, q, wn);
+    da.Upload(act);
+    dwt.Upload(wt.data());
+    Tensor tact = T2(da.ptr(), d, M, K);
+    Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {N, K});
+
+    const uint64_t wmma_before = f.dt == vt::DType::kQ6_K
+                                     ? vt::rocm::KQuantWmmaDispatchCount()
+                                     : vt::rocm::KQuantWmmaQ4KDispatchCount();
+    DevBuf dout(rocm, q, on);
+    Tensor tout = T2(dout.ptr(), d, M, N);
+    vt::MatmulBTQuant(q, tout, tact, twt);
+    CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    const uint64_t wmma_after = f.dt == vt::DType::kQ6_K
+                                    ? vt::rocm::KQuantWmmaDispatchCount()
+                                    : vt::rocm::KQuantWmmaQ4KDispatchCount();
+    // Reachability: the WMMA arm must still fire for its floor(M/16)x
+    // floor(N/16) corner even though the full shape is not aligned — a
+    // silent full fallback to scalar would pass the NMSE check above just
+    // as well, which is exactly why #2109's own real-model measurement
+    // needed a hand-trimmed prompt before this fix.
+    CHECK(wmma_after > wmma_before);
+    rocm.DestroyQueue(q);
+  }
+}
 #endif  // VLLM_CPP_HIP
 
 TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {

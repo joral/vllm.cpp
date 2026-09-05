@@ -186,9 +186,15 @@ scale layout through the tile op.
 - **W1.4** (done): the issue's own gate (c) recipe run against the pinned
   oracle; narrowly satisfied against its stated threshold, oracle-figure
   reconciliation left open.
-- **W2** (not started): `M`/`N` tail handling for a non-16-multiple row
-  count.
-- **W3** (not started, separate row): Q5_K.
+- **W1.5** (done): `M`/`N` tail handling for a non-16-multiple row count —
+  see `## Now`. Closes the gap where a real (essentially never 16-aligned)
+  prompt fell back to scalar for the whole call, not only its ragged edge.
+- **W2 does not exist as originally framed.** The pre-W1.5 spec named a W2
+  ("launch-site replacement", the scalar arm's eventual retirement once
+  every format is covered). W1.5's tail-fill design makes the scalar kernel
+  a PERMANENT dependency (the remainder cells, and every `m<16`/decode
+  shape) rather than a stopgap awaiting format coverage, so that framing no
+  longer applies — see `## Now`.
 
 ## Risks
 
@@ -201,9 +207,11 @@ scale layout through the tile op.
   low bits. Record near-tie adjudication per the ratified band doctrine
   (`.agents/specs/rocm-m4-oracle.md`) if bit-exactness cannot be shown
   directly, rather than asserting identity the change cannot prove.
-- **Row-count tail handling** (`M`/`N` not a multiple of 16) is unresolved in
-  this spec and must be designed in the implementation wave before any
-  launch-site change lands.
+- **Row-count tail handling** (`M`/`N` not a multiple of 16) — RESOLVED in
+  the implementation wave: see `## Now`. The host gate relaxed from exact
+  alignment to `m >= 16 && n >= 16`, and the scalar `KQuantGemmK` grew a
+  `skip_m`/`skip_n` guard so it fills in the WMMA corner's remainder without
+  recomputing it.
 
 ## Tests to port
 
@@ -241,8 +249,6 @@ scale layout through the tile op.
   and spec.
 - gfx1151 (RDNA3.5) WMMA tile: needs Strix Halo hardware to verify; a
   separate row and spec.
-- `M`/`N` tail handling for a non-16-multiple row count: unresolved here,
-  owed to the implementation wave.
 - hipBLASLt per-superblock scale support: unmeasured; recorded as an open
   question for whoever implements W1, not assumed either way beyond the
   Risks section above.
@@ -443,6 +449,24 @@ same-checkpoint same-pinned-oracle reproduction — not as reconciled against
 the issue's original absolute figures**, which stay an open question this
 paragraph names rather than answers.
 
-Not yet closed: Q5_K and the M/N tail remain `## Owed`, as scoped above. W2
-(launch-site replacement) refers to the scalar arm's retirement once every
-format is covered; today both arms coexist by design.
+**M/N tail (W1.5) landed.** The host gate relaxed from exact 16-alignment to
+`m >= 16 && n >= 16`; the WMMA kernels already floored `m`/`n` internally
+and needed no change. `KQuantGemmK` grew a `skip_m`/`skip_n` guard (every
+pre-existing call site passes `0, 0`, an always-false guard — unchanged
+behavior there) so the tail-fill pass computes only the remainder the WMMA
+corner left untouched, never recomputing it. Hardware-verified on a
+deliberately doubly-misaligned shape (M=37, N=50, neither a multiple of
+16) for both formats: correct against the CPU oracle, WMMA reachability
+still holds for the aligned corner, and RED-first mutation-proven (`&&` to
+`||` in the skip guard leaves real cells unwritten — NMSE explodes to
+0.17/3.6e65 — and reverting restores an identical source hash). Real-model
+confirmation: the ORIGINAL 291-token prompt (`prompt_tokens=291`, not a
+multiple of 16, the exact shape that fell back to scalar entirely before
+this change) now measures 2704.7 ms total kernel time — within 10.5% of
+the perfectly-aligned 288-token result (2447.1 ms) and a 4.4x improvement
+over the pre-fix scalar total for this same prompt. **W2 is not this row's
+retirement of the scalar arm** — the tail-fill pass and the `m<16`/decode
+paths need the scalar kernel permanently, by design, not as a stopgap
+awaiting format coverage; that framing predates the tail fix and no longer
+applies. `## Owed` above is current: Q5_K (a separate row) and the
+gfx1100/gfx1151 WMMA tiles (separate rows) are what remains.

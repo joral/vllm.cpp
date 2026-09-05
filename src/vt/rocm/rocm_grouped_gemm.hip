@@ -857,14 +857,21 @@ __global__ void GroupedKQ8K(OutT* __restrict__ out, const uint8_t* __restrict__ 
 
 // --- non-grouped keep-quant GEMM (cuda_quant_dot.cu QuantDotGemmKernel :706) ---
 // warp per (i,j); no expert indirection (w_row = weight + j*w_row_bytes).
+// skip_m/skip_n: the WMMA tile-aligned corner [0,skip_m)x[0,skip_n) a caller
+// already filled and this launch must not recompute (KERNEL-QUANT-CIQ-GEMM-
+// ROCM-RDNA4's M/N tail arm). Every existing call site passes 0,0, which
+// makes the guard `i < 0 && j < 0` — always false — so this is a pure
+// addition: unchanged behavior wherever the tail arm does not use it.
 template <typename OutT, int Fmt>
 __global__ void KQuantGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
                             const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
-                            int64_t nsb, size_t w_row_bytes, size_t w_block_bytes) {
+                            int64_t nsb, size_t w_row_bytes, size_t w_block_bytes,
+                            int64_t skip_m, int64_t skip_n) {
   const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
   if (warp >= m * n) return;
   const int64_t i = warp / n;
   const int64_t j = warp % n;
+  if (i < skip_m && j < skip_n) return;
   const int lane = threadIdx.x;
   const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
   const BlockQ8_K* a_row = act + i * nsb;
@@ -1314,11 +1321,26 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
     const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
     // RDNA4 WMMA tile arm: Q6_K and Q4_K prefill only (m > 1, since
-    // KQuantDecodeCoopWarps above already owns m == 1), tile-aligned M/N
-    // only. Q5_K is `## Owed` — same 32-wide scale/min shape as Q4_K plus a
-    // high-bit plane, not yet ported. Every other shape and every other
-    // architecture falls through to the arms below unchanged.
-    const bool wmma_ok = (fmt == 2 || fmt == 0) && m % 16 == 0 && n % 16 == 0 &&
+    // KQuantDecodeCoopWarps above already owns m == 1). Q5_K is `## Owed` —
+    // same 32-wide scale/min shape as Q4_K plus a high-bit plane, not yet
+    // ported. Every other format and every other architecture falls through
+    // to the arms below unchanged.
+    //
+    // M/N TAIL (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4's `## Owed`, closed here):
+    // `m >= 16 && n >= 16` is the gate, not exact alignment — the WMMA
+    // kernels already floor internally (`m_tiles = m / 16`, and `n_tiles`
+    // is passed in as `n / 16`), so a non-16-multiple shape still gets the
+    // WMMA arm over its floor(m/16)*16 x floor(n/16)*16 corner. What was
+    // missing was the REST of the output: a real prompt is essentially never
+    // 16-aligned (this row's own real-model gate (c) measurement needed a
+    // prompt hand-trimmed to exactly 288/512 tokens to engage the WMMA arm
+    // at all), so requiring exact alignment meant the common case fell back
+    // to scalar for the WHOLE shape, not just the remainder. The scalar
+    // kernel's new `skip_m`/`skip_n` guard fills in that remainder --
+    // bottom rows [m_aligned, m) x all columns, and the right columns
+    // [0, m_aligned) x [n_aligned, n) -- without recomputing the corner
+    // WMMA already wrote.
+    const bool wmma_ok = (fmt == 2 || fmt == 0) && m >= 16 && n >= 16 &&
                         QuantWmmaEnabled() && Gfx12QuantWmmaHostOk(q.device.index);
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
@@ -1332,6 +1354,11 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
         KQuantGemmKWmmaQ6K<OutT><<<static_cast<unsigned>(grid_wmma),
                                    dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
             o, w, qact, m, n, nsb, n_tiles);
+        const int64_t m_aligned = m_tiles * 16, n_aligned = n_tiles * 16;
+        if (m_aligned < m || n_aligned < n) {
+          KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, m_aligned, n_aligned);
+        }
         return;
       }
       if (wmma_ok && fmt == 0) {
@@ -1343,6 +1370,11 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
         KQuantGemmKWmmaQ4K<OutT><<<static_cast<unsigned>(grid_wmma),
                                    dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
             o, w, qact, m, n, nsb, n_tiles);
+        const int64_t m_aligned = m_tiles * 16, n_aligned = n_tiles * 16;
+        if (m_aligned < m || n_aligned < n) {
+          KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, m_aligned, n_aligned);
+        }
         return;
       }
       if (coop == 8 && fmt == 2) {
@@ -1354,10 +1386,10 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
             o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
         return;
       }
-      if (fmt == 2 && Q6KSmallPrivateEnabled()) KQuantGemmK<OutT, 3><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
-      else if (fmt == 2) KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
-      else if (fmt == 1) KQuantGemmK<OutT, 1><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
-      else KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+      if (fmt == 2 && Q6KSmallPrivateEnabled()) KQuantGemmK<OutT, 3><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
+      else if (fmt == 2) KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
+      else if (fmt == 1) KQuantGemmK<OutT, 1><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
+      else KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
     };
     if (out.dtype == DType::kF32) launch(float{}); else launch(uint16_t{});
     Check(hipGetLastError(), "K-quant gemm");
