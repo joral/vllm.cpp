@@ -247,7 +247,7 @@ def print_cells(legs, args):
                 if not v:
                     continue
                 name = axis + (" (est)" if axis == "ttft_corrected" else "")
-                print(f"| {key[0]} | {key[1]} | {len(v)} | {name} ms "
+                print(f"| {key[0]} | {key[1]} | {len(v)} | {name} ms | "
                       + " | ".join(fmt(percentile(v, p)) for p in PCTS)
                       + f" | {fmt(max(v))} | {fmt(statistics.mean(v))} |")
 
