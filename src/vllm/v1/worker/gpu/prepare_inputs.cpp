@@ -431,9 +431,15 @@ std::vector<int32_t> FillDraftsForRow(const std::vector<int32_t>& draft_tokens,
                std::to_string(num_placeholders) +
                " draft placeholders on a runner with no draft buffer "
                "(num_speculative_steps == 0)");
-  // The pre-A2-3 pair of refusals, restated on the buffer. num_valid == 0 with
-  // placeholders scheduled is "placeholders scheduled without a matching
-  // propose"; a positive but short count is the fill's own mismatch.
+  // THE COUNT half, and only that half. The pre-A2-3 fill made ONE refusal that
+  // did two jobs, because it read `pending_drafts_`: it asked whether a propose
+  // had run for this request at all (freshness, since `take_draft_token_ids`
+  // moves that object out) and, implicitly, what it wrote. This function can only
+  // answer the second: `draft_tokens` and `num_valid_draft_tokens` survive the
+  // out-of-band pull by design, so a stale row and a fresh one are indistinguishable
+  // here. FRESHNESS IS THE CALLER'S, asserted in `GPUModelRunner::execute_model`
+  // against `ProposedDraftLedger` BEFORE this is called, and it keeps the pre-A2-3
+  // wording. Do not read the check below as covering it.
   VT_CHECK(num_valid >= num_placeholders,
            "async draft fill: request '" + req_id + "' proposed " +
                std::to_string(num_valid) +
@@ -458,6 +464,23 @@ std::vector<int32_t> FillDraftsForRow(const std::vector<int32_t>& draft_tokens,
       draft_tokens.begin() + static_cast<std::ptrdiff_t>(row) +
           static_cast<std::ptrdiff_t>(num_placeholders));
 }
+
+// SPEC-DFLASH2 A2-3 REPAIR (#2911): the fill's freshness rule. See the header
+// for what it restores and why `FillDraftsForRow` cannot answer it.
+void ProposedDraftLedger::Record(const std::vector<std::string>& req_ids) {
+  // ASSIGN, never merge: an earlier propose's requests are no longer fresh, and
+  // merging would let a request that stopped being proposed for keep passing.
+  req_ids_.clear();
+  for (const std::string& rid : req_ids) req_ids_.insert(rid);
+}
+
+void ProposedDraftLedger::Clear() { req_ids_.clear(); }
+
+bool ProposedDraftLedger::IsFresh(const std::string& req_id) const {
+  return req_ids_.count(req_id) != 0;
+}
+
+void ProposedDraftLedger::Consume() { req_ids_.clear(); }
 
 // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710). The OR over the batch of the row
 // predicate the combine applies, and nothing else: see the header for why this

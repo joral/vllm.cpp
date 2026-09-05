@@ -946,7 +946,14 @@ class GPUModelRunner final : public ModelRunnerBase {
     // this row has been bitten by conflating them. `AsyncDeviceInputs` OWNS every
     // pointer in this struct, including this one. WHEN they may be freed is the
     // separate question: only in `~GPUModelRunner`, which is the sole `Free` site
-    // and where the runner and therefore its queue are going away. They are
+    // and which DRAINS `queue_` before it frees. That drain is the guarantee,
+    // and the sentence that stood here — "the runner and therefore its queue are
+    // going away" — was not one: the runner does not own `queue_`, does not
+    // destroy it, and a kernel queued against these buffers is still queued when
+    // the runner's members are destroyed. Freeing under it is the defect
+    // `20d225e54` repaired one level down in
+    // `RejectionSamplerDeviceOutput::Release`, and this is the same tree's other
+    // half of it. They are
     // allocated once on first use and are never per-step, never block-scoped, and
     // never released by a scope exit. That is deliberate. A2-4 exists to move the
     // verify wait past the propose, and a buffer whose free is tied to a scope
@@ -955,6 +962,22 @@ class GPUModelRunner final : public ModelRunnerBase {
     // because verify is lossless the emitted tokens stay correct and NOTHING
     // raises. Moving a wait cannot move a free here, because no wait frees this.
     int32_t* draft_tokens = nullptr;
+    // SPEC-DFLASH2 A2-3 REPAIR (#2911): the device mirror of
+    // `StepInputs::cu_num_logits`, [max_num_reqs + 1] exclusive prefix sum, the
+    // twin of `query_start_loc` above and uploaded beside it every step.
+    //
+    // IT EXISTS BECAUSE A NULL IS NOT A NEUTRAL DEFAULT HERE. The kernel reads a
+    // null `cu_num_logits` as arange(num_reqs + 1), so every row's `num_logits`
+    // is 1 and its `num_draft_tokens` is 0. On a decode step that is the right
+    // answer. On a VERIFY step it makes `logits_start` == `query_end - 1`, which
+    // IS the last draft slot: the committed token is written over the last
+    // draft and no drafts are scattered at all. Verify is lossless, so the
+    // emitted tokens stay correct and only ACCEPTANCE falls — reason A's class,
+    // which no token gate in this tree can see (#1366,
+    // `.agents/specs/dflash2-async-spec-sampler.md` §"Reason A"). This arm
+    // therefore mirrors the same per-request vector the host arm passes, rather
+    // than passing a null that is only correct while the veto stands.
+    int32_t* cu_num_logits = nullptr;    // [max_num_reqs + 1]
     int32_t draft_stride = 0;            // == InputBatch::num_speculative_steps
     int64_t input_ids_capacity = 0;      // elements in `input_ids`
     int32_t max_reqs = 0;
@@ -1154,6 +1177,12 @@ class GPUModelRunner final : public ModelRunnerBase {
   // `req_states.draft_tokens` for the workers, and the `DraftTokensHandler`'s
   // host copy for the scheduler (model_runner.py:1548 and :1553-1556).
   std::optional<DraftTokenIds> pending_drafts_;
+  // The async placeholder fill's FRESHNESS half (SPEC-DFLASH2 A2-3 repair,
+  // #2911), which A2-3 deleted with `pending_drafts_` and did not restate. The
+  // rule, and why `InputBatch::draft_tokens` cannot carry it, are on
+  // `ProposedDraftLedger` in `prepare_inputs.h`. Written by `set_draft_tokens`
+  // and `clear_draft_tokens`, read and consumed by the fill in `execute_model`.
+  ProposedDraftLedger proposed_drafts_;
   // SPEC-DFLASH2 A2-3 (#2911): the ONE producer seam for both residences.
   // Scatters `drafts` into `input_batch_.draft_tokens` by req_state slot and
   // stashes it in `pending_drafts_` for the out-of-band pull — upstream's

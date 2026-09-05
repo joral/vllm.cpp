@@ -189,3 +189,81 @@ TEST_CASE("A2-3 fill: placeholders against a zero-width buffer are refused") {
                                  /*req_state_idx=*/0, /*num_valid=*/0,
                                  /*num_placeholders=*/0, "nospec"));
 }
+
+// ─── SPEC-DFLASH2 A2-3 REPAIR (#2911): the fill's FRESHNESS half ─────────────
+//
+// WHAT WAS LOST. Before A2-3 the fill made ONE refusal, over a map built from
+// `pending_drafts_`: "no drafts proposed for request '…' (placeholders scheduled
+// without a matching propose)". `take_draft_token_ids` MOVES `pending_drafts_`
+// out on its way to the scheduler, so the question that refusal really answered
+// was "did a propose run for this request since the last time the fill looked".
+// A2-3 rehomed the message onto `input_batch_.req_id_to_index` — is the request
+// in the persistent batch — which is nearly always true, and left freshness
+// resting on `num_valid_draft_tokens`, which is persistent, survives the pull by
+// design, and is zeroed only by `clear_draft_tokens`. `FillDraftsForRow` above
+// cannot see the difference: a stale row and a fresh one are the same bytes.
+//
+// WHY IT MATTERS AND WHY NOTHING ELSE CATCHES IT. Verify is lossless. A stale
+// draft spliced into this step's placeholders emits exactly the same tokens and
+// costs ACCEPTANCE only — reason A's class, invisible to every token gate here
+// (#1366), on the row whose whole measured gap is acceptance and throughput.
+//
+// WHAT THESE CASES GATE, precisely. They gate the RULE, not its reach. The
+// runner's call site is separately proven reached: forcing its refusal false reds
+// `test_mtp_depth` 5 of 10 and `test_dflash2_runner_reach` 9 of 10, because the
+// production fill runs it on every filled step. What NO suite in this tree
+// presents is a STALE step through `execute_model` — deleting the refusal
+// outright is silent — so the sequence below is the instrument for the
+// guarantee and the mutation above is the instrument for the reach. Neither
+// stands in for the other.
+TEST_CASE("A2-3 ledger: the fill CONSUMES the propose, so a second fill is stale") {
+  vllm::v1::ProposedDraftLedger ledger;
+
+  // Nothing has proposed. Every request is stale, which is what the very first
+  // step of a spec engine looks like and what the pre-A2-3 refusal caught.
+  CHECK_FALSE(ledger.IsFresh("a"));
+  CHECK(ledger.size() == 0u);
+
+  // A propose ran and wrote rows for two of the three requests in the batch.
+  ledger.Record({"a", "b"});
+  CHECK(ledger.IsFresh("a"));
+  CHECK(ledger.IsFresh("b"));
+  CHECK_FALSE(ledger.IsFresh("c"));
+
+  // THE FILL USES THEM. This is the step that is allowed to splice.
+  ledger.Consume();
+
+  // THE STEP THAT SKIPS THE PROPOSE. The drafts are still sitting in
+  // `InputBatch::draft_tokens` and `num_valid_draft_tokens` still counts them,
+  // so every check `FillDraftsForRow` makes is still satisfied — and this is the
+  // input the pre-A2-3 fill threw on. Without the Consume above, the ledger would
+  // answer for a propose that belongs to the PREVIOUS verify step.
+  CHECK_FALSE(ledger.IsFresh("a"));
+  CHECK_FALSE(ledger.IsFresh("b"));
+
+  // A new propose makes them fresh again, and only the requests it named.
+  ledger.Record({"b", "c"});
+  CHECK_FALSE(ledger.IsFresh("a"));
+  CHECK(ledger.IsFresh("b"));
+  CHECK(ledger.IsFresh("c"));
+}
+
+TEST_CASE("A2-3 ledger: Record REPLACES, and a propose that drafted nothing clears") {
+  vllm::v1::ProposedDraftLedger ledger;
+
+  // Record must not merge. A request this propose stopped drafting for is not
+  // fresh, and merging would let its previous row keep passing — the same stale
+  // splice by another route.
+  ledger.Record({"a", "b"});
+  ledger.Record({"b"});
+  CHECK_FALSE(ledger.IsFresh("a"));
+  CHECK(ledger.IsFresh("b"));
+  CHECK(ledger.size() == 1u);
+
+  // `clear_draft_tokens` is the end of a propose arm that produced nothing, so
+  // nothing is fresh afterwards. It is not the same event as a fill's Consume,
+  // but it leaves the same state, and both must.
+  ledger.Clear();
+  CHECK_FALSE(ledger.IsFresh("b"));
+  CHECK(ledger.size() == 0u);
+}

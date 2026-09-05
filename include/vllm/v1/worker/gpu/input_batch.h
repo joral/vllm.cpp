@@ -299,10 +299,24 @@ class InputBatch {
   std::vector<int32_t> prefill_len;
 
   // ─── SPEC-DFLASH2 A2-3 (#2911): the per-req_state DRAFT BUFFER ────────────
-  // Mirror of `RequestStates.draft_tokens` (states.py:71-77) and of the
-  // per-request valid count upstream keeps beside it as
-  // `_num_valid_draft_tokens` (gpu_model_runner.py:883-895), @ pin
+  // Mirror of `RequestStates.draft_tokens`
+  // (vllm/v1/worker/gpu/states.py:71-77, zeroed at :113) @ pin
   // 5559679229bc961848b121ccdeaa8fa5d79bec98.
+  //
+  // `num_valid_draft_tokens` BESIDE IT HAS NO UPSTREAM COUNTERPART, and the
+  // anchor this comment used to give for it was wrong. A2-3 cited
+  // `gpu_model_runner.py:883-895`; at the pin those lines are the LEGACY
+  // runner's n-gram-GPU async D2H buffer set (`_num_valid_draft_tokens`,
+  // `_num_valid_draft_tokens_cpu`, its event and its copy stream), allocated
+  // only when `speculative_config.use_ngram_gpu()`, and they are not a
+  // per-req_state count paralleling `states.draft_tokens` at all. The NEW
+  // runner keeps no such count: it takes each row's draft length from the
+  // scheduler's own `scheduled_spec_decode_tokens`
+  // (`vllm/v1/worker/gpu/model_runner.py:941-949`), which we cannot, because
+  // under async scheduling that list is `-1` placeholders and the count of what
+  // this runner actually proposed is exactly what the fill needs. It is our
+  // construct, named after upstream's, and it is recorded as a divergence here
+  // rather than dressed as a mirror.
   //
   // WHAT IT IS FOR. Two consumers need to agree on what this runner drafted:
   // the async placeholder fill in `execute_model`, and

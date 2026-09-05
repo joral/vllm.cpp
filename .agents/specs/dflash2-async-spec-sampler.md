@@ -141,6 +141,46 @@ refusal it now hits is the one guarding the unwired draft buffer, which is
 A2-3's half of reason B rather than A2-2's; the sampler still has no verify arm
 either, and that half simply no longer gets the chance to refuse first.
 
+### The CUDA arms' null `cu_num_logits`, measured on the A2-3 REPAIR head
+
+A fresh review returned FAIL on A2-3 because both CUDA arms passed
+`/*cu_num_logits=*/nullptr` where the host arm passed `step.cu_num_logits`. The
+kernel reads a null as arange, so `num_logits` is 1, `num_draft_tokens` is 0 and
+`logits_start` is `query_end - 1` — the last draft slot on a verify step. This is
+the mutation that made that executable rather than argued.
+
+**The instrument is the HOST arm, because it is the only one this box builds**
+(no `nvcc`). Passing an arange `cu_num_logits` to it is byte-for-byte the null's
+kernel meaning, stated by `cuda_combine_tokens.cu:69-79` itself. So the mutation
+is: delete the veto at both construction sites (which is **M**, and gives the
+combine a real verify step with a correctly sized buffer), then swap the host
+arm's `step.cu_num_logits` for `arange(num_reqs + 1)`. Both variants were built
+and run at the repair head; `runner.cpp` was restored between them and its md5
+`8267057a5cb0b28b4101551e349d290c` read the same before and after.
+
+| run | cases | assertions | exit | `[SPECTRACE]` lines |
+|---|---|---|---|---|
+| **M** alone (the repaired shape) | 9 of 10 passed | 118 passed, 0 failed | 1 | 192 |
+| **M** + arange (the pre-repair shape) | 9 of 10 passed | 118 passed, 0 failed | 1 | 185 |
+
+**The suite cannot tell them apart, and the traces can.** Under the pre-repair
+shape each verify block's last draft slot holds the PREVIOUS step's emitted
+token, with the `emit=` column unchanged over the same rows:
+
+| position | repaired `draft=[...]` | pre-repair shape | previous step's `emit` |
+|---|---|---|---|
+| 4 | `6` | `5` | `5` |
+| 5 | `11` | `3` | `3` |
+| 6 | `7` | `9` | `9` |
+| 7 | `5` | `18` | `18` |
+
+which is the reason-A table below, position for position, twelve waves later and
+on a second call site. The `k=3` blocks show it in the last slot only:
+`[ 6 18 5 ]` becomes `[ 6 18 22 ]`, `[ 10 3 5 ]` becomes `[ 10 3 12 ]`, and 12 is
+the previous step's emit. Nothing raises, both arms pass 118 of 118 identity
+assertions, and only ACCEPTANCE moves — on the row whose entire measured gap is
+acceptance and throughput.
+
 ### Reason B: the async sampler has no verify arm at all — CLOSED BY A2-2
 
 **Historical from here down.** This subsection records the state A2-1 left and
@@ -357,14 +397,114 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
 - **A2-3's two CUDA combine arms are WIRED and UNBUILT.** No `nvcc` on the CPU
   box this wave ran on, and no `rc` lease was taken because the wave is
   CPU-gateable in full and the fleet was needed for measurement. No `.cu` file is
-  edited — `LaunchCombineSampledAndDraftTokens` already took `draft_tokens` and
-  its stride, and A2-3 only stops passing null — so the unbuilt surface is the
-  two `#ifdef VLLM_CPP_CUDA` blocks in `runner.cpp`: the device mirror's
-  `draft_tokens` allocation, its per-step `stage_upload`, its entry in the
-  destructor's free list, and the host-array arm's pointer. The host arm below
-  them takes the identical buffer and IS built and gated, so the two device arms
-  are the same call with a different residence. Risk bounded to a compile
-  failure. Owner: row `SPEC-DFLASH2`, issue #2911.
+  edited — `LaunchCombineSampledAndDraftTokens` already took `draft_tokens`, its
+  stride and `cu_num_logits` — so the unbuilt surface is what sits inside the two
+  `#ifdef VLLM_CPP_CUDA` blocks in `runner.cpp`: the two launch calls and the two
+  `stage_upload`s beside them. The device mirror's ALLOCATIONS and its entries in
+  the destructor's free list are outside the `#ifdef` and are compiled here.
+
+  **THE CLAIM THIS ENTRY USED TO MAKE WAS FALSE, and a fresh review returned FAIL
+  on it.** It said the two device arms were "the same call with a different
+  residence" with the "risk bounded to a compile failure". They were the same
+  BUFFER with a different `cu_num_logits`: the host arm passed the real
+  per-request `step.cu_num_logits` and both device arms passed
+  `/*cu_num_logits=*/nullptr`. `src/vt/cuda/cuda_combine_tokens.cu:69-79` reads a
+  null as arange, giving `num_logits == 1`, `num_draft_tokens == 0` and
+  `logits_start == query_end - 1` — which on a verify step IS the last draft
+  slot. So the first step after A2-5 lifts the veto, on GB10's integrated
+  production default, the device arms would have written the committed token over
+  the last draft and scattered NOTHING, while the host arm wrote it at
+  `query_end - (1 + k)` and scattered k drafts. That is reason A returning by a
+  second route, it compiles cleanly, and it is invisible to every token gate here.
+
+  **FIXED, not documented.** Both arms now read the same `cu_num_logits` the host
+  arm does — the UMA arm takes the host pointer, like `prefill_len` beside it; the
+  mirror arm uploads it into a new `AsyncDeviceInputs::cu_num_logits` exactly as
+  it uploads `query_start_loc`, the same `num_reqs + 1` extent — through ONE local
+  so the two cannot be edited apart. `step.cu_num_logits` is the arange on the
+  non-speculative path (`prepare_inputs.cpp:213`), so the change is inert for
+  every engine running today. A refusal was rejected as the repair: it would be
+  unbuilt here too, and it would leave A2-5 making this exact edit at these exact
+  two call sites with no mutation to check it against. A built assertion covers
+  the remaining silent route — every arm's only source of a row's `num_logits` is
+  this vector, so `execute_model` now refuses a combine whose
+  `step.cu_num_logits` does not hold `num_reqs + 1` entries, ahead of the arm
+  selection and outside the `#ifdef`. THE MEASUREMENT is under `## What was
+  measured`. Owner: row `SPEC-DFLASH2`, issue #2911.
+- **The fill's FIRST refusal was deleted by A2-3, not restated, and the header
+  said otherwise. FIXED.** `prepare_inputs.h` claimed the fill carried "the
+  pre-A2-3 pair of refusals, restated on the buffer". It carried one of them.
+  The deleted one was
+  `VT_CHECK(own_it != own.end(), "no drafts proposed for request '…'
+  (placeholders scheduled without a matching propose)")` over a map built from
+  `pending_drafts_`; because `take_draft_token_ids` MOVES that object out, it
+  meant "a propose ran for this request since the last time anyone looked". A2-3
+  rehomed the same MESSAGE onto `input_batch_.req_id_to_index.find(req_id)`,
+  which asks whether the request is in the persistent batch — nearly always true.
+
+  Freshness then rested only on `num_valid_draft_tokens`, which survives the pull
+  BY DESIGN and is zeroed only by `clear_draft_tokens`. Any step that skips the
+  propose leaves the count standing and `FillDraftsForRow` splices the PREVIOUS
+  verify step's drafts into this step's placeholders — silently, verify being
+  lossless. Pre-A2-3 that input threw by name. It is live as soon as the async
+  decode arm's gap (the entry below) is fixed for step one but a later step skips
+  a propose, or the scheduler and the runner disagree by one.
+
+  RESTORED rather than documented. `ProposedDraftLedger` (`prepare_inputs.h`)
+  records the req_ids the most recent propose wrote; `set_draft_tokens` calls
+  `Record`, `clear_draft_tokens` calls `Clear`, and the fill calls `IsFresh` then
+  `Consume`, clearing it after use — exactly as `take_draft_token_ids` consumes
+  `pending_drafts_`, which is where the old freshness came from. The refusal keeps
+  the pre-A2-3 wording so a reader who has seen it before recognises it, and what
+  `FillDraftsForRow` can and cannot answer is now stated on that function.
+
+  **THE REACH AND THE RULE ARE GATED SEPARATELY, and neither stands in for the
+  other.** REACH: forcing the runner's refusal false reds `test_mtp_depth` 5 of
+  10 and `test_dflash2_runner_reach` 9 of 10 — the same counts the producer-write
+  mutation gives, because it is the same production filled step, so the line runs
+  on every step the fill patches. RULE: `Consume` made a no-op reds
+  `test_draft_fill.cpp:241-242` on two `CHECK_FALSE(ledger.IsFresh(...))`, and
+  `Record` merging instead of replacing reds `:259` and `:261`. **What NOTHING in
+  this tree gates is the two together**: deleting the refusal outright is SILENT
+  across `test_mtp_depth`, `test_dflash2_runner_reach`, `test_engine_core_proc`,
+  `test_runner` and `test_dflash_causality`, because no CPU-tier suite drives a
+  step that skips its propose through `execute_model`. Recorded rather than
+  claimed. Mutation **M** is the nearest thing to that step, and at the repair
+  head it throws the restored refusal by name (`## Now`). Owner: row
+  `SPEC-DFLASH2`, issue #2911.
+- **`test_verify_route_predicate.cpp` described a refusal that no longer exists
+  and re-derived the predicate it was written to keep single. FIXED.** The case
+  said the site refuses because "the draft buffer … is not wired yet (A2-3,
+  #2644)" — false since A2-3 wired it, and the wrong issue, because #2911 owns
+  A2-3 and #2644 owned A2-1. It then hand-copied
+  `const bool refuses = !StepRoutesToVerify(StepTotal(mixed));` and asserted it
+  false, which is a SECOND expression of the rule this file exists to keep single
+  (#2710) and, since A2-3 made the site's condition
+  `!StepRoutesToVerify(...) || <the buffer covers the pool>`, was not even the
+  site's rule any more. The case now states the current condition, reads the
+  route once, and drops the partition claim; `test_verify_route_predicate` goes
+  from 21 assertions to 20 and stays green. Owner: row `SPEC-DFLASH2`, issue
+  #2911.
+- **The device mirror's destructor freed seven pointers with no drain, and said
+  it was safe. FIXED.** `~GPUModelRunner` called `b.Free(p)` over the
+  `AsyncDeviceInputs` list with no `Synchronize` and no event wait, and the
+  struct's header argued the safety from "the runner and therefore its queue are
+  going away". That is not an argument: the runner does not own `queue_`, does
+  not destroy it and does not drain it — only `async_copy_queue_` is destroyed
+  here, and before the frees. A kernel queued against those buffers is still
+  queued. It is the same defect `20d225e54` repaired one level down in
+  `RejectionSamplerDeviceOutput::Release`, which is on `main` and sets the
+  standard.
+
+  PRE-EXISTING for six of the pointers; A2-3 added the seventh (`draft_tokens`)
+  AND wrote the rejected reasoning down as a lifetime proof, which is what turns
+  a carried gap into a contradiction between two files. `~GPUModelRunner` now
+  drains `queue_` before the first `Free`, and the header says the drain is the
+  guarantee. WHAT IT COSTS: one full main-queue drain per runner destruction —
+  once in a process's life for the ordinary single-runner server, paid at
+  TEARDOWN with no request in flight, so it is off every serving path. Same trade
+  as the `Release` repair: an observable stall instead of an unobservable wrong
+  answer. Owner: row `SPEC-DFLASH2`, issue #2911.
 - **`sample_tokens_async`'s DECODE arm never proposes, and A2-5 is blocked on
   it.** FOUND BY A2-3 (#2911), which is the first wave whose measurement could
   see it. A2-2 gave the async sampler a verify arm and put
@@ -735,9 +875,17 @@ with.
 
 **A2-3 has landed** (#2911). `InputBatch` carries the drafts' residence: a
 per-req_state `draft_tokens` buffer of `[max_num_reqs, num_speculative_steps]`
-row-major, with a `num_valid_draft_tokens` count beside it, mirroring
-`RequestStates.draft_tokens` (states.py:71-77) and upstream's
-`_num_valid_draft_tokens` (gpu_model_runner.py:883-895). It is zeroed for a slot
+row-major, mirroring `RequestStates.draft_tokens` (states.py:71-77), with a
+`num_valid_draft_tokens` count beside it that has NO upstream counterpart. A2-3
+anchored that count on `gpu_model_runner.py:883-895` and the anchor is wrong,
+checked at the pin: those lines are the LEGACY runner's n-gram-GPU async D2H
+buffer set, gated on `speculative_config.use_ngram_gpu()`, not a per-req_state
+count paralleling `states.draft_tokens`. The new runner keeps no such count and
+reads each row's draft length off the scheduler's own
+`scheduled_spec_decode_tokens` (`vllm/v1/worker/gpu/model_runner.py:941-949`);
+we cannot, because under async scheduling that list is `-1` placeholders and how
+many drafts this runner actually proposed is precisely what the fill needs. The
+claim is dropped rather than re-anchored. It is zeroed for a slot
 at admission, moves with the request through `condense`, swaps through
 `swap_states`, and is sized by the req_state POOL rather than by `num_reqs` —
 which is the sizing that makes the CUDA scatter's unbounded row read safe, the
@@ -758,20 +906,41 @@ argument for the first time.
 producer's write reds `test_mtp_depth` (5 of 10 cases, exit 1) and
 `test_dflash2_runner_reach` (9 of 10, exit 1), both throwing the fill's refusal
 by name at `prepare_inputs.cpp` — the fill is reached from `execute_model` and
-the gate can see it. Sizing the buffer by one row instead of the pool reds the
-sizing case in `test_input_batch` on `CHECK( 3 == 24 )` and leaves
-`test_mtp_depth` GREEN, which is the `num_reqs == 1` blindness made executable
-and the reason that assertion is on the SIZE and not on behaviour. Taking the
-fill's width from the stride instead of the placeholder count reds two
-`test_draft_fill` cases, one of them the MIXED `num_reqs == 3` step.
+the gate can see it. Sizing the buffer one row short of the pool reds the sizing
+case in `test_input_batch` on `CHECK( 21 == 24 )`, twice in one case
+(`test_input_batch.cpp:299` and `:308`), and leaves `test_mtp_depth` GREEN —
+which is the `num_reqs == 1` blindness made executable and the reason that
+assertion is on the SIZE and not on behaviour. **The `CHECK( 3 == 24 )` this
+paragraph and A2-3's commit body both quoted was the WRONG mutation's value**; 3
+is what a buffer sized by `num_reqs` after a single admission yields, and one row
+short of the pool yields 21. The commit body is history and cannot be repaired;
+this is the correction, measured at the repair head. Taking the fill's width from
+the stride instead of the placeholder count reds two `test_draft_fill` cases, one
+of them the MIXED `num_reqs == 3` step.
+
+**BOTH OF THOSE MUTATIONS PROVE A BLINDNESS, and that is the point of them.** The
+sizing mutation leaves every behavioural suite green and the width mutation is
+seen only by `test_draft_fill`. The CUDA scatter's unbounded row read has NO
+behavioural gate anywhere in this tree, on any tier, so the sizing assertion is
+the whole instrument for it and it asserts a SIZE deliberately. Do not read
+either mutation as evidence that a behavioural suite would catch a resizing.
 
 **The draft scatter is still UNREACHED, and A2-5 is the wave that reaches it.**
 A2-3 supplied the buffer; it did not lift the veto, which it was scoped not to
-touch. Mutation **M** at this head is red for a THIRD reason, and the move is the
-result worth recording: `test_mtp_depth` goes to 9 of 10 passed / 118 assertions
-(against 5 of 10 failed / 29 assertions at the A2-2 head), `async input combine:`
-does not appear in the output at all, and the single failure is the fill
-refusing because `sample_tokens_async`'s DECODE arm never proposes. The combine
-now accepts a verify step. Both remaining gaps are `## Owed` entries above.
+touch. Mutation **M** at the repair head is red for a THIRD reason, and the move
+is the result worth recording: `test_mtp_depth` goes to 9 of 10 passed / 118
+assertions (against 5 of 10 failed / 29 assertions at the A2-2 head), `async
+input combine:` does not appear in the output at all, and the single failure is
+the fill refusing because `sample_tokens_async`'s DECODE arm never proposes. The
+combine now accepts a verify step. Both remaining gaps are `## Owed` entries
+above.
+
+The refusal M hits has MOVED AGAIN with the fill's freshness repair below, and
+the count has not: it is now `runner.cpp`'s restored `async draft fill: no drafts
+proposed for request 'req' (placeholders scheduled without a matching propose)`
+rather than `prepare_inputs.cpp`'s `proposed 0 drafts but the scheduler placed 2
+placeholders`. Same case, same 9 of 10 / 118 assertions / exit 1, and the new
+message names the decode-arm gap directly instead of describing its downstream
+symptom.
 
 A2-4 is the next wave, and the decode-arm gap above is what A2-5 is blocked on.

@@ -274,8 +274,12 @@ TEST_CASE("swap_states swaps last_sampled_tokens + prefill_len") {
 // Mirrors `RequestStates.draft_tokens` (vllm/v1/worker/gpu/states.py:71-77 @ pin
 // 5559679229bc961848b121ccdeaa8fa5d79bec98), the persistent
 // [num_req_states, num_speculative_steps] tensor the combine's draft scatter
-// reads, plus the per-slot valid count upstream carries separately as
-// `_num_valid_draft_tokens` (gpu_model_runner.py:883-895).
+// reads. The per-slot valid count beside it is OURS and has no upstream twin:
+// the anchor A2-3 gave for it, `gpu_model_runner.py:883-895`, is the LEGACY
+// runner's n-gram-GPU D2H buffer set at that pin, and the new runner takes each
+// row's draft length from the scheduler's list instead
+// (`vllm/v1/worker/gpu/model_runner.py:941-949`) — which we cannot, because
+// under async scheduling that list is `-1` placeholders.
 //
 // WHY THE SIZING IS AN ASSERTION AND NOT AN IMPLEMENTATION DETAIL. The combine's
 // scatter indexes `draft_tokens[req_state_idx * stride + b]`, and its CUDA
