@@ -201,7 +201,45 @@ recomputing them warm-only moves them by less than the round-to-round spread.
 
 ## Realised prompt-length histogram
 
-Pending.
+**The published histogram is the one the servers count**, from
+`usage.prompt_tokens`, and it is pending with the run. Each engine renders its
+own chat template, which adds tokens neither the corpus nor a local tokenizer
+sees.
+
+The corpus's own shape is not pending. Measured with the target checkpoint's
+`tokenizer.json` by `benchmarks/variadic/corpus_tokens.py`, over the raw prompt
+text of the 144-prompt corpus at seed 0, sha256
+`6d6420fc4c0a55019dc24da3dd5b410e2743a6b268f2ee2fb2c89ae21d3cfc5e`:
+
+| band | n | min | p50 | p90 | max | mean |
+|---|---|---|---|---|---|---|
+| `S` | 50 | 26 | 56 | 79 | 108 | 58 |
+| `M` | 58 | 43 | 118 | 224 | 407 | 134 |
+| `L` | 22 | 687 | 878 | 1070 | 1087 | 882 |
+| `XL` | 14 | 2237 | 2928 | 3094 | 3233 | 2804 |
+| **all** | 144 | 26 | 108 | 1083 | 3233 | 481 |
+
+| prompt tokens | prompts |
+|---|---|
+| 0-127 | 84 |
+| 128-255 | 21 |
+| 256-511 | 3 |
+| 512-1023 | 18 |
+| 1024-2047 | 4 |
+| 2048 and up | 14 |
+
+The shortest prompt is 26 tokens and the longest is 3,233, a span of 124x, with
+a median of 108 and a mean of 481. The predecessor's whole workload is the `M`
+band alone: 43 to 407 tokens.
+
+That gap between the median and the mean is the point of the mix. A quarter of
+the corpus is above 512 tokens and carries most of the prefill, while more than
+half of it is under 128 tokens, so the scheduler sees short and long requests in
+the same queue rather than one length repeated.
+
+The longest prompt plus 192 output tokens plus a chat template fits inside the
+8,192-token `--max-model-len` the run pins, which is what this measurement was
+taken to check before a lease was spent on finding out.
 
 ## Throughput and the round-to-round spread
 
