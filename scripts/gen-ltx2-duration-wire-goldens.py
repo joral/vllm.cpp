@@ -521,6 +521,128 @@ def cpp_lines(up) -> list[str]:
     add("inline constexpr bool kLtx2RequireNumFramesAllowsAutoWithHead = true;")
     add("")
 
+    # ── The bf16 arm (row LTX25-A24-DURATION-HEAD-BF16, #2955) ───────────────
+    add("")
+    add("// ── A24 WAVE 6: THE bf16 ARM ────────────────────────────────────────")
+    add("//")
+    add("// Upstream resolves ONE pipeline dtype and it is bfloat16")
+    add("// (distilled.py:109), handed to DurationPredictor.from_checkpoint at")
+    add("// :163-165. Every one of the head's fifteen parameters narrows under")
+    add("// `.to(bfloat16)`, so upstream's head IS a bf16 module.")
+    add("//")
+    add("// THE OUTPUT IS A FUNNEL AND THAT IS WHY THIS TABLE HAS NINE ROWS.")
+    add("// The head returns one bf16 scalar per batch row, through `exp`. Eight")
+    add("// mantissa bits applied once to a single number absorb almost every")
+    add("// intermediate difference: on the shipped widths at a QUIET amplitude")
+    add("// the correct chain reproduces upstream bit-exactly and so does every")
+    add("// wrong rule but the last. Row 4 below is exactly that fixture, kept")
+    add("// deliberately, and its `separating` mask is 1 -- it is the control")
+    add("// that says the funnel is real rather than a story.")
+    add("//")
+    add("// SO COVERAGE IS PER RULE ACROSS FIXTURES, NEVER PER FIXTURE, and the")
+    add("// generator REFUSES to emit when any rule reaches zero.")
+    add("struct Ltx2DurBf16Case {")
+    add("    int64_t video_dim; int64_t audio_dim; int64_t hidden;")
+    add("    int64_t queries; int64_t heads; int64_t mlp_hidden;")
+    add("    int64_t video_tokens; int64_t audio_tokens;")
+    add("    double amplitude; double token_scale;")
+    add("    // Upstream's own bf16 answer, and the seven rejected rules beside it")
+    add("    // in the order kLtx2DurBf16RuleNames gives.")
+    add("    float upstream;")
+    add("    float rejected[7];")
+    add("};")
+    add("inline constexpr const char* kLtx2DurBf16RuleNames[7] = {")
+    for rule in BF16_RULES:
+        add(f'    "{rule}",')
+    add("};")
+    add("inline constexpr Ltx2DurBf16Case kLtx2DurBf16Cases[] = {")
+
+    torch = up.torch
+    coverage = {rule: 0 for rule in BF16_RULES}
+    not_exact: list[str] = []
+    emitted = 0
+    for cand in BF16_CANDIDATES:
+        vdim, adim, hidden, queries, heads, mlp, v_count, a_count, amp, tscale = cand
+        cfg = (vdim, adim, hidden, queries, heads, mlp)
+        head = up.DurationHead(*cfg)
+        bf16_fill(up, head, amp)
+        head.eval()
+        # CAPTURED BEFORE ANY CAST. Reading a parameter after `.to(bfloat16)`
+        # narrows it in place and yields a false 0/0; four sessions in this
+        # family have hit that trap.
+        params = {name: p.detach().clone() for name, p in head.named_parameters()}
+        video = bf16_tokens(up, v_count, vdim, 0.0, tscale) if v_count else None
+        audio = bf16_tokens(up, a_count, adim, 1.7, tscale) if a_count else None
+        narrow = up.DurationHead(*cfg)
+        with torch.no_grad():
+            for name, p in narrow.named_parameters():
+                p.copy_(params[name])
+            narrow = narrow.to(torch.bfloat16)
+            narrow.eval()
+            answer = float(narrow(
+                video.to(torch.bfloat16) if video is not None else None,
+                audio.to(torch.bfloat16) if audio is not None else None).float()[0])
+            correct = float(bf16_chain(up, params, cfg, video, audio, "correct")[0])
+            rejected = {r: float(bf16_chain(up, params, cfg, video, audio, r)[0])
+                        for r in BF16_RULES}
+        # THE CANDIDATE LIST IS FIXED, NOT FILTERED. A fixture that stops
+        # reproducing reds HERE rather than being silently dropped, because a
+        # generator that quietly emits fewer cases is a mute switch with a
+        # changelog.
+        if correct != answer:
+            not_exact.append(f"{cand} -> chain {correct!r} vs upstream {answer!r}")
+            continue
+        separating = [r for r in BF16_RULES if rejected[r] != answer]
+        for r in separating:
+            coverage[r] += 1
+        emitted += 1
+        values = ", ".join(f"{rejected[r]:.9g}f" for r in BF16_RULES)
+        add(f"    {{{vdim}, {adim}, {hidden}, {queries}, {heads}, {mlp}, "
+            f"{v_count}, {a_count}, {amp!r}, {tscale!r}, {answer:.9g}f, "
+            f"{{{values}}}}},  // separates {len(separating)}: "
+            f"{','.join(separating) or 'NOTHING (the funnel control)'}")
+    add("};")
+
+    if not_exact:
+        raise SystemExit(
+            "REFUSING TO EMIT: these bf16 fixtures no longer reproduce upstream "
+            "bit-exactly, so the table would gate a band it never measured:\n  "
+            + "\n  ".join(not_exact))
+    zero = [r for r in BF16_RULES if coverage[r] == 0]
+    if zero:
+        raise SystemExit(
+            "REFUSING TO EMIT: rule(s) " + ", ".join(zero) + " are separated by NO "
+            "fixture in this table. A rejected column equal to upstream's answer at "
+            "every row cannot fail, and a gate built on it is decoration. Add a "
+            "fixture that separates it or record it unmeasurable by name.")
+    add("// How many of the emitted fixtures separate each rule, in the order")
+    add("// kLtx2DurBf16RuleNames gives. The test asserts every entry is non-zero,")
+    add("// so this is the blast radius a mutation of that rule must produce -- it")
+    add("// named the count BEFORE the mutation was run.")
+    add("inline constexpr int kLtx2DurBf16RuleCoverage[7] = {"
+        + ", ".join(str(coverage[r]) for r in BF16_RULES) + "};")
+    add(f"inline constexpr int kLtx2DurBf16CaseCount = {emitted};")
+    add("")
+    add("// THE `query_tokens` NARROWING IS UNMEASURABLE BY ANY VALUE GATE HERE,")
+    add("// and it is recorded as a COUNT rather than pretended away. Holding the")
+    add("// pooler's learnable queries at f32 instead of narrowing them separates")
+    add("// in 0 of 93 bit-exact pooler fixtures: the difference is absorbed by the")
+    add("// rounding of its own projection. The parameter genuinely narrows, and")
+    add("// the entry count below is the control that says so -- a probe that")
+    add("// reported zero here would be blind rather than reassuring.")
+    qt_head = up.DurationHead(4096, 2048, 256, 1, 4, 256)
+    bf16_fill(up, qt_head, 0.18)
+    with torch.no_grad():
+        before = qt_head.attention_pooler.query_tokens.detach().clone()
+        after = before.to(torch.bfloat16).float()
+        moved = int((before != after).sum())
+    if moved == 0:
+        raise SystemExit(
+            "REFUSING TO EMIT: query_tokens moved in 0 entries under `.to(bfloat16)`, "
+            "so the count control is blind and cannot say the narrowing happens at all")
+    add(f"inline constexpr int kLtx2DurBf16QueryTokensNarrowedEntries = {moved};")
+    add(f"inline constexpr int kLtx2DurBf16QueryTokensCount = {before.numel()};")
+    add("")
     # ── AutoDuration's defaults ──────────────────────────────────────────────
     default = up.AutoDuration()
     add("// AutoDuration's defaults (utils/types.py:116-124), read off the class.")
