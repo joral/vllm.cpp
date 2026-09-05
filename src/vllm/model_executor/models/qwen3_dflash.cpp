@@ -1792,9 +1792,11 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     // Not wrong, just wasteful, which is exactly the kind of defect that
     // survives a token gate. Asking here makes the switch select this driver's
     // existing single-forward eager path, which is what it means everywhere else.
+    // The TT captured arm of this family is not gated (#2812): explicit opt-in only.
     const bool graph_ok =
         UseDflashGraph() && vt::GraphCaptureEnabled() && d.b.SupportsGraphCapture() &&
-        platforms::GetPlatform(queue.device.type).support_static_graph_mode();
+        platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
+        !platforms::GetPlatform(queue.device.type).static_graph_requires_opt_in();
 
     // --- Eager paged path (VT_DFLASH_GRAPH=0, VLLM_CPP_CUDAGRAPH=0, or capture
     //     unsupported) --------------------------------------------------------
