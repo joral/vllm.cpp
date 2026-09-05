@@ -1,0 +1,36 @@
+=== MUTATION: percentile -> nearest rank ===
+FAIL: test_a_nearest_rank_implementation_would_fail_this (__main__.PercentileContract.test_a_nearest_rank_implementation_would_fail_this)
+FAIL: test_matches_hand_computed_linear_interpolation (__main__.PercentileContract.test_matches_hand_computed_linear_interpolation)
+Ran 19 tests in 22.471s
+FAILED (failures=2)
+=== MUTATION: warmup phase merged into the measured window ===
+FAIL: test_an_engine_without_metrics_falls_back_to_usage (__main__.AcceptanceFromMetrics.test_an_engine_without_metrics_falls_back_to_usage)
+FAIL: test_the_metrics_delta_becomes_a_rate (__main__.AcceptanceFromMetrics.test_the_metrics_delta_becomes_a_rate)
+FAIL: test_concurrency_four_really_overlaps (__main__.ClosedLoopConcurrency.test_concurrency_four_really_overlaps)
+FAIL: test_concurrency_one_never_overlaps (__main__.ClosedLoopConcurrency.test_concurrency_one_never_overlaps)
+FAIL: test_measured_wall_clock_excludes_the_warmup_phase (__main__.WarmupIsExcluded.test_measured_wall_clock_excludes_the_warmup_phase)
+FAIL: test_measured_window_holds_no_warmup_request (__main__.WarmupIsExcluded.test_measured_window_holds_no_warmup_request)
+Ran 19 tests in 23.500s
+FAILED (failures=6)
+=== MUTATION: concurrency ignored: always one worker ===
+=== MUTATION: token count taken from the chunk count ===
+FAIL: test_first_chunk_tokens_tracks_the_servers_granularity (__main__.ChunkingIsRecovered.test_first_chunk_tokens_tracks_the_servers_granularity)
+FAIL: test_the_coarse_engine_pays_for_its_chunking_in_raw_ttft (__main__.ChunkingIsRecovered.test_the_coarse_engine_pays_for_its_chunking_in_raw_ttft)
+FAIL: test_tokens_per_chunk_comes_from_usage_not_from_the_chunk_count (__main__.ChunkingIsRecovered.test_tokens_per_chunk_comes_from_usage_not_from_the_chunk_count)
+FAIL: test_a_server_without_usage_is_marked_chunks_not_counted_silently (__main__.UsageIsMandatory.test_a_server_without_usage_is_marked_chunks_not_counted_silently)
+Ran 19 tests in 22.407s
+FAILED (failures=4)
+=== MUTATION: absent acceptance reported as zero ===
+FAIL: test_an_engine_exposing_nothing_reports_absent_not_zero (__main__.AcceptanceFromMetrics.test_an_engine_exposing_nothing_reports_absent_not_zero)
+FAIL: test_concurrency_four_really_overlaps (__main__.ClosedLoopConcurrency.test_concurrency_four_really_overlaps)
+FAIL: test_concurrency_one_never_overlaps (__main__.ClosedLoopConcurrency.test_concurrency_one_never_overlaps)
+Ran 19 tests in 22.789s
+FAILED (failures=3)
+=== MUTATION: TTFT correction dropped ===
+FAIL: test_the_coarse_engine_pays_for_its_chunking_in_raw_ttft (__main__.ChunkingIsRecovered.test_the_coarse_engine_pays_for_its_chunking_in_raw_ttft)
+Ran 19 tests in 22.224s
+FAILED (failures=1)
+=== MUTATION: corpus seed ignored ===
+FAIL: test_same_seed_gives_the_same_bytes (__main__.CorpusIsDeterministic.test_same_seed_gives_the_same_bytes)
+Ran 19 tests in 22.106s
+FAILED (failures=1)
