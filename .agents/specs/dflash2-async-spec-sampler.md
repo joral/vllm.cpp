@@ -177,9 +177,28 @@ token, with the `emit=` column unchanged over the same rows:
 which is the reason-A table below, position for position, twelve waves later and
 on a second call site. The `k=3` blocks show it in the last slot only:
 `[ 6 18 5 ]` becomes `[ 6 18 22 ]`, `[ 10 3 5 ]` becomes `[ 10 3 12 ]`, and 12 is
-the previous step's emit. Nothing raises, both arms pass 118 of 118 identity
-assertions, and only ACCEPTANCE moves — on the row whose entire measured gap is
-acceptance and throughput.
+the previous step's emit. Nothing raises and both arms pass 118 of 118 identity
+assertions.
+
+**"Only ACCEPTANCE moves" was measured over THOSE ROWS and it is false over the
+whole run.** A round-3 review took the flattened streams and they differ: at
+`k=1`, positions 9 and 11, the pre-repair shape reads `ns=2 acc=1 draft=[ 1 ]
+emit=[ 1 1 ]` where the repaired shape reads `ns=1 acc=0 emit=[ 1 ]`. The
+corrupted slot holds the COMMITTED token, so it matches and is ACCEPTED, and
+acceptance therefore RISES in this fixture rather than falling. Flattened, the
+pre-repair run emits **198 tokens against the repaired run's 197** — one
+inserted `1`, every other position identical, which is verify being lossless —
+and `[SPECTRACE]` prints 185 lines against 192.
+
+Two things follow and neither is a gate. Tokens-per-step at a fixed step budget
+DOES differ between the shapes, so any statement that the defect is invisible to
+every axis has to be scoped to the per-row `emit=` comparison. And the
+discriminator is unreachable on a committed configuration: seeing it at all
+needs mutation **M**, the veto deleted at both `async_input_combine_`
+assignments, so it can be measured and cannot be committed as a gate. The
+committed instruments stay what they are — `execute_model`'s `cu_num_logits`
+size refusal, which the CPU tier builds and which a review proved non-vacuous
+above `num_reqs == 1`, and G2's id comparison in `test_combine_tokens.cpp`.
 
 ### Reason B: the async sampler has no verify arm at all — CLOSED BY A2-2
 
@@ -250,11 +269,17 @@ defect itself is fixed.
   The sync-scheduler arm (`VT_ASYNC_SCHED=0`) carried it identically, because
   `async_input_combine_` is a runner-level lever that `VT_ASYNC_SCHED` does not
   reach.
-- **No acceptance gate on this fixture can see this class of defect.** The
-  synthetic MTP head in `test_mtp_depth` accepts nothing: every traced block
-  reads `ns=1 acc=0` in the baseline as well. The acceptance signal has zero
-  dynamic range here, so a draft-token comparison, not an acceptance ratio, is
-  the only CPU instrument that discriminates. That is what G2 is.
+- **No COMMITTED acceptance gate on this fixture can see this class of defect,
+  and the "zero dynamic range" reason for that was too strong.** The synthetic
+  MTP head in `test_mtp_depth` accepts nothing in the ordinary baseline — every
+  traced block reads `ns=1 acc=0` — but the round-3 measurement above shows the
+  corrupted shape reaching `ns=2 acc=1` at two `k=1` positions and emitting one
+  extra token over the run, because the committed token spliced into a draft slot
+  matches itself. So the signal is not identically zero; it is only reachable
+  under mutation **M**, its sign is an artefact of what the corruption happens to
+  overwrite, and it says nothing about WHICH id is wrong. A draft-token
+  comparison, not an acceptance ratio, is therefore still the instrument. That is
+  what G2 is.
 
 ## Upstream anchors
 
@@ -826,8 +851,31 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   the class is invisible on the CPU tier and on any unified-memory backend,
   where the kernels have already finished. Owner: no row yet; tracked by issue
   [#2916](https://github.com/mudler/vllm.cpp/issues/2916).
-- **The `nsys` read (G4).** Needs `dgx:gpu0` under an `rc` lease. Not taken
-  here; the task that produced this spec was explicitly denied a device.
+- **`~GPUModelRunner` destroys the copy queue and the two verify events BEFORE
+  it drains.** `DestroyQueue(async_copy_queue_)` and the two `DestroyEvent` calls
+  run ahead of the mirror's `b.Synchronize(queue_)`, so A2-3's drain protects the
+  mirror's buffers and protects neither of them. PRE-EXISTING and untouched here:
+  A2-3's round-3 repair owns the drain's CLAIM, not the destructor's ordering,
+  and reordering the teardown is a separate change with its own mutation. It is
+  the same class as the `#2916` entry above and closing it needs the same GPU
+  tier, because on the CPU build `async_device_inputs_` is always null and the
+  block never executes at all. Owner: this row, wave A2-4, which is the wave that
+  moves waits in this destructor.
+- **The drain is COMPILED here and EXECUTED on neither tier.** Deleting it leaves
+  all eleven G1 targets green, on the CPU build because
+  `async_device_mirror()`'s body is inside `#ifdef VLLM_CPP_CUDA` and on the CUDA
+  build because this box has no `nvcc`. Its correctness rests on reading — sole
+  destruction path, right queue, correctly scoped, no double drain, no deadlock —
+  and it stays owed a device run.
+- **The `nsys` read (G4).** RUN, by the operator holding the device; this wave
+  took no lease and measured no device, so the number below is recorded from that
+  run and not from this one, and the run's own recipe and evidence belong with it.
+  The decode GPU reads **96.01% busy**, and this spec's threshold is that at or
+  above 95% the throughput half of the A2 premise is refuted outright. A2-4 and
+  A2-5 are STOPPED on it, and A2-3 lands for its structural value alone: it
+  discharges A2-1's `## Owed` and removes a reason-A hazard. No wave in A2 may
+  quote a throughput result against this reading. What is still owed here is the
+  run's recorded recipe, revisions and contention state beside the number.
 
 ## Now
 
@@ -841,6 +889,16 @@ per-request `num_logits` from `cu_num_logits`, carries the
 `[query_end - num_draft_tokens, query_end)`, on both the host and the CUDA side,
 which refuse the same shapes. G2 exists and is green; G1 was green before and
 after. The draft lane is UNREACHED, as the `## Owed` entry above discloses.
+
+**G2 IS FUNCTION-LEVEL AND THIS SENTENCE IS NOT COVERAGE**, which a round-3
+review found it reading as. `test_combine_tokens.cpp:233` says so itself: it
+drives `combine_sampled_and_draft_tokens` directly because the runner cannot
+reach it while the veto stands. It gates the RULE. The nearest end-to-end
+statement is the producer-side round trip A2-3's round-3 repair added
+(`WriteDraftRow` written, `FillDraftsForRow` read back, in `test_draft_fill`)
+plus the count-write mutation that reds `test_mtp_depth` 5 of 10 and
+`test_dflash2_runner_reach` 9 of 10 through `execute_model`. Neither makes the
+combine's draft scatter reached, and nothing here should be read as saying it is.
 
 **A2-2 has landed** (#2802). `RejectionSampler` is split: `verify` issues the
 accept walk and returns a `RejectionSamplerDeviceOutput` whose buffers are still
@@ -942,5 +1000,57 @@ rather than `prepare_inputs.cpp`'s `proposed 0 drafts but the scheduler placed 2
 placeholders`. Same case, same 9 of 10 / 118 assertions / exit 1, and the new
 message names the decode-arm gap directly instead of describing its downstream
 symptom.
+
+**A2-3's THIRD review round is repaired on the same branch, and the wave claims
+no throughput result.** Gate G4 has run on the operator's device — 96.01% busy on
+the decode GPU, against this spec's own threshold that a reading at or above 95%
+refutes the throughput half outright — and A2-4 and A2-5 are STOPPED on it. The
+round-3 repair took no lease and measured no device; every number below is from
+the CPU tier. A2-3 lands for structural value only: it discharges A2-1's
+`## Owed` and removes a reason-A hazard, and nothing in it is offered as a step
+toward the row's 11% gap.
+
+Three of the round-3 findings changed the code.
+
+- **The ledger's consume was fail-OPEN and is now tied to the STEP.**
+  `proposed_drafts_.Consume()` sat inside
+  `if (use_async_scheduling_ && !sched_spec->empty())`, so a step with no
+  placeholders consumed nothing while `Record` stayed unconditional on them. Step
+  N proposes, step N+1 has no placeholders and never proposes (the async decode
+  arm, `## Owed` #2920), step N+2 has placeholders and `IsFresh` answers off step
+  N — a propose two steps old spliced into a later step, which
+  `prepare_inputs.h` asserts the design makes unrepresentable. The mechanism it
+  replaced never behaved that way: `take_draft_token_ids` moves `pending_drafts_`
+  out on EVERY deferred-batch step, gated on `check_for_draft_tokens_` alone
+  (`core_proc.cpp:234`). The loop and the consume are now one function,
+  `FillDraftsForStep`, called on every async-scheduling step INCLUDING the empty
+  one. **Nothing distinguished the two placements before**: the fail-open shape
+  left `test_draft_fill`, `test_mtp_depth`, `test_dflash2_runner_reach`,
+  `test_runner` and `test_engine_core_proc` all green. It now reds one
+  `test_draft_fill` case — `CHECK_THROWS` at the third fill in the sequence
+  Record / empty step / placeholders — and still reds nothing else, which is the
+  blindness stated rather than removed.
+- **The producer's draft-token PAYLOAD had no gate anywhere.** Deleting the
+  `for (int c = 0; c < stride; ++c)` scatter from `set_draft_tokens`, leaving the
+  count write, left all eleven G1 targets green: every draft in the process could
+  be zeroed end to end and nothing red. Payload and count are now one named rule,
+  `WriteDraftRow`, gated as a ROUND TRIP against `FillDraftsForRow` over a buffer
+  seeded with `100*r + c`. Deleting the payload write now reds 2 of 15
+  `test_draft_fill` cases and STILL reds nothing else (7 other targets measured
+  green under it), so the round trip is the whole instrument. Deleting the COUNT
+  write still reds `test_mtp_depth` 5 of 10 and `test_dflash2_runner_reach` 9 of
+  10 by name at the fill's refusal, and deleting either production CALL SITE reds
+  the same two suites identically — the reach is proven, the payload's EFFECT is
+  not observed anywhere but in the round trip.
+- **Three claims were corrected rather than defended.** "`emit=` byte-identical"
+  and "only ACCEPTANCE falls" are true over the four rows the table lists and
+  false over the run; the measured numbers are in `## What was measured` above.
+  The destructor's drain is compiled on the CPU tier and EXECUTED on neither,
+  because `async_device_mirror()`'s body is entirely inside `#ifdef
+  VLLM_CPP_CUDA` and `async_device_inputs_` is therefore always null here; the
+  comment now says so and rests the drain on reading. And the two device arms do
+  NOT "read one local so they cannot be edited apart": the mirror arm passes
+  `dev->cu_num_logits`, which is correct only while its `stage_upload` is present
+  and correctly sized.
 
 A2-4 is the next wave, and the decode-arm gap above is what A2-5 is blocked on.

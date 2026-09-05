@@ -55,6 +55,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <set>
 #include <vector>
 
@@ -407,7 +408,8 @@ inline bool RowCarriesDraftTokens(int32_t row_num_draft_tokens) {
 // PREVIOUS verify step's row and every check above satisfied. The pre-A2-3 fill
 // caught that input by name, from `pending_drafts_`, whose move-out made its
 // membership test a freshness test. `ProposedDraftLedger` below carries that half
-// now, and `GPUModelRunner::execute_model` applies it before it calls this.
+// now, and `FillDraftsForStep` below applies it before it calls this, on every
+// async-scheduling step `GPUModelRunner::execute_model` runs.
 // Splicing a stale draft costs acceptance and raises nothing, verify being
 // lossless, so the guarantee has to live somewhere and it is not here.
 //
@@ -428,6 +430,49 @@ std::vector<int32_t> FillDraftsForRow(const std::vector<int32_t>& draft_tokens,
                                       int draft_tokens_stride, int req_state_idx,
                                       int num_valid, int num_placeholders,
                                       const std::string& req_id);
+
+// SPEC-DFLASH2 A2-3 REPAIR (#2911): THE PRODUCER'S ROW RULE, the counterpart of
+// `FillDraftsForRow` above and the other half of the one residence.
+//
+// WHY IT IS A NAMED FUNCTION, and it is not symmetry for its own sake. A review
+// deleted the payload scatter from `GPUModelRunner::set_draft_tokens` — the
+// `for (int c = 0; c < stride; ++c)` loop, leaving the count write in place —
+// and ALL EIGHT of this row's targets stayed green. Every draft in the process
+// could be zeroed end to end and nothing red, because verify is lossless: the
+// emitted tokens do not move and only ACCEPTANCE falls (#1366, and reason A in
+// this row's spec). Deleting the COUNT write does red, loudly, at the fill's
+// refusal — so the call site is proven REACHED and the payload was proven
+// UNOBSERVED at the same time. Stating the write here puts the payload and the
+// count in one function that `tests/vllm/v1/worker/test_draft_fill.cpp` drives
+// against `FillDraftsForRow` as a ROUND TRIP: what the producer wrote is what
+// the consumer reads back, so deleting the payload write now reds.
+//
+// It writes TWO things and a caller may not have one without the other:
+//   * the row, PADDED to the stride with zeros. The pad is never read (both
+//     readers take their count from `num_valid_draft_tokens` or from the
+//     scheduler's placeholder count), and zeroing it keeps a previous occupant's
+//     tail out of a dump or a debugger.
+//   * `num_valid_draft_tokens[req_state_idx]`, the count that decides how much
+//     of the row is real. Upstream governs the same way: `req_states.draft_tokens`
+//     keeps whatever it held and the count says what is live.
+//
+// The refusals mirror the fill's. A row longer than the stride is the speculator
+// contradicting the `k` the buffer was sized from, which would truncate silently
+// here and truncate a DIFFERENT number of drafts in the combine. A row outside
+// the buffer means the buffer was sized by `num_reqs` rather than by the
+// req_state pool, which is the sizing that makes the CUDA scatter's unbounded
+// row read safe.
+//
+//   draft_tokens             [>= (max req_state + 1) * stride] ROW-MAJOR
+//   num_valid_draft_tokens   [>= max req_state + 1], one count per req_state
+//   draft_tokens_stride      the speculator's MAX draft length
+//   req_state_idx            the request's req_state slot, NOT its batch row
+//   row                      what this propose produced for that request
+//   req_id                   named in the refusals only
+void WriteDraftRow(std::vector<int32_t>& draft_tokens,
+                   std::vector<int32_t>& num_valid_draft_tokens,
+                   int draft_tokens_stride, int req_state_idx,
+                   const std::vector<int32_t>& row, const std::string& req_id);
 
 // SPEC-DFLASH2 A2-3 REPAIR (#2911): THE ASYNC FILL'S FRESHNESS RULE.
 //
@@ -455,7 +500,9 @@ std::vector<int32_t> FillDraftsForRow(const std::vector<int32_t>& draft_tokens,
 // from `Consume`: without it the ledger would answer for a propose two steps old,
 // which is exactly the state `pending_drafts_`' move-out used to make
 // unrepresentable. `IsFresh` alone is a lookup; the sequence is the guarantee, and
-// that is what `tests/vllm/v1/worker/test_draft_fill.cpp` drives.
+// that is what `tests/vllm/v1/worker/test_draft_fill.cpp` drives — through
+// `FillDraftsForStep`, which is where the sequence is stated so that a call site
+// cannot separate the fill from the consume.
 //
 // Keyed by req_id and not by req_state slot deliberately: it is a one-step fact
 // about the last propose, so it neither moves through `condense` nor swaps
@@ -471,6 +518,10 @@ class ProposedDraftLedger {
   // not already used it?
   bool IsFresh(const std::string& req_id) const;
   // The fill has used this ledger. The next fill needs a new propose.
+  //
+  // IT IS A PROPERTY OF THE STEP AND NOT OF THE FILL. `FillDraftsForStep` below
+  // is the only caller for exactly that reason; see its comment for the state a
+  // per-fill consume leaves representable.
   void Consume();
   // For tests and diagnostics; never a route.
   std::size_t size() const { return req_ids_.size(); }
@@ -478,6 +529,48 @@ class ProposedDraftLedger {
  private:
   std::set<std::string> req_ids_;
 };
+
+// SPEC-DFLASH2 A2-3 REPAIR ROUND 3 (#2911): THE FILL IS A STEP, NOT A LOOP.
+//
+// WHAT WENT WRONG WITH THE PREVIOUS SHAPE. `execute_model` ran the per-request
+// loop AND `Consume()` inside `if (use_async_scheduling_ && !sched_spec->empty())`,
+// so a step with NO placeholders consumed nothing and the ledger outlived its
+// step. The mechanism it replaced does not behave that way: `pending_drafts_`'
+// move-out through `take_draft_token_ids` (core_proc.cpp:234) runs on EVERY
+// deferred-batch step, gated on `check_for_draft_tokens_` alone and never on
+// placeholders existing, and `Record` is likewise unconditional on them.
+//
+// THE STATE THAT LEAVES REPRESENTABLE. Step N proposes and Records {A}. Step N+1
+// has no placeholders — the async decode arm that never proposes is one such
+// step today (`## Owed`, #2920) — so nothing consumes and nothing Records or
+// Clears. Step N+2 has placeholders, `IsFresh(A)` passes off STEP N's propose,
+// and step N's drafts are spliced into step N+2's placeholders. That is verbatim
+// the "a propose two steps old" state this header says the design makes
+// unrepresentable, and it costs acceptance and raises nothing.
+//
+// NOTHING DISTINGUISHED THE TWO PLACEMENTS. Hoisting the `Consume()` out to the
+// step left `test_draft_fill`, `test_mtp_depth`, `test_dflash2_runner_reach`,
+// `test_runner` and `test_engine_core_proc` all green, in both placements. So the
+// step is stated HERE, as one function that does the loop and the consume
+// together, and the sequence is driven in `test_draft_fill.cpp`: a fill, then a
+// step with no placeholders, then a fill that MUST refuse. Put the consume back
+// inside the emptiness branch and that third fill splices instead of refusing.
+//
+// WHAT IT RETURNS. The patched copy of `scheduled_spec_decode_tokens` — the
+// scheduler's `-1` placeholders replaced by this runner's real drafts, one entry
+// per request that had placeholders. An empty input gives an empty result and
+// still consumes, which is the whole point.
+//
+// The caller supplies the residence (`InputBatch::draft_tokens`, its stride, the
+// req_id -> slot map and the per-slot valid counts) rather than the InputBatch
+// itself, so this header keeps stating a RULE over arrays and the runner keeps
+// owning the batch.
+std::map<std::string, std::vector<int32_t>> FillDraftsForStep(
+    ProposedDraftLedger& ledger,
+    const std::map<std::string, std::vector<int32_t>>& scheduled_spec_tokens,
+    const std::vector<int32_t>& draft_tokens, int draft_tokens_stride,
+    const std::unordered_map<std::string, int>& req_id_to_index,
+    const std::vector<int32_t>& num_valid_draft_tokens);
 
 }  // namespace vllm::v1
 

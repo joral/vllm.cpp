@@ -38,12 +38,16 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vllm/v1/worker/gpu/prepare_inputs.h"
 
 using vllm::v1::FillDraftsForRow;
+using vllm::v1::FillDraftsForStep;
+using vllm::v1::WriteDraftRow;
 
 namespace {
 
@@ -266,4 +270,234 @@ TEST_CASE("A2-3 ledger: Record REPLACES, and a propose that drafted nothing clea
   ledger.Clear();
   CHECK_FALSE(ledger.IsFresh("b"));
   CHECK(ledger.size() == 0u);
+}
+
+// ─── SPEC-DFLASH2 A2-3 REPAIR ROUND 3 (#2911): the PRODUCER's row ───────────
+//
+// WHY THESE CASES EXIST. A review deleted the payload scatter from
+// `GPUModelRunner::set_draft_tokens` — the `for (int c = 0; c < stride; ++c)`
+// loop — and left the count write in place. ALL EIGHT of this row's targets
+// stayed green. Every draft in the process could be zeroed end to end and
+// nothing red, because speculative decoding is lossless: the emitted tokens do
+// not move and only ACCEPTANCE falls (#1366). Deleting the COUNT write reds
+// loudly at the fill's refusal, so the call site was proven REACHED and the
+// payload proven UNOBSERVED in the same measurement.
+//
+// The instrument is a ROUND TRIP and not an assertion on the buffer's bytes: the
+// producer writes, the consumer reads back, and what comes out must be what went
+// in. The buffer is seeded with `100*r + c` first, so a producer that writes
+// nothing leaves the seed behind and the round trip reads 200 where it must read
+// 31. That is a value comparison against the proposer's own ids, which is the
+// only instrument this row has for the acceptance-only class of defect.
+TEST_CASE("A2-3 producer: the row WriteDraftRow wrote is the row the fill reads") {
+  std::vector<int32_t> buf = Buffer(/*num_req_states=*/4, /*stride=*/3);
+  std::vector<int32_t> valid(4, 0);
+
+  const std::vector<int32_t> proposed = {31, 32, 33};
+  WriteDraftRow(buf, valid, /*draft_tokens_stride=*/3, /*req_state_idx=*/2,
+                proposed, "a");
+
+  // The count says how much of the row is real...
+  CHECK(valid[2] == 3);
+  // ...and the row holds the proposer's ids, not the seed.
+  const std::vector<int32_t> got =
+      FillDraftsForRow(buf, /*draft_tokens_stride=*/3, /*req_state_idx=*/2,
+                       /*num_valid=*/valid[2], /*num_placeholders=*/3, "a");
+  REQUIRE(got.size() == 3u);
+  CHECK(got[0] == 31);
+  CHECK(got[1] == 32);
+  CHECK(got[2] == 33);
+
+  // A write is to ONE row. Slot 1 keeps its seed and slot 1's count stays 0,
+  // which is what stops a producer that scatters over the whole buffer from
+  // passing the assertions above.
+  CHECK(buf[3] == 100);
+  CHECK(buf[4] == 101);
+  CHECK(valid[1] == 0);
+}
+
+// The pad is part of the payload rule, not an afterthought. A shorter row leaves
+// the previous occupant's tail in the slots beyond it, and a dump, a debugger or
+// a future reader that took its count from the stride would read it.
+TEST_CASE("A2-3 producer: a short row is zero-padded over the previous occupant") {
+  std::vector<int32_t> buf = Buffer(/*num_req_states=*/4, /*stride=*/3);
+  std::vector<int32_t> valid(4, 3);
+
+  WriteDraftRow(buf, valid, /*draft_tokens_stride=*/3, /*req_state_idx=*/1,
+                {77}, "b");
+
+  CHECK(valid[1] == 1);
+  CHECK(buf[3] == 77);
+  CHECK(buf[4] == 0);
+  CHECK(buf[5] == 0);
+}
+
+// The producer's refusals mirror the fill's, for the same reasons: a row longer
+// than the stride truncates silently here and truncates a DIFFERENT number of
+// drafts in the combine, and a row outside the buffer means the buffer was sized
+// by `num_reqs` rather than by the req_state pool — the sizing that makes the
+// CUDA scatter's unbounded row read safe.
+TEST_CASE("A2-3 producer: a row the buffer cannot hold is refused, not truncated") {
+  std::vector<int32_t> buf = Buffer(/*num_req_states=*/4, /*stride=*/3);
+  std::vector<int32_t> valid(4, 0);
+
+  // Four drafts into a row that holds three.
+  CHECK_THROWS(WriteDraftRow(buf, valid, /*draft_tokens_stride=*/3,
+                             /*req_state_idx=*/0, {1, 2, 3, 4}, "long"));
+  // Slot 4 is one past the last row this buffer holds.
+  CHECK_THROWS(WriteDraftRow(buf, valid, /*draft_tokens_stride=*/3,
+                             /*req_state_idx=*/4, {1}, "past"));
+  CHECK_THROWS(WriteDraftRow(buf, valid, /*draft_tokens_stride=*/3,
+                             /*req_state_idx=*/-1, {1}, "negative"));
+  // A count array that does not cover the pool: the row would be written and its
+  // count dropped, which is the half of the pair the fill actually reads.
+  std::vector<int32_t> short_valid(2, 0);
+  CHECK_THROWS(WriteDraftRow(buf, short_valid, /*draft_tokens_stride=*/3,
+                             /*req_state_idx=*/3, {1}, "nocount"));
+  // A runner with no draft buffer has nothing to store into.
+  std::vector<int32_t> empty;
+  CHECK_THROWS(WriteDraftRow(empty, valid, /*draft_tokens_stride=*/0,
+                             /*req_state_idx=*/0, {1}, "nospec"));
+
+  // The last row IS addressable, and a bound off by one in the safe direction
+  // would take the top slot out of service.
+  CHECK_NOTHROW(WriteDraftRow(buf, valid, /*draft_tokens_stride=*/3,
+                              /*req_state_idx=*/3, {1, 2, 3}, "last"));
+}
+
+// ─── SPEC-DFLASH2 A2-3 REPAIR ROUND 3 (#2911): the STEP, not the fill ───────
+//
+// WHAT THESE CASES SEPARATE, and nothing in this tree separated it before. The
+// runner used to run the fill loop AND the ledger's `Consume()` inside
+// `if (use_async_scheduling_ && !sched_spec->empty())`. Hoisting the consume out
+// to the step — the fail-closed placement — left `test_draft_fill`,
+// `test_mtp_depth`, `test_dflash2_runner_reach`, `test_runner` and
+// `test_engine_core_proc` all green. Two placements, one of them a live
+// fail-open defect, and no gate anywhere could tell them apart.
+//
+// THE DEFECT THE PER-FILL PLACEMENT LEAVES. Step N proposes and Records {A}.
+// Step N+1 has NO placeholders, so nothing consumes; it is also the async decode
+// arm that never proposes (`## Owed`, #2920), so nothing Records or Clears
+// either. Step N+2 has placeholders, `IsFresh(A)` answers off STEP N's propose,
+// and step N's drafts are spliced into step N+2's positions. Every check
+// `FillDraftsForRow` makes is satisfied — the row and the count are persistent
+// and intact — so the ledger is the only thing that can refuse.
+//
+// The mechanism the ledger replaced never had this state: `take_draft_token_ids`
+// moves `pending_drafts_` out on EVERY deferred-batch step (core_proc.cpp:234),
+// gated on `check_for_draft_tokens_` and never on placeholders existing.
+//
+// The sequence below is that state, driven through `FillDraftsForStep`. Put the
+// consume back inside an emptiness test and the last line returns slot 2's row
+// instead of throwing.
+namespace {
+
+using Sched = std::map<std::string, std::vector<int32_t>>;
+
+// The scheduler's async placeholders for one request (async_scheduler.py:43-45).
+Sched Placeholders(const std::string& req_id, int n) {
+  return Sched{{req_id, std::vector<int32_t>(static_cast<size_t>(n), -1)}};
+}
+
+}  // namespace
+
+TEST_CASE("A2-3 step: the fill consumes the propose, so a second fill refuses") {
+  vllm::v1::ProposedDraftLedger ledger;
+  const std::vector<int32_t> buf = Buffer(/*num_req_states=*/4, /*stride=*/3);
+  const std::vector<int32_t> valid(4, 3);
+  const std::unordered_map<std::string, int> idx{{"a", 2}};
+
+  ledger.Record({"a"});
+
+  const Sched with_ph = Placeholders("a", 3);
+  const Sched filled = FillDraftsForStep(ledger, with_ph, buf, /*stride=*/3, idx,
+                                         valid);
+  REQUIRE(filled.at("a").size() == 3u);
+  CHECK(filled.at("a")[0] == 200);
+  CHECK(filled.at("a")[2] == 202);
+
+  // No propose in between: the same drafts are no longer this step's.
+  CHECK_THROWS(FillDraftsForStep(ledger, with_ph, buf, /*stride=*/3, idx, valid));
+}
+
+TEST_CASE("A2-3 step: a step with NO placeholders consumes the propose too") {
+  vllm::v1::ProposedDraftLedger ledger;
+  const std::vector<int32_t> buf = Buffer(/*num_req_states=*/4, /*stride=*/3);
+  const std::vector<int32_t> valid(4, 3);
+  const std::unordered_map<std::string, int> idx{{"a", 2}};
+
+  // Step N: a propose ran and drafted for "a".
+  ledger.Record({"a"});
+
+  // Step N+1: an async step that scheduled no drafts at all. It fills nothing —
+  // and it has still USED UP the last propose, because the step is what consumes.
+  const Sched none;
+  const Sched empty_result =
+      FillDraftsForStep(ledger, none, buf, /*stride=*/3, idx, valid);
+  CHECK(empty_result.empty());
+
+  // Step N+2: placeholders arrive with no propose since step N. THIS is the line
+  // the two placements disagree on. Fail-closed refuses; the per-fill placement
+  // returns { 200, 201, 202 } — step N's drafts, two steps old.
+  CHECK_THROWS(FillDraftsForStep(ledger, Placeholders("a", 3), buf, /*stride=*/3,
+                                 idx, valid));
+
+  // And the refusal is not unconditional: a fresh propose makes the same inputs
+  // fill again, so the case above is measuring freshness and not a broken call.
+  ledger.Record({"a"});
+  const Sched again =
+      FillDraftsForStep(ledger, Placeholders("a", 3), buf, /*stride=*/3, idx, valid);
+  REQUIRE(again.at("a").size() == 3u);
+  CHECK(again.at("a")[0] == 200);
+}
+
+// A request the step cannot locate has no req_state row to read from, and a
+// placeholder the worker cannot fill would embed a literal -1 in the model's
+// input ids. Both are refusals for that reason.
+TEST_CASE("A2-3 step: a fresh request with no batch row is refused") {
+  vllm::v1::ProposedDraftLedger ledger;
+  const std::vector<int32_t> buf = Buffer(/*num_req_states=*/4, /*stride=*/3);
+  const std::vector<int32_t> valid(4, 3);
+
+  ledger.Record({"gone"});
+  const std::unordered_map<std::string, int> idx{{"other", 0}};
+  CHECK_THROWS(FillDraftsForStep(ledger, Placeholders("gone", 2), buf,
+                                 /*stride=*/3, idx, valid));
+
+  // A slot the count array does not cover cannot be substantiated either.
+  vllm::v1::ProposedDraftLedger ledger2;
+  ledger2.Record({"a"});
+  const std::unordered_map<std::string, int> far{{"a", 3}};
+  const std::vector<int32_t> short_valid(2, 3);
+  CHECK_THROWS(FillDraftsForStep(ledger2, Placeholders("a", 2), buf,
+                                 /*stride=*/3, far, short_valid));
+}
+
+// THE MIXED STEP AT THE STEP LEVEL. Three requests, two of them drafting with
+// different k and one plain decode row, filled in one call. A step rule that
+// took its width or its slot from the first entry agrees with the correct one on
+// every single-request input and disagrees here.
+TEST_CASE("A2-3 step: a MIXED step fills each request from its own slot") {
+  vllm::v1::ProposedDraftLedger ledger;
+  const std::vector<int32_t> buf = Buffer(/*num_req_states=*/8, /*stride=*/3);
+  std::vector<int32_t> valid(8, 0);
+  valid[5] = 3;
+  valid[7] = 1;
+  const std::unordered_map<std::string, int> idx{{"a", 5}, {"b", 6}, {"c", 7}};
+
+  ledger.Record({"a", "b", "c"});
+
+  Sched sched;
+  sched["a"] = std::vector<int32_t>(3, -1);
+  sched["c"] = std::vector<int32_t>(1, -1);  // "b" drafted nothing this step.
+
+  const Sched filled =
+      FillDraftsForStep(ledger, sched, buf, /*stride=*/3, idx, valid);
+  REQUIRE(filled.size() == 2u);
+  REQUIRE(filled.at("a").size() == 3u);
+  CHECK(filled.at("a")[0] == 500);
+  CHECK(filled.at("a")[2] == 502);
+  REQUIRE(filled.at("c").size() == 1u);
+  CHECK(filled.at("c")[0] == 700);
+  CHECK(filled.count("b") == 0u);
 }

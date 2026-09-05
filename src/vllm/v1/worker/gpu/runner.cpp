@@ -2389,7 +2389,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     const std::map<std::string, std::vector<int32_t>>* sched_spec =
         &scheduler_output.scheduled_spec_decode_tokens;
     std::map<std::string, std::vector<int32_t>> filled_spec;
-    if (use_async_scheduling_ && !sched_spec->empty()) {
+    if (use_async_scheduling_) {
       // SPEC-DFLASH2 A2-3 (#2911): THE FILL READS THE DRAFT BUFFER, not the
       // out-of-band stash. `pending_drafts_` is a delivery to the scheduler and
       // `take_draft_token_ids` MOVES it out, so it can never be the residence two
@@ -2401,46 +2401,25 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // scatter from disagreeing about what this runner drafted — a disagreement
       // that costs acceptance and raises nothing, verify being lossless.
       //
-      // The per-request rule is `FillDraftsForRow` (prepare_inputs.h), shared
-      // with nothing else but written once: the row arithmetic it applies is the
-      // combine's own. This loop supplies the slot and the counts and applies
-      // the rule; it does not restate it.
-      for (const auto& [req_id, placeholders] : *sched_spec) {
-        // FRESHNESS FIRST (A2-3 repair, #2911). Placeholders are only ever
-        // assigned to requests this runner sampled AND proposed for on the
-        // previous step (update_after_schedule skips prefill chunks; preemption
-        // clears them). This is the pre-A2-3 refusal restored, message and all:
-        // before A2-3 it asked `pending_drafts_`, which `take_draft_token_ids`
-        // MOVES OUT, so it meant "a propose ran for this request since the last
-        // fill". A2-3 rehomed it onto `req_id_to_index`, which only asks whether
-        // the request is in the persistent batch — nearly always true — and left
-        // freshness resting on `num_valid_draft_tokens`, which survives the pull
-        // by design and is cleared only by `clear_draft_tokens`. A step that
-        // skipped the propose would then splice the PREVIOUS verify step's
-        // drafts into THIS step's placeholders, silently, because verify is
-        // lossless. `ProposedDraftLedger` carries the freshness half again and
-        // the fill CONSUMES it below, so a second fill with no propose between
-        // finds it empty.
-        VT_CHECK(proposed_drafts_.IsFresh(req_id),
-                 "async draft fill: no drafts proposed for request '" + req_id +
-                     "' (placeholders scheduled without a matching propose)");
-        // Separately: a request the fill cannot locate has no req_state row to
-        // read, and embedding a -1 is not an option.
-        const auto slot_it = input_batch_.req_id_to_index.find(req_id);
-        VT_CHECK(slot_it != input_batch_.req_id_to_index.end(),
-                 "async draft fill: request '" + req_id +
-                     "' has drafts but no row in the persistent batch, so they "
-                     "cannot be located");
-        const int slot = slot_it->second;
-        filled_spec[req_id] = FillDraftsForRow(
-            input_batch_.draft_tokens, input_batch_.num_speculative_steps, slot,
-            input_batch_.num_valid_draft_tokens[static_cast<std::size_t>(slot)],
-            static_cast<int>(placeholders.size()), req_id);
-      }
-      // CONSUMED, exactly as `take_draft_token_ids` consumes `pending_drafts_`.
-      // This is what makes the refusal above a freshness test: the NEXT fill can
-      // only pass if a propose ran in between and repopulated it.
-      proposed_drafts_.Consume();
+      // THE WHOLE STEP IS ONE CALL, and this is the A2-3 repair-round-3 shape.
+      // The per-request rule is `FillDraftsForRow` and the STEP rule —
+      // freshness, the slot lookup, and the ledger's consume — is
+      // `FillDraftsForStep` (both in prepare_inputs.h), so the loop and the
+      // consume cannot be separated by an edit here. They were: the consume used
+      // to sit inside `use_async_scheduling_ && !sched_spec->empty()`, so a step
+      // with no placeholders consumed nothing and left the ledger answering for
+      // a propose two steps old — the exact state this design exists to make
+      // unrepresentable, and one no suite in this tree could see. The mechanism
+      // it replaced never behaved that way: `take_draft_token_ids` moves
+      // `pending_drafts_` out on EVERY deferred-batch step (core_proc.cpp:234).
+      //
+      // Called on every async-scheduling step, EMPTY MAP INCLUDED. That is not
+      // an accident of structure: the empty step is precisely the one that must
+      // still consume.
+      filled_spec = FillDraftsForStep(
+          proposed_drafts_, *sched_spec, input_batch_.draft_tokens,
+          input_batch_.num_speculative_steps, input_batch_.req_id_to_index,
+          input_batch_.num_valid_draft_tokens);
       sched_spec = &filled_spec;
     }
 
@@ -2534,12 +2513,30 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // `logits_start` becomes `query_end - 1`, which IS the last draft slot: the
     // committed token lands on top of the last draft and NOTHING is scattered,
     // while the host arm writes it at `query_end - (1 + k)` and scatters the k
-    // drafts. Verify is lossless, so the emitted tokens are identical either way
-    // and only ACCEPTANCE falls — reason A, measured on this branch as
-    // `draft=[ 6 18 5 ]` -> `[ 6 18 22 ]` and `[ 5 ]` -> `[ 3 ]` (the previous
-    // step's `emit`) with `emit=` byte-identical and the suite's identity
-    // assertions passing 118/118 in both arms. No token gate in this tree sees
-    // it (#1366).
+    // drafts. Reason A, measured on this branch as `draft=[ 6 18 5 ]` ->
+    // `[ 6 18 22 ]` and `[ 5 ]` -> `[ 3 ]` — the previous step's `emit` — with
+    // the `emit=` column unchanged OVER THOSE ROWS and the suite's identity
+    // assertions passing 118 of 118 in both arms.
+    //
+    // "ONLY ACCEPTANCE FALLS" IS SCOPED TO THOSE ROWS AND IS NOT A GLOBAL CLAIM.
+    // A round-3 review measured the whole run and it moves both ways: at `k=1`,
+    // positions 9 and 11, the pre-repair shape reads `ns=2 acc=1
+    // draft=[ 1 ] emit=[ 1 1 ]` where the repaired shape reads `ns=1 acc=0
+    // emit=[ 1 ]`, because the corrupted slot holds the COMMITTED token, which
+    // then matches and is ACCEPTED. Flattened, the pre-repair run emits 198
+    // tokens against the repaired run's 197 — one inserted `1`, the rest
+    // identical, verify being lossless — and `[SPECTRACE]` prints 185 lines
+    // against 192. So acceptance and tokens-per-step at a fixed step budget do
+    // differ, and a claim that nothing but per-row acceptance moves is wrong.
+    //
+    // That discriminator is NOT a gate this tree can ship, which is why the
+    // guard below exists instead: reaching the pre-repair shape at all needs
+    // mutation M — the veto deleted at BOTH `async_input_combine_` assignments —
+    // so the difference is only observable under a mutation and never on a
+    // committed configuration. What IS committed is the size guard below plus
+    // `test_combine_tokens.cpp`'s G2, which drives the combine directly and
+    // compares against the proposer's own ids. No END-TO-END token gate in this
+    // tree sees the class (#1366).
     //
     // WHY IT IS FIXED AND NOT REFUSED. A refusal would be UNBUILT here (no nvcc
     // on this box), so its correctness would rest on reading, and it would leave
@@ -2564,9 +2561,16 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
                  "SLOT and scatters no drafts — SPEC-DFLASH2 reason A, which "
                  "costs acceptance and raises nothing)");
 #ifdef VLLM_CPP_CUDA
-    // The ONE expression both device arms read, so neither can be edited into
-    // disagreeing with the other or with the host arm below (which takes the
-    // same vector by reference). Inside the #ifdef because only the device arms
+    // The host-side source both device arms start from. It is NOT true that they
+    // therefore cannot be edited apart, and the round-3 review was right to say
+    // so: only the UMA arm passes this pointer through. The mirror arm passes
+    // `dev->cu_num_logits`, a DEVICE buffer that equals it only while the
+    // `stage_upload(*dev, dev->cu_num_logits, cu_num_logits_host, num_reqs + 1)`
+    // below is present and correctly sized. Delete or mis-size that upload and
+    // the mirror arm alone reverts to reason A — unbuilt on this box and caught
+    // by nothing. What the shared local does buy is that neither arm can pick up
+    // a DIFFERENT host source than the host arm below, which takes the same
+    // vector by reference. Inside the #ifdef because only the device arms
     // want a pointer; the assertion above it is outside, where the CPU tier
     // builds and gates it.
     const int32_t* const cu_num_logits_host = step.cu_num_logits.data();
@@ -4002,35 +4006,17 @@ void GPUModelRunner::set_draft_tokens(DraftTokenIds&& drafts) {
       const auto slot_it = input_batch_.req_id_to_index.find(drafts.req_ids[i]);
       if (slot_it == input_batch_.req_id_to_index.end()) continue;
       const int slot = slot_it->second;
-      const std::vector<int32_t>& row = drafts.draft_token_ids[i];
-      // A row longer than the stride is the speculator contradicting the k the
-      // buffer was sized from, which would silently truncate a draft here and
-      // silently truncate a different number of them in the combine. Refuse.
-      VT_CHECK(static_cast<int>(row.size()) <= stride,
-               "set_draft_tokens: request '" + drafts.req_ids[i] +
-                   "' proposed " + std::to_string(row.size()) +
-                   " drafts but the draft buffer's row holds " +
-                   std::to_string(stride) +
-                   " (num_speculative_steps disagrees with the speculator)");
-      const std::size_t base =
-          static_cast<std::size_t>(slot) * static_cast<std::size_t>(stride);
-      VT_CHECK(base + static_cast<std::size_t>(stride) <=
-                   input_batch_.draft_tokens.size(),
-               "set_draft_tokens: the draft buffer holds no row for req_state "
-               "slot " +
-                   std::to_string(slot) +
-                   " (it must be sized by the req_state pool, not by num_reqs)");
-      // The row is PADDED to the stride, not left short: the pad is never read
-      // (both readers take their count from num_valid_draft_tokens or from the
-      // scheduler's placeholder count), and zeroing it keeps a previous
-      // occupant's tail out of a dump or a debugger.
-      for (int c = 0; c < stride; ++c) {
-        input_batch_.draft_tokens[base + static_cast<std::size_t>(c)] =
-            c < static_cast<int>(row.size()) ? row[static_cast<std::size_t>(c)]
-                                             : 0;
-      }
-      input_batch_.num_valid_draft_tokens[static_cast<std::size_t>(slot)] =
-          static_cast<int32_t>(row.size());
+      // THE ROW WRITE IS ONE NAMED RULE (A2-3 repair round 3, #2911). Payload
+      // and count used to be two adjacent statements here, and deleting the
+      // PAYLOAD one left every target in this row green: verify is lossless, so
+      // a zeroed draft costs acceptance and raises nothing, while deleting the
+      // COUNT reds loudly at the fill's refusal. `WriteDraftRow`
+      // (prepare_inputs.h) makes them one call, which
+      // `tests/vllm/v1/worker/test_draft_fill.cpp` gates as a round trip against
+      // `FillDraftsForRow` — the producer's write read back by the consumer.
+      WriteDraftRow(input_batch_.draft_tokens,
+                    input_batch_.num_valid_draft_tokens, stride, slot,
+                    drafts.draft_token_ids[i], drafts.req_ids[i]);
     }
   }
   // SPEC-DFLASH2 A2-3 repair (#2911): the FILL'S FRESHNESS SOURCE. Recorded
@@ -4975,6 +4961,25 @@ GPUModelRunner::~GPUModelRunner() {
     // paid at TEARDOWN with no request in flight. That is the same trade the
     // `Release` repair took — an observable stall instead of an unobservable
     // wrong answer — and here the stall is off every serving path entirely.
+    //
+    // IT IS EXECUTED ON NEITHER TIER, and the commit that landed it said "the
+    // mirror's allocation and its entry in the destructor's free list are
+    // outside the `#ifdef` and ARE compiled here", which is true and reads as
+    // coverage it does not have. `async_device_mirror()` has its whole body
+    // inside `#ifdef VLLM_CPP_CUDA`, so on the CPU build it always answers false,
+    // `async_device_inputs_` is always null, and this entire block — the
+    // `Synchronize` included — never runs. On the CUDA build it would run and is
+    // not compiled here (no nvcc on this box). Deleting the drain leaves all
+    // eleven of this row's targets green. It rests on READING: sole destruction
+    // path, `queue_` is the queue `stage_upload` and both combine launches use,
+    // correctly scoped, no double drain, no deadlock.
+    //
+    // PRE-EXISTING ORDERING SMELL, recorded and NOT repaired by this wave because
+    // it is not this repair's defect: `DestroyQueue(async_copy_queue_)` above and
+    // the two `DestroyEvent` calls above it run BEFORE this drain, so the drain
+    // protects the mirror's buffers and protects neither of them. Closing it
+    // needs the same GPU tier that would exercise the drain at all. It is filed
+    // under this row's spec `## Owed`.
     b.Synchronize(queue_);
     // `draft_tokens` and `cu_num_logits` are in the list because they are in the
     // struct; see the struct's declaration for why A2-4 must not move a free

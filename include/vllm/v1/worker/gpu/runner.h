@@ -1181,7 +1181,9 @@ class GPUModelRunner final : public ModelRunnerBase {
   // #2911), which A2-3 deleted with `pending_drafts_` and did not restate. The
   // rule, and why `InputBatch::draft_tokens` cannot carry it, are on
   // `ProposedDraftLedger` in `prepare_inputs.h`. Written by `set_draft_tokens`
-  // and `clear_draft_tokens`, read and consumed by the fill in `execute_model`.
+  // and `clear_draft_tokens`, read and consumed by `FillDraftsForStep`, which
+  // `execute_model` runs on EVERY async-scheduling step (the consume is a
+  // property of the step, not of the fill; see prepare_inputs.h).
   ProposedDraftLedger proposed_drafts_;
   // SPEC-DFLASH2 A2-3 (#2911): the ONE producer seam for both residences.
   // Scatters `drafts` into `input_batch_.draft_tokens` by req_state slot and
