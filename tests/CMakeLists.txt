@@ -1869,6 +1869,11 @@ target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src
 
 vllm_cpp_add_test(test_attention_window_adoption
   vllm/model_executor/layers/attention/test_attention_window_adoption.cpp)
+
+# ENG-ATTENTION-WINDOW W3 (#2388): the kill switch itself, which had no test in
+# either of the two environment spellings it replaced.
+vllm_cpp_add_test(test_disable_sliding_window
+  vllm/model_executor/layers/attention/test_disable_sliding_window.cpp)
 target_include_directories(test_attention_window_adoption PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # `vllm-cli`'s `--offload-config` (#1135). It runs the BINARY, because that is the
 # only thing that proves the FLAG arrives: `test_weight_residency_reach` already
