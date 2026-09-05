@@ -25,8 +25,11 @@ and this model's speed axis.
 **Which revision this was compared against.** Every upstream anchor below was
 read in the local checkout at `5559679229`, which is the revision the committed
 `tests/parity/goldens/glm4_moe_lite_greedy/` artifacts were captured on and the
-PRIOR parity pin. The ACTIVE pin is `e126687a9a`, at which no gate has run in
-this tree (`.agents/upstream-sync.md`, [#2794](https://github.com/mudler/vllm.cpp/issues/2794)).
+PRIOR parity pin. The ACTIVE pin is `e126687a9a`. **One** token gate has now run
+at it and passed (`b55f63ed6`, job `7386f034-246a-4af5-9a04-f98aafffce54` on
+GB10, 2026-09-04, `IDS mismatched_positions 0 of 96`, `TOKENGATE_VERDICT PASS`),
+and that is a different model's battery: no `Glm4MoeLiteForCausalLM` golden has
+been re-captured at the active pin ([#2794](https://github.com/mudler/vllm.cpp/issues/2794)).
 Re-reading `glm4_moe.py` at the active pin is owed as O5.
 
 **Upstream, read at `5559679229` — the pin the goldens were captured on.**
@@ -268,8 +271,10 @@ this host, because what it compares is a frozen `our_ids.npy`.
   checkpoints.
 - O5. The upstream anchors are read at `5559679229`, not at the active pin
   `e126687a9a`. `Glm4MoE`'s fp32 gate is a class property rather than a config
-  key, so it is unlikely to have moved, but "unlikely" is not "read". Owed to the
-  pin-reconciliation queue ([#2611](https://github.com/mudler/vllm.cpp/issues/2611)).
+  key, so it is unlikely to have moved, but "unlikely" is not "read". The token
+  gate that passed at the active pin on 2026-09-04 (`b55f63ed6`) is a different
+  model's battery and says nothing about this one. Owed to the pin-reconciliation
+  queue ([#2611](https://github.com/mudler/vllm.cpp/issues/2611)).
 - O4. `routed_scaling_factor` is applied to the routing weights rather than the
   routed output ([#2930](https://github.com/mudler/vllm.cpp/issues/2930)). It is
   a recorded deviation whose only gate vehicle had `routed_scaling_factor: 1.0`,
