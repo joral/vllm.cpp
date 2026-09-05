@@ -222,6 +222,12 @@ SUITES=(
   test_ci_walk_base
   test_rc_stage_checkpoint
   test_sglang_lease_identity
+  # #2877. Registered in TWO places -- here and in `.github/workflows/ci.yml` --
+  # and pinned in `REQUIRED_SUITE_REGISTRATIONS`, so neither registration is
+  # deletable at rc=0. It landed on NO lane at all: absent from this array and
+  # from CI, while the tool it gates had never been run on a real fingerprint.
+  # Standard library only, ~1.2 s, no artifact and no GPU.
+  test_q4exp_layerfp_diff
 )
 
 failed=()

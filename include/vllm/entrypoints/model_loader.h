@@ -607,6 +607,16 @@ class LoadedEngine {
   // attention-only model.
   int max_num_seqs() const { return max_num_seqs_; }
 
+  // SPEC-MTP I5d: the speculative config as RESOLVED against the checkpoint
+  // (ResolveSpecConfig), or empty on the non-speculative default. Exposed for
+  // #2770: the server's PrometheusStatLogger has to register the spec_decode
+  // metric families with the same k the scheduler builds its per-position
+  // vectors from, and `params.speculative_config` is not that value — the
+  // loader re-resolves it against the checkpoint's mtp_num_hidden_layers.
+  const std::optional<vllm::SpeculativeConfig>& speculative_config() const {
+    return resolved_spec_config_;
+  }
+
   // KV-EXTERNAL-CACHE (LMCache): the wired external KV connector, or null when
   // none was configured. Exposed so the output-invariance gate can read the
   // prefill-tokens-saved / chunks-stored counters. Non-owning.

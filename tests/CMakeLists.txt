@@ -4032,3 +4032,17 @@ target_include_directories(test_glm_moe_dsa_forward PRIVATE
 # lane's environment where a reader of the build looks for it.
 set_tests_properties(test_glm_moe_dsa_forward PROPERTIES
   ENVIRONMENT "VT_MOE_EXPERT_STREAM=1")
+
+# QUANT-QWEN38-27B-NVFP4-ARM W7 (#2760). A ModelOpt checkpoint that DECLARES
+# `quant_algo: "NVFP4"` -- 4-bit weights AND 4-bit ACTIVATIONS -- and that this
+# build runs W4A16 has to say so at load. Every case enters through
+# `vllm::LoadQwen3_5Dense` with stderr captured, never through the notice
+# function alone, because a test that calls the function directly stays green
+# when the production call site is deleted. Cases 1-6 are hermetic over a
+# one-layer synthetic checkpoint in the artifact's own module names, as is case
+# 8; case 7 is env-gated on VLLM_CPP_QWEN38_27B_RADIXARK_DIR and reads only
+# `config.json` and the three shards' safetensors headers.
+vllm_cpp_add_test(test_qwen38_27b_radixark_w4a4_notice
+  vllm/models/test_qwen38_27b_radixark_w4a4_notice.cpp)
+target_include_directories(test_qwen38_27b_radixark_w4a4_notice PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
