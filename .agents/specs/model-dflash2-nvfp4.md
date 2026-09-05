@@ -15,8 +15,16 @@ behaviour, so nothing here is a product decision and nothing was asked.
 
 ## Now
 
-`ACTIVE`. The loader-side arm is written and gated hermetically. No device has
-run it; see [Owed](#owed).
+`ACTIVE`. The loader-side arm is written and gated hermetically:
+`test_qwen3_dflash2_nvfp4` 14/14 test cases, 317/317 assertions, with the four
+neighbouring draft suites (`test_qwen3_dflash2_exl3` 5/5,
+`test_qwen3_dflash2_draft` 44/44, `test_dflash_causality` 13/13,
+`test_dflash2_draft_routing` 12/12) and the six dense NVFP4 suites the exported
+reader touches all unchanged and green. The red before it was the issue's own
+sentence, verbatim: `vt: qwen3_dflash: expected BF16 for
+layers.0.self_attn.q_proj.weight at
+src/vllm/model_executor/models/qwen3_dflash_weights.cpp:50`. No device has run
+it; see [Owed](#owed).
 
 ## The gap, verified against the tree rather than taken from the issue
 
@@ -277,10 +285,16 @@ what NVFP4 group-16 requires.
   arms this change must leave byte-unchanged.
 - Full: `scripts/agent-preflight.sh --staged`, judged by grepping for
   `gate(s) failed` and `NOT a green`.
-- Reachability, by mutation in a scratch copy, restored byte-for-byte with a
-  sha256 either side: delete the `cfg.raw["quantization_config"]` carry in
+- Reachability, by mutation, restored byte-for-byte with a sha256 either side:
+  delete the `cfg.raw["quantization_config"]` carry in
   `MakeQwen3DFlashDraftConfig` and confirm the arm cases red. A gate that stays
   green without that line is measuring a class, not a capability.
+  **RUN: 10 of the 14 cases red under it**, including the published-shape load,
+  every refusal that names a module, and both cross-check directions; the four
+  that survive are the ones whose subject is the tensors rather than the
+  declaration. `src/vllm/model_executor/models/qwen3_dflash_weights.cpp` hashed
+  `093fa70722f56d8f30744d051235178b77cff2de937b2b9262e897e63c5cba4c` before the
+  mutation and the same value after the restore.
 
 ## Risks and decisions
 
@@ -303,9 +317,26 @@ what NVFP4 group-16 requires.
   `.agents/specs/bench-qwen38-27b-nvfp4-matched.md` is the leg that pays it, and
   it needs a lease. Until it runs, this arm is proven to READ the format and not
   to RUN it.
-- **A locally computed sha256 for `model.safetensors`.** The header was read by
-  HTTP range request; the 1.55 GB payload was not downloaded, so no hash is
-  recorded. Nothing in this spec records a hash it did not compute.
+- ~~**A locally computed sha256 for `model.safetensors`.**~~ **ALREADY PAID, by
+  `BENCH-QWEN38-27B-SOTA`.** This row read the header by HTTP range request and
+  downloaded nothing, but the payload is already staged and hashed:
+  `2228b9b22e93a88d84556419c879448ab6c490ae65c4c0b166f4962190ddbf26`, computed
+  from the local bytes and matching the publisher's LFS object hash, recorded in
+  `docs/USAGE.md`. This row records no hash it did not compute and quotes that
+  one from the row that did.
+- **THE FORWARD BRANCH IS NOT REACHED BY ANY GATE IN THIS TREE, and this bullet
+  is the declaration `AGENTS.md` §"Nothing lands dead" requires for it.** The
+  nine `DflashLinear` / `DflashMlpGateUp` call sites ARE reached and gated --
+  every existing bf16 and EXL3 draft suite runs through them, and deleting one
+  reds those suites -- but the branch that binds `Nvfp4W4A16LinearMethod` needs
+  a populated `Nvfp4Weight`, and executing it needs `vt::MatmulNvfp4`, which is
+  registered for CUDA only (`src/vt/cuda/cuda_matmul_nvfp4.cu:2703`). So this
+  change lands a LOADER capability that is gated and a FORWARD branch that is
+  compiled, routed and unexecuted. It is owned by this row,
+  `MODEL-DFLASH2-NVFP4`, tracked by
+  [#2758](https://github.com/mudler/vllm.cpp/issues/2758), and the leg that
+  executes it is leg F of `BENCH-QWEN38-27B-SOTA`
+  ([#2761](https://github.com/mudler/vllm.cpp/issues/2761)).
 - **NVFP4 owners for `fc`, the selector projection and the conv kernel
   projections.** Refused by name today. Owed by this row; a published draft that
   quantizes any of them is the trigger, and none does.
