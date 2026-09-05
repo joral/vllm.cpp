@@ -1922,15 +1922,17 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
         }
       }
     }
-    // f32 IS THE PARITY ARM AND IT IS OWED A NARROWING. Upstream builds the head
-    // at the pipeline dtype, `torch.bfloat16` (distilled.py:109,163-167), so this
-    // is WIDER than the reference -- the polarity AGENTS.md names, recorded here
-    // beside the call rather than left for a reader to derive. The bf16 arm is
-    // gap A24's eighth component and is owed by
-    // .agents/specs/ltx25-duration-head-wire.md `## Owed`; the `compute_dtype`
-    // parameter exists so landing it is this one argument.
+    // UPSTREAM'S OWN MODEL DTYPE, and this line is the whole of A24's eighth
+    // component at the call side. `DurationPredictor.from_checkpoint` takes the
+    // pipeline dtype (distilled.py:163-165) and `:109` resolves that to
+    // `torch.bfloat16`, so a head materialized f32 here moves twice the bytes
+    // upstream moves and computes at a width upstream never uses. Row
+    // LTX25-A24-DURATION-HEAD-BF16, .agents/specs/ltx25-a24-duration-head-bf16.md.
+    //
+    // THE TWO CALLS ARE REVERTED INDEPENDENTLY IN MUTATION. Wave 5 reverted two
+    // loader sites together and could not see either one alone.
     im.has_duration_head = Ltx2LoadDurationHeadWeights(f, im.duration_head_cfg,
-                                                       vt::DType::kF32,
+                                                       vt::DType::kBF16,
                                                        &im.duration_head_weights);
     if (!im.has_duration_head) {
       // The BARE spelling, for a head stored without upstream's key prefix.
@@ -1939,7 +1941,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
       // state dict carries bare names and is the same head.
       im.duration_head_cfg.prefix = "";
       im.has_duration_head = Ltx2LoadDurationHeadWeights(f, im.duration_head_cfg,
-                                                         vt::DType::kF32,
+                                                         vt::DType::kBF16,
                                                          &im.duration_head_weights);
     }
   }

@@ -207,6 +207,151 @@ def assert_discriminating(raw_seconds: list[float], frames: list[int]) -> None:
         )
 
 
+# ── The bf16 arm (row LTX25-A24-DURATION-HEAD-BF16, #2955) ───────────────────
+#
+# A24's EIGHTH and last component. Upstream resolves one pipeline dtype and it is
+# bfloat16 (distilled.py:109), handed to DurationPredictor.from_checkpoint at
+# :163-165, so upstream's head is a bf16 module and every one of its fifteen
+# parameters narrows.
+#
+# WHY THIS SECTION SWEEPS INSTEAD OF NAMING A FIXTURE. The head returns ONE bf16
+# scalar per batch row, through `exp`. Eight mantissa bits applied once to a
+# single number absorb almost every intermediate difference: on the SHIPPED
+# widths the correct chain reproduces upstream bit-exactly AND so does every
+# wrong rule but the last one. A single-fixture table here would be green under
+# six of the seven mutations it claims to detect, and would look exactly like a
+# passing test.
+#
+# So coverage is measured PER RULE ACROSS FIXTURES, never per fixture, and this
+# emitter REFUSES to write when any rule reaches zero. That is wave 5's own
+# correction (.agents/specs/ltx25-a24-upsampler-bf16.md §3.2) applied at the
+# outset rather than after review.
+#
+# THE PARAMETER DRAW IS PART OF THE MEASUREMENT. Wave 5 measured its band on a
+# `torch.manual_seed` draw and the committed generator drew differently, which
+# moved the table enough that one arm separated nothing. Every number below is
+# measured on the CLOSED FORM the C++ side rebuilds, so the two agree on the
+# weights before they are asked to agree on the answer.
+
+BF16_RULES = (
+    "two_round",    # R1: round the GEMM, then add the bias in bf16
+    "add_f32",      # R2a: the modality-embedding add kept in f32
+    "emb_f32",      # R2b: the modality embedding not narrowed
+    "soft_bf16",    # R5a: the attention scores and weights narrowed
+    "attn_f32",     # R5b: the pooled attention output not rounded
+    "gelu_narrow",  # R3: the tanh argument narrowed before the multiply
+    "exp_f32",      # R4: the seconds returned unrounded
+)
+
+
+def bf16_fill(up, head, amplitude: float) -> None:
+    """The same closed form fill_synthetic uses, at a per-fixture amplitude.
+
+    The C++ side rebuilds this expression exactly, so a disagreement is about the
+    ARITHMETIC and never about which weights each side was holding.
+    """
+    torch = up.torch
+    with torch.no_grad():
+        for slot, (_name, param) in enumerate(head.named_parameters()):
+            idx = torch.arange(param.numel(), dtype=torch.float64)
+            values = torch.sin(idx * 0.7391 + float(slot) * 1.13) * amplitude
+            param.copy_(values.reshape(param.shape).to(param.dtype))
+
+
+def bf16_tokens(up, count: int, width: int, phase: float, scale: float):
+    torch = up.torch
+    idx = torch.arange(count * width, dtype=torch.float64)
+    return (torch.sin(idx * 0.013 + phase) * scale).reshape(1, count, width).to(torch.float32)
+
+
+def bf16_chain(up, params, cfg, video, audio, rule: str):
+    """What the C++ bf16 arm computes: bf16 weights, f32 accumulate, round at
+    every store point upstream has one -- and exactly one wrong rule when asked."""
+    torch = up.torch
+    bf = torch.bfloat16
+
+    def rnd(t):
+        return t.to(bf).float()
+
+    vdim, adim, hidden, queries, heads, mlp = cfg
+    w = {k: rnd(v) for k, v in params.items()}
+    if rule == "emb_f32":
+        for k in ("video_modality_emb", "audio_modality_emb"):
+            w[k] = params[k].clone()
+
+    def lin(x, weight, bias):
+        y = x @ weight.T
+        # R1. Upstream's bf16 Linear is bf16(f32(a) @ f32(w).T + f32(b)) -- ONE
+        # rounding, with the bias added at the accumulator's width.
+        return rnd(rnd(y) + bias) if rule == "two_round" else rnd(y + bias)
+
+    groups = []
+    for name, tokens, dim in (("video", video, vdim), ("audio", audio, adim)):
+        if tokens is None:
+            continue
+        y = lin(rnd(tokens), w[f"{name}_input_proj.weight"], w[f"{name}_input_proj.bias"])
+        emb = w[f"{name}_modality_emb"]
+        # R2. The embedding is a narrowed Parameter and the add rounds.
+        y = (y + emb) if rule == "add_f32" else rnd(y + emb)
+        groups.append(y)
+    tok = torch.cat(groups, dim=1)
+
+    batch, seq = tok.shape[0], tok.shape[1]
+    head_dim = hidden // heads
+    iw = w["attention_pooler.cross_attn.in_proj_weight"]
+    ib = w["attention_pooler.cross_attn.in_proj_bias"]
+    qt = w["attention_pooler.query_tokens"].unsqueeze(0).expand(batch, -1, -1)
+    qp = lin(qt, iw[:hidden], ib[:hidden])
+    kp = lin(tok, iw[hidden:2 * hidden], ib[hidden:2 * hidden])
+    vp = lin(tok, iw[2 * hidden:], ib[2 * hidden:])
+    qh = qp.reshape(batch, queries, heads, head_dim).transpose(1, 2)
+    kh = kp.reshape(batch, seq, heads, head_dim).transpose(1, 2)
+    vh = vp.reshape(batch, seq, heads, head_dim).transpose(1, 2)
+    scores = (qh @ kh.transpose(-1, -2)) / math.sqrt(head_dim)
+    # R5a. torch's bf16 attention core keeps its softmax at the accumulator's
+    # width; narrowing the scores and the weights is the plausible wrong rule.
+    if rule == "soft_bf16":
+        scores = rnd(scores)
+    probs = torch.softmax(scores, dim=-1)
+    if rule == "soft_bf16":
+        probs = rnd(probs)
+    pooled = (probs @ vh).transpose(1, 2).reshape(batch, queries, hidden)
+    # R5b. The pooled result IS stored at bf16.
+    if rule != "attn_f32":
+        pooled = rnd(pooled)
+    pooled = lin(pooled, w["attention_pooler.cross_attn.out_proj.weight"],
+                 w["attention_pooler.cross_attn.out_proj.bias"])
+
+    flat = pooled.reshape(batch, -1)
+    hid = lin(flat, w["mlp_hidden.weight"], w["mlp_hidden.bias"])
+    inner = 0.7978845608028654 * (hid + 0.044715 * hid ** 3)
+    # R3. gelu(approximate="tanh") is f32 opmath rounded ONCE on store; narrowing
+    # the tanh argument is the wrong rule that type-checks.
+    if rule == "gelu_narrow":
+        inner = rnd(inner)
+    act = rnd(0.5 * hid * (1.0 + torch.tanh(inner)))
+    log_duration = lin(act, w["mlp_out.weight"], w["mlp_out.bias"]).squeeze(-1)
+    # R4. THE LAST ROUNDING IS THE ONE A USER SEES: it decides the frame count.
+    return log_duration.exp() if rule == "exp_f32" else rnd(log_duration.exp())
+
+
+# Candidates, swept rather than chosen. A fixture is EMITTED only when the
+# correct chain reproduces upstream bit-exactly on it; the rules it separates are
+# then counted toward the coverage this file also emits.
+BF16_CANDIDATES = (
+    #  vdim adim hid  q  h  mlp   Tv  Ta   amp  tokscale
+    (4096, 2048, 256, 1, 4, 256,   6,  4, 0.18, 0.50),  # the SHIPPED widths, both streams
+    (4096, 2048, 256, 1, 4, 256,   7,  0, 0.18, 0.50),  # shipped, video only
+    (4096, 2048, 256, 1, 4, 256,   0,  5, 0.18, 0.50),  # shipped, audio only -- T2A's shape
+    (4096, 2048, 256, 1, 4, 256,   6,  4, 0.05, 0.50),  # shipped, the QUIET amplitude
+    ( 128,   64,  32, 1, 4,  24,   6,  4, 0.35, 0.50),
+    ( 128,   64,  32, 1, 4,  24,  12,  8, 0.25, 0.50),  # the only pair that reaches R3
+    ( 256,  128,  32, 1, 4,  32,  12,  8, 0.35, 0.50),
+    ( 256,  128,  32, 1, 4,  32,   6,  4, 0.40, 0.50),
+    ( 128,   64,  32, 1, 4,  24,  12,  8, 0.40, 0.50),
+)
+
+
 TIME_SCALE = 8  # VIDEO_SCALE_FACTORS.time (ltx_core/types.py:70)
 
 
