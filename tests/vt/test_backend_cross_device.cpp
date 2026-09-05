@@ -2666,6 +2666,7 @@ namespace vt::rocm {
 int KQuantDecodeCoopWarps(vt::DType wdt, int64_t m, int64_t nsb);
 uint64_t KQuantCoopDispatchCount();
 uint64_t KQuantWmmaDispatchCount();
+uint64_t KQuantWmmaQ4KDispatchCount();
 void Q8KQuantizeForTest(vt::Queue& q, void* scratch, const void* act, vt::DType dtype,
                         int64_t row_stride, int64_t rows, int64_t nsb, bool candidate);
 bool Q8KCandidateSelectedForTest(const char* env_value, bool gfx1100_default_accepted,
@@ -3391,6 +3392,97 @@ TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
     // site's call in a scratch copy leaves this counter flat and reds this
     // case, which the NMSE checks above cannot do on their own — the scalar
     // fallback would still pass them.
+    CHECK(wmma_after > wmma_before);
+  }
+  rocm.DestroyQueue(q);
+}
+
+// Same row, Q4_K arm (issue #2109's `## Owed`, landed in a follow-up wave):
+// Q4_K's scale granularity is 32-wide, twice the 16-wide WMMA K-tile, and it
+// carries a second per-sub-block correction (`dmin * sumi`) Q6_K has no
+// equivalent of, so this is not just the Q6_K case with a different dtype —
+// it exercises a materially different code path in `KQuantGemmKWmmaQ4K`.
+TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  constexpr int64_t M = 32, N = 48, K = 512;
+  constexpr int64_t kBlockBytes = 144;  // sizeof(BlockQ4_K)
+  constexpr int kDOff = 0, kDminOff = 2;
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+  const size_t row_bytes = static_cast<size_t>(nsb) * kBlockBytes;
+  const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+  std::mt19937 rng(2412);
+  std::vector<uint8_t> wt(wn);
+  for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+  for (int64_t r = 0; r < N; ++r)
+    for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+      uint8_t* blk = wt.data() + r * row_bytes + bIdx * kBlockBytes;
+      const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+      auto put16 = [&](int off, float v) {
+        const uint16_t h = vt::F32ToF16(v);
+        std::memcpy(blk + off, &h, 2);
+      };
+      put16(kDOff, 0.0125f * jitter);
+      put16(kDminOff, 0.0075f * jitter);
+    }
+
+  const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+  const std::vector<float> act = RandomVec(an, 2413, -0.5f, 0.5f);
+
+  std::vector<float> ref(on, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> ca = act;
+    std::vector<uint8_t> cw = wt;
+    Tensor tout = T2(ref.data(), cd, M, N);
+    Tensor tact = T2(ca.data(), cd, M, K);
+    Tensor twt = Tensor::Contiguous(cw.data(), vt::DType::kQ4_K, cd, {N, K});
+    vt::MatmulBTQuant(cq, tout, tact, twt);
+    cpu.DestroyQueue(cq);
+  }
+
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  const Device d{DeviceType::kROCM, 0};
+  DevBuf da(rocm, q, an);
+  DevBufBytes dwt(rocm, q, wn);
+  da.Upload(act);
+  dwt.Upload(wt.data());
+  Tensor tact = T2(da.ptr(), d, M, K);
+  Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kQ4_K, d, {N, K});
+
+  for (bool bf16_out : {false, true}) {
+    CAPTURE(bf16_out);
+    const uint64_t wmma_before = vt::rocm::KQuantWmmaQ4KDispatchCount();
+    if (!bf16_out) {
+      DevBuf dout(rocm, q, on);
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    } else {
+      DevBufBytes dout(rocm, q, on * sizeof(uint16_t));
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      std::vector<uint16_t> got(on);
+      dout.Download(got.data());
+      std::vector<float> gotf(on);
+      for (size_t i = 0; i < on; ++i) gotf[i] = vt::BF16ToF32(got[i]);
+      CHECK(Nmse(ref, gotf) <= kNmseTol);
+    }
+    const uint64_t wmma_after = vt::rocm::KQuantWmmaQ4KDispatchCount();
     CHECK(wmma_after > wmma_before);
   }
   rocm.DestroyQueue(q);

@@ -166,6 +166,12 @@ scale layout through the tile op.
 - hipBLASLt per-superblock scale support: unmeasured; recorded as an open
   question for whoever implements W1, not assumed either way beyond the
   Risks section above.
+- Q5_K WMMA tile: same 32-wide scale/min shape `KQuantGemmKWmmaQ4K` already
+  carries, plus a high-bit plane (like Q6_K's `qh`) neither existing kernel
+  handles. Deprioritized below Q4_K by real-model evidence: the checkpoint
+  this row gates against (`Q4_K_M`) never invokes Q5_K at all — it is a
+  `Q5_K_M`/`Q5_K_S`-only format — so porting it would not move this row's own
+  gate (c) measurement, only a differently-quantized checkpoint's.
 
 ## Stop conditions
 
@@ -251,6 +257,60 @@ evidence toward gate (c); replicating the issue's own exact recipe (its
 prompt, its `-n 128 -ngl 99`, and the oracle side) is the remaining step to
 close it and is not done in this paragraph.
 
-Not yet closed: Q4_K/Q5_K and the M/N tail remain `## Owed`, as scoped above.
-W2 (launch-site replacement) refers to the scalar arm's retirement once every
+**Q4_K WMMA tile (`KQuantGemmKWmmaQ4K`) landed in the same wave**, at the
+developer's direction after the real-model trace above showed Q4_K carrying
+59.2% of this checkpoint's total kernel time (7090.3 ms of 11973.9 ms
+scalar-arm total across 108 calls) against Q6_K's 36.1% (20 calls) — bigger
+in absolute terms than the kernel this row started with, so closing it
+mattered more than tuning Q6_K further. Q4_K's layout differs from Q6_K's in
+two ways this kernel carries: its nibbles are UNSIGNED (no -32 recentering —
+the scalar `DotQ4K` has none either), and its scale granularity is 32-wide
+(twice the 16-wide WMMA tile) with a SECOND per-sub-block correction
+(`dmin * sumi`, using the activation's precomputed `bsums` against the
+weight's mins) that needs no tensor-core work at all and is folded into the
+same one-f32-expression-per-superblock epilogue as a separate integer
+accumulator. `kGroupGemmBatch == 2` batches exactly one Q4_K sub-block (two
+16-wide K-tiles) per barrier, by construction rather than by re-tuning.
+
+Same hardware-verification shape as Q6_K: correct against the CPU oracle
+(f32 and bf16 out), and BOTH correction terms mutation-proven separately
+(breaking the scale term reds NMSE 0.639; breaking the min term reds NMSE
+0.0027 — smaller because the min term is the smaller correction, but still
+~5.5x over the 5e-4 bound) — reverting each restores an identical source
+hash. `ctest -R 'rocm|cross_device'` carries the same single pre-existing
+failure as every commit in this row.
+
+**Op-level A/B (`examples/quant-gemm-bench`), Q4_K prefill:**
+
+| Shape | scalar | WMMA | ratio |
+|---|---:|---:|---:|
+| N=3072 K=2048 | 390.5 GFLOP/s | 1134.4 GFLOP/s | 2.91x |
+| N=12288 K=2048 | 447.5 GFLOP/s | 1331.1 GFLOP/s | 2.97x |
+| N=2048 K=6144 | 302.7 GFLOP/s | 1094.9 GFLOP/s | 3.62x |
+
+Smaller than Q6_K's ratio: Q4_K's scalar arm was already lighter per element
+(a plain nibble mask, versus Q6_K's heavier ql+qh reconstruction) and the
+WMMA arm carries extra per-cell work (the min-correction loop, the scale/min
+unpack) that Q6_K's does not. Real, still substantial in absolute terms given
+Q4_K's share of total kernel time.
+
+**Second real-model measurement, same recipe as above, same 288-token
+prompt, same binary, both kernels active:**
+
+| | scalar (`=0`) | WMMA (both kernels) | ratio |
+|---|---:|---:|---:|
+| `KQuantGemmKWmmaQ4K<float>` (64 calls) | 4700.3 ms | 1199.5 ms | 3.92x |
+| `KQuantGemmKWmmaQ4K<uint16_t>` (44 calls) | 2380.2 ms | 475.9 ms | 5.00x |
+| `KQuantGemmKWmmaQ6K<uint16_t>` (20 calls) | 4311.9 ms | 203.5 ms | 21.2x |
+| Total kernel time, whole forward pass | 11954.5 ms | 2447.1 ms | **4.89x** |
+| Wall clock (`vllm-cli`, includes model load) | 12.358 s | 2.844 s | 4.35x |
+
+Same caveat as the Q6_K-only measurement: this is not the issue's own `-n 128
+-ngl 99` recipe, so the absolute totals are not directly comparable to its
+108,817 ms / 18,812 ms figures. It is the strongest real-model evidence this
+row has produced toward gate (c) — closing gate (c) itself still needs the
+issue's exact recipe run, oracle side included.
+
+Not yet closed: Q5_K and the M/N tail remain `## Owed`, as scoped above. W2
+(launch-site replacement) refers to the scalar arm's retirement once every
 format is covered; today both arms coexist by design.

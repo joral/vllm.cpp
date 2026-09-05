@@ -452,10 +452,14 @@ __device__ inline void DequantQ6KGroup16(const BlockQ6_K* xb, int grp, int8_t ou
 // than a correctness concern — the row's spec gate (c) (rocprofv3 total
 // kernel time) is not asserted by this commit, and closing it is follow-up
 // work once this mechanism is confirmed correct on-target.
-// Plain integer, never gated by VT_ROCM_QUANT_WMMA_OK: the host launch site
-// below needs it on every compilation pass, including the host pass, where
-// that macro is never defined.
+// Plain integers, never gated by VT_ROCM_QUANT_WMMA_OK: the host launch site
+// below needs kQuantWmmaWarpsPerBlock on every compilation pass, including
+// the host pass, where that macro is never defined; kGroupGemmBatch is
+// shared by every WMMA-format kernel in this file (Q4_K's below included),
+// so it lives at file scope rather than once per kernel body.
 constexpr int kQuantWmmaWarpsPerBlock = 4;
+constexpr int kGroupGemmBatch = 2;
+static_assert(16 % kGroupGemmBatch == 0, "16 scale-groups must divide evenly into batches");
 
 template <typename OutT>
 __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
@@ -490,14 +494,12 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
   // (only 16 of 32 lanes filled one row each). Spreading the same total work
   // over all 32 lanes across all 16 groups removes both costs in one change.
   __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16][16];
-  // raw_tile now holds kGroupGemmBatch groups' raw WMMA tiles at once, so a
-  // whole batch's compute+store is one barrier and its scale-fold is another,
-  // rather than a barrier per single group each way. 16 KiB (w_stage) + 16
-  // KiB (this, at batch 4) = 32 KiB/block, comfortably under the 64 KiB LDS
-  // budget this project's other WMMA kernels stay inside
+  // raw_tile holds kGroupGemmBatch groups' raw WMMA tiles at once, so a
+  // whole batch's compute+store is one barrier and its scale-fold is
+  // another, rather than a barrier per single group each way. 16 KiB
+  // (w_stage) + 8 KiB (this, at batch 2) = 24 KiB/block, comfortably under
+  // the 64 KiB LDS budget this project's other WMMA kernels stay inside
   // (rocm_paged_attn.hip's own BM=16 BN=64 d=256 note).
-  constexpr int kGroupGemmBatch = 2;
-  static_assert(16 % kGroupGemmBatch == 0, "16 scale-groups must divide evenly into batches");
   __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][kGroupGemmBatch][16][16];
 
   const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ6_K);
@@ -572,6 +574,184 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
       const int ii = cell / 16, jj = cell % 16;
       const float d = DF16ToF32(xb_cur[jj]->d) * a_row0[ii * nsb + sb].d;
       acc_f[c] += d * static_cast<float>(isum[c]);
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < 8; ++c) {
+    const int cell = lane + c * 32;
+    const int ii = cell / 16, jj = cell % 16;
+    const int64_t oi = i0 + ii, oj = j0 + jj;
+    if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[c];
+    else out[oi * n + oj] = DF32ToBF16(acc_f[c]);
+  }
+#endif  // VT_ROCM_QUANT_WMMA_OK
+}
+
+// --- RDNA4 WMMA int8 tile arm of KQuantGemmK, Q4_K
+// (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4, issue #2109's `## Owed`). Same mechanism
+// as `KQuantGemmKWmmaQ6K` above (same tile shape, same fill-once-per-
+// superblock staging, same batch-of-`kGroupGemmBatch` store/fold), but Q4_K's
+// layout differs from Q6_K's in two ways this kernel has to carry:
+//
+// 1. Q4_K's nibbles are UNSIGNED (0..15, no -32 recentering — DotQ4K's own
+//    scalar reconstruction has none either, because the "DC offset" a
+//    superblock's values sit at is corrected by the min term below rather
+//    than by centering the nibble itself).
+// 2. Q4_K's scale granularity is 32-wide (`kQK_K/32 == 8` sub-blocks), twice
+//    the 16-wide WMMA K-tile, so `kGroupGemmBatch == 2` batches two K-tiles
+//    per sub-block by CONSTRUCTION here, not by the batch-size tuning
+//    `KQuantGemmKWmmaQ6K`'s spec table recorded — `qsb = gb / kGroupGemmBatch`
+//    is exact for batch 2 and would silently stop being one sub-block if that
+//    constant ever changed independently of this comment.
+//
+// Q4_K also carries a SECOND per-sub-block correction the scalar arm calls
+// `dmin * sumi`: `sumi = sum_g bsums[g] * mins[g/2]` uses the ACTIVATION's
+// already-quantized per-16-group sums (`BlockQ8_K::bsums`) against the
+// WEIGHT's per-32-sub-block mins, and needs no tensor-core work at all — it
+// is 16 integer multiply-adds per output cell, done directly in registers.
+// `isum` (the tensor-core term) and `sumi` (the min term) are kept in
+// SEPARATE integer accumulators for the same reason `KQuantGemmKWmmaQ6K`
+// keeps one: each is exact on its own, and `d * isum - dmin * sumi` is the
+// only float expression, applied once per superblock, matching `DotQ4K`
+// verbatim.
+#if defined(VT_ROCM_QUANT_WMMA_OK)
+__device__ inline void DequantQ4KTile16(const BlockQ4_K* xb, int tile16, int8_t out[16]) {
+  const int sb = tile16 >> 1;
+  const int t = tile16 & 1;
+  const uint8_t* q4b = xb->qs + (sb / 2) * 32;
+  const int shift = (sb & 1) ? 4 : 0;
+#pragma unroll
+  for (int k = 0; k < 16; ++k) {
+    const int e = t * 16 + k;
+    out[k] = static_cast<int8_t>((q4b[e] >> shift) & 0x0F);
+  }
+}
+
+// The packed-scales unpack `DotQ4K`/`DotQ5K` both already do inline; factored
+// out here only because this kernel needs it once per (row, superblock)
+// rather than folded into a single-row dot product.
+__device__ inline void UnpackQ4KScalesMins(const BlockQ4_K* xb, uint8_t scales[8],
+                                           uint8_t mins[8]) {
+  const uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f, kmask3 = 0x03030303;
+  uint32_t utmp[4];
+  memcpy(utmp, xb->scales, 12);
+  utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+  const uint32_t uaux = utmp[1] & kmask1;
+  utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+  utmp[2] = uaux;
+  utmp[0] &= kmask1;
+  const uint8_t* s = reinterpret_cast<const uint8_t*>(&utmp[0]);
+  const uint8_t* mn = reinterpret_cast<const uint8_t*>(&utmp[2]);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    scales[i] = s[i];
+    mins[i] = mn[i];
+  }
+}
+#endif  // VT_ROCM_QUANT_WMMA_OK
+
+template <typename OutT>
+__global__ void KQuantGemmKWmmaQ4K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                                   const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
+                                   int64_t nsb, int64_t n_tiles) {
+#if !defined(VT_ROCM_QUANT_WMMA_OK)
+  (void)out; (void)weight; (void)act; (void)m; (void)n; (void)nsb; (void)n_tiles;
+  return;
+#else
+  using namespace rocwmma;
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * kQuantWmmaWarpsPerBlock +
+                       static_cast<int64_t>(threadIdx.y);
+  const int64_t m_tiles = m / 16;
+  if (tile >= m_tiles * n_tiles) return;
+  const int64_t it = tile / n_tiles;
+  const int64_t jt = tile % n_tiles;
+  const int64_t i0 = it * 16;
+  const int64_t j0 = jt * 16;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int wy = static_cast<int>(threadIdx.y);
+
+  __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16][16];
+  __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][kGroupGemmBatch][16][16];
+  // Unpacked once per (row, superblock): 8 scales + 8 mins, tiny next to the
+  // tile buffers above.
+  __shared__ uint8_t row_scales[kQuantWmmaWarpsPerBlock][16][8];
+  __shared__ uint8_t row_mins[kQuantWmmaWarpsPerBlock][16][8];
+
+  const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ4_K);
+  const BlockQ4_K* w_row_base[16];
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    w_row_base[r] =
+        reinterpret_cast<const BlockQ4_K*>(weight + static_cast<size_t>(j0 + r) * row_stride);
+  }
+  const BlockQ8_K* a_row0 = act + i0 * nsb;
+
+  float acc_f[8];
+#pragma unroll
+  for (int c = 0; c < 8; ++c) acc_f[c] = 0.0f;
+
+  for (int64_t sb = 0; sb < nsb; ++sb) {
+    const BlockQ4_K* xb_cur[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) xb_cur[r] = w_row_base[r] + sb;
+
+    if (lane < 16) UnpackQ4KScalesMins(xb_cur[lane], row_scales[wy][lane], row_mins[wy][lane]);
+
+    int32_t isum[8];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) isum[c] = 0;
+
+    for (int t = lane; t < 16 * 16; t += 32) {
+      const int row = t / 16;
+      const int tile16 = t % 16;
+      DequantQ4KTile16(xb_cur[row], tile16, w_stage[wy][tile16][row]);
+    }
+    __syncthreads();
+
+    for (int gb = 0; gb < 16; gb += kGroupGemmBatch) {
+      const int qsb = gb / kGroupGemmBatch;  // one Q4_K sub-block of 32 (see header note)
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+        const int grp = gb + gi;
+        fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+        fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
+        fragment<accumulator, 16, 16, 16, int32_t> acc;
+        fill_fragment(acc, 0);
+        const int8_t* a_ptr = a_row0[sb].qs + grp * 16;
+        const long a_ld = static_cast<long>(nsb) * static_cast<long>(sizeof(BlockQ8_K));
+        load_matrix_sync(a_frag, a_ptr, a_ld);
+        load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
+        mma_sync(acc, a_frag, b_frag, acc);
+        store_matrix_sync(&raw_tile[wy][gi][0][0], acc, 16, mem_row_major);
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          const int cell = lane + c * 32;
+          const int ii = cell / 16, jj = cell % 16;
+          isum[c] += raw_tile[wy][gi][ii][jj] * static_cast<int32_t>(row_scales[wy][jj][qsb]);
+        }
+      }
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      const int cell = lane + c * 32;
+      const int ii = cell / 16, jj = cell % 16;
+      int32_t sumi = 0;
+#pragma unroll
+      for (int g = 0; g < 16; ++g) {
+        sumi += static_cast<int32_t>(a_row0[ii * nsb + sb].bsums[g]) *
+                static_cast<int32_t>(row_mins[wy][jj][g / 2]);
+      }
+      const float d = DF16ToF32(xb_cur[jj]->d) * a_row0[ii * nsb + sb].d;
+      const float dmin = DF16ToF32(xb_cur[jj]->dmin) * a_row0[ii * nsb + sb].d;
+      acc_f[c] += d * static_cast<float>(isum[c]) - dmin * static_cast<float>(sumi);
     }
   }
 
@@ -980,6 +1160,11 @@ std::atomic<uint64_t> g_kq_coop_dispatches{0};
 // output values.
 std::atomic<uint64_t> g_kq_wmma_dispatches{0};
 
+// Same witness, Q4_K's own call site. Kept as a separate counter rather than
+// folded into the one above so a reviewer can prove EACH format's launch
+// site is reached independently, not infer Q4_K's from Q6_K's.
+std::atomic<uint64_t> g_kq_wmma_q4k_dispatches{0};
+
 // VT_ROCM_QUANT_WMMA=0 forces the scalar arm even on gfx1200/gfx1201 — the
 // A/B escape hatch every WMMA arm in this tree ships with
 // (VT_ATTN_PREFILL_SHAREDK_WMMA is the paged-attention precedent). Default
@@ -1048,6 +1233,10 @@ uint64_t KQuantCoopDispatchCount() {
 
 uint64_t KQuantWmmaDispatchCount() {
   return g_kq_wmma_dispatches.load(std::memory_order_relaxed);
+}
+
+uint64_t KQuantWmmaQ4KDispatchCount() {
+  return g_kq_wmma_q4k_dispatches.load(std::memory_order_relaxed);
 }
 
 void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
@@ -1124,21 +1313,34 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
     const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
-    // RDNA4 WMMA tile arm: Q6_K prefill only (m > 1, since KQuantDecodeCoopWarps
-    // above already owns m == 1), tile-aligned M/N only. Every other shape and
-    // every other architecture falls through to the arms below unchanged.
-    const bool wmma_ok = fmt == 2 && m % 16 == 0 && n % 16 == 0 && QuantWmmaEnabled() &&
-                        Gfx12QuantWmmaHostOk(q.device.index);
+    // RDNA4 WMMA tile arm: Q6_K and Q4_K prefill only (m > 1, since
+    // KQuantDecodeCoopWarps above already owns m == 1), tile-aligned M/N
+    // only. Q5_K is `## Owed` — same 32-wide scale/min shape as Q4_K plus a
+    // high-bit plane, not yet ported. Every other shape and every other
+    // architecture falls through to the arms below unchanged.
+    const bool wmma_ok = (fmt == 2 || fmt == 0) && m % 16 == 0 && n % 16 == 0 &&
+                        QuantWmmaEnabled() && Gfx12QuantWmmaHostOk(q.device.index);
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
-      if (wmma_ok) {
+      if (wmma_ok && fmt == 2) {
         g_kq_wmma_dispatches.fetch_add(1, std::memory_order_relaxed);
         const int64_t n_tiles = n / 16;
         const int64_t m_tiles = m / 16;
         const int64_t grid_wmma = (m_tiles * n_tiles + kQuantWmmaWarpsPerBlock - 1) /
                                   kQuantWmmaWarpsPerBlock;
         KQuantGemmKWmmaQ6K<OutT><<<static_cast<unsigned>(grid_wmma),
+                                   dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
+            o, w, qact, m, n, nsb, n_tiles);
+        return;
+      }
+      if (wmma_ok && fmt == 0) {
+        g_kq_wmma_q4k_dispatches.fetch_add(1, std::memory_order_relaxed);
+        const int64_t n_tiles = n / 16;
+        const int64_t m_tiles = m / 16;
+        const int64_t grid_wmma = (m_tiles * n_tiles + kQuantWmmaWarpsPerBlock - 1) /
+                                  kQuantWmmaWarpsPerBlock;
+        KQuantGemmKWmmaQ4K<OutT><<<static_cast<unsigned>(grid_wmma),
                                    dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
             o, w, qact, m, n, nsb, n_tiles);
         return;
