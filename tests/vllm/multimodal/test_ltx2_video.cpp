@@ -13682,6 +13682,51 @@ TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
   CHECK(res.frame_count != recipe_res.frame_count);
 }
 
+// THE BARE SPELLING, WHICH NOTHING REACHED. `Ltx2VideoEngine::Load` has TWO
+// `Ltx2LoadDurationHeadWeights` call sites: the prefixed one, and a fallback for
+// a head stored without upstream's `duration_head.` prefix. The fixture for the
+// bare spelling has existed since row LTX25-DURATION-HEAD-WIRE (#2900) and NO
+// case used it, so the second call site was unreached and reverting its dtype
+// alone could not be seen. That is wave 5's own M9 finding -- two loader sites
+// reverted together, neither visible alone -- reproduced here rather than
+// inherited, and the row's spec named it before this case existed.
+//
+// So this case is the pair to the one above: the same two widths, through the
+// OTHER call site, on a head whose keys carry no prefix at all.
+TEST_CASE("ltx2 video: the BARE-spelled duration head loads through the second call site") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head_bare;
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_bare");
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  vllm::multimodal::VideoResult res;
+  REQUIRE_NOTHROW(res = engine->Generate(gen));
+
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+  INFO("bare head predicted " << trace.duration_seconds << "s -> " << trace.duration_frames
+                              << " frames");
+  // THE HEAD RAN, which is what says the fallback bound a real bag rather than
+  // returning upstream's `None` and leaving the recipe to decide.
+  REQUIRE(trace.duration_frames > 0);
+  CHECK(res.frame_count == trace.duration_frames);
+
+  // AND IT RAN AT UPSTREAM'S WIDTH. Reverting the bare call site alone to `kF32`
+  // reds these two and nothing else in this suite.
+  const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+  INFO("bare duration head weights: " << trace.duration_head_weight_bytes << " bytes over "
+                                      << trace.duration_head_weight_elems << " parameters");
+  REQUIRE(trace.duration_head_weight_elems > 0);
+  CHECK(trace.duration_head_weight_bytes == trace.duration_head_weight_elems * bf16_bytes);
+  REQUIRE(trace.duration_head_values > 0);
+  CHECK(trace.duration_head_not_bf16 == 0);
+}
+
 // A RETAKE HAS NO PREDICTOR, AND THIS ROW REFUSED TO LET ONE SILENTLY WIN
 // TWO STATEMENTS EARLIER. `retake.py` reads its frame count off the source
 // clip's metadata (`:220`) and constructs no `DurationPredictor`, so an
