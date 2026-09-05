@@ -1260,7 +1260,13 @@ target_include_directories(test_dots3_note_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # performance number is claimable. CPU-only, no checkpoint download, no GPU.
 vllm_cpp_add_test(test_dots3_note_vision vllm/models/test_dots3_note_vision.cpp)
 target_compile_definitions(test_dots3_note_vision PRIVATE
-  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev"
+  # W9d (#2881): the reference-independence case re-reads THIS file and counts
+  # the qualified names in each reference namespace, through the shared
+  # instrument in `dots3_note_ref_independence.h`. Same arrangement the audio
+  # target uses; the instrument takes the path as an argument precisely so the
+  # two targets share one scan and one pp-number rule.
+  DOTS3_VISION_TEST_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/test_dots3_note_vision.cpp")
 
 # dots3-note W7a (#2703): the AUDIO tower and its front end. Two fixture
 # directories, because the two halves are gated against different things — the

@@ -36,6 +36,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -55,8 +57,13 @@
 #include "vllm/multimodal/dots3_note_processor.h"
 #include "vllm/multimodal/pil_resize.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
+#include "vllm/model_executor/models/dense_attn_block.h"  // Dev / DBuf
+#include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // BlockFp8Runnable
+#include "dots3_note_ref_independence.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
 
 namespace {
 
@@ -315,6 +322,23 @@ std::vector<double> Attention(const std::vector<double>& q,
 double Silu(double x) { return x / (1.0 + std::exp(-x)); }
 double Sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
+// Round a double to the nearest bf16 value, ties to even, and hand it back as a
+// double. Needed only by the FP8 arm's A/B, where upstream's OTHER class
+// accumulates its denominator in the activation dtype (`vision.py:188`) over
+// addends it has already rounded to it (`:200`). Written on the bit pattern
+// because that is what bf16 IS -- the top 16 bits of the f32 -- and doing it in
+// arithmetic would be a second, weaker definition.
+double Bf16(double x) {
+  const float f = static_cast<float>(x);
+  std::uint32_t b = 0;
+  std::memcpy(&b, &f, sizeof(b));
+  const std::uint32_t lsb = (b >> 16) & 1u;
+  b = (b + 0x7FFFu + lsb) & 0xFFFF0000u;
+  float r = 0.0F;
+  std::memcpy(&r, &b, sizeof(r));
+  return static_cast<double>(r);
+}
+
 // What the gate needs to say about a DISCRETE decision, computed on the
 // reference's own side.
 struct MoeRouteRef {
@@ -502,6 +526,371 @@ std::vector<double> PixelShuffle(const std::vector<double>& x, int64_t gh,
   return out;
 }
 // `nn.GELU()` with no `approximate=` is the EXACT erf gelu.
+// ═══════════════════════════════════════════════════════════════════════════
+// THE FP8 ARM'S REFERENCE (W9d, #2881). Written from the upstream source at
+// `9035151d6`; it calls nothing the implementation calls -- not
+// `vt::F32ToF8E4M3`, not `vt::QuantFp8Group`, not `vt::MatmulFp8BlockScaled`,
+// not `Dots3NoteVisionBlockCastFp8`. Its own e4m3 encoder is below, and the
+// enumeration case is what holds that claim to the bytes rather than to this
+// sentence.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// f32 -> raw fp8-e4m3fn byte, round-to-nearest-even, saturating at +/-448 and
+// with no infinity (`fp8_e4m3fn`: NaN only at 0x7F/0xFF).
+//
+// Written as a DECOMPOSITION over the representable grid rather than as bit
+// surgery on the f32, which is the shape `include/vt/fp8_kv.h` uses. Two
+// readings of the same IEEE definition that share no expression: a slip in
+// either one moves the bytes and G1 compares them.
+unsigned char Fp8E4M3Encode(double x) {
+  const unsigned char sign = std::signbit(x) ? 0x80u : 0x00u;
+  const double a = std::fabs(x);
+  if (std::isnan(a)) return 0x7Fu;
+  if (a >= 448.0) return static_cast<unsigned char>(sign | 0x7Eu);
+  // Subnormals: exponent field 0, value = mant * 2^-9.
+  if (a < std::ldexp(1.0, -6)) {
+    const double q = a * 512.0;
+    double lo = std::floor(q);
+    double frac = q - lo;
+    if (frac > 0.5 || (frac == 0.5 && std::fmod(lo, 2.0) != 0.0)) lo += 1.0;
+    if (lo >= 8.0) return static_cast<unsigned char>(sign | (1u << 3));
+    return static_cast<unsigned char>(sign |
+                                      static_cast<unsigned char>(lo));
+  }
+  int e = static_cast<int>(std::floor(std::log2(a)));
+  if (e < -6) e = -6;
+  if (std::ldexp(1.0, e + 1) <= a) e += 1;
+  if (a < std::ldexp(1.0, e)) e -= 1;
+  double q = a / std::ldexp(1.0, e) * 8.0;  // in [8, 16)
+  double lo = std::floor(q);
+  const double frac = q - lo;
+  if (frac > 0.5 || (frac == 0.5 && std::fmod(lo, 2.0) != 0.0)) lo += 1.0;
+  if (lo >= 16.0) {
+    lo = 8.0;
+    e += 1;
+  }
+  const int exp_field = e + 7;
+  const int mant = static_cast<int>(lo) - 8;
+  if (exp_field > 15 || (exp_field == 15 && mant >= 7))
+    return static_cast<unsigned char>(sign | 0x7Eu);
+  return static_cast<unsigned char>(
+      sign | (static_cast<unsigned char>(exp_field) << 3) |
+      static_cast<unsigned char>(mant));
+}
+
+double Fp8E4M3Decode(unsigned char b) {
+  const double sm = (b & 0x80u) != 0u ? -1.0 : 1.0;
+  const int e = static_cast<int>((b >> 3) & 0x0Fu);
+  const int m = static_cast<int>(b & 0x07u);
+  if (e == 15 && m == 7) return std::numeric_limits<double>::quiet_NaN();
+  if (e == 0) return sm * (static_cast<double>(m) / 512.0);
+  return sm * std::ldexp(1.0 + static_cast<double>(m) / 8.0, e - 7);
+}
+
+// One block-cast weight: the packed bytes at `[N, K]` and the f64 scale grid at
+// `[cdiv(N,128), cdiv(K,128)]`.
+struct BlockCastRef {
+  std::vector<unsigned char> packed;
+  std::vector<double> scale;
+  int64_t rows = 0;   // cdiv(N, 128)
+  int64_t cols = 0;   // cdiv(K, 128)
+};
+
+// `_per_block_cast_to_fp8_padded` (`vision.py:225-239`) over
+// `per_block_cast_to_fp8` (`vllm/utils/deep_gemm.py:660-681`), literally:
+//
+//   x_padded = zeros(align(m,128), align(n,128));  x_padded[:m,:n] = x   :669-672
+//   x_view   = x_padded.view(-1, 128, ncols/128, 128)                    :673
+//   x_amax   = x_view.abs().float().amax(dim=(1,3), keepdim=True).clamp(1e-4)
+//                                                                       :674
+//   sf       = x_amax / fp8_max                                          :676
+//   (no _ceil_to_ue8m0: use_ue8m0 is False at vision.py:237)             :677
+//   x_scaled = (x_view * (1.0 / sf)).to(fp8)                             :678
+//   return x_scaled[:m,:n], sf                                           :679-681
+//
+// The PAD is materialized here rather than reasoned away, because the whole
+// point of an independent reference is that it does not repeat the
+// implementation's shortcut. If the implementation's "a zero cannot raise an
+// absolute maximum" argument were wrong, this arm would disagree with it.
+BlockCastRef PerBlockCastFp8(const std::vector<double>& w, int64_t n,
+                             int64_t k) {
+  const int64_t B = 128;
+  const int64_t pn = ((n + B - 1) / B) * B, pk = ((k + B - 1) / B) * B;
+  std::vector<double> padded(static_cast<size_t>(pn * pk), 0.0);
+  for (int64_t r = 0; r < n; ++r)
+    for (int64_t c = 0; c < k; ++c)
+      padded[static_cast<size_t>(r * pk + c)] = w[static_cast<size_t>(r * k + c)];
+
+  BlockCastRef out;
+  out.rows = pn / B;
+  out.cols = pk / B;
+  out.scale.assign(static_cast<size_t>(out.rows * out.cols), 0.0);
+  std::vector<unsigned char> full(static_cast<size_t>(pn * pk), 0u);
+  for (int64_t bi = 0; bi < out.rows; ++bi) {
+    for (int64_t bj = 0; bj < out.cols; ++bj) {
+      double amax = 0.0;
+      for (int64_t r = 0; r < B; ++r)
+        for (int64_t c = 0; c < B; ++c)
+          amax = std::max(
+              amax, std::fabs(padded[static_cast<size_t>((bi * B + r) * pk +
+                                                         bj * B + c)]));
+      if (amax < 1e-4) amax = 1e-4;
+      const double sf = amax / 448.0;
+      out.scale[static_cast<size_t>(bi * out.cols + bj)] = sf;
+      const double inv = 1.0 / sf;
+      for (int64_t r = 0; r < B; ++r)
+        for (int64_t c = 0; c < B; ++c) {
+          const size_t idx =
+              static_cast<size_t>((bi * B + r) * pk + bj * B + c);
+          full[idx] = Fp8E4M3Encode(padded[idx] * inv);
+        }
+    }
+  }
+  out.packed.assign(static_cast<size_t>(n * k), 0u);
+  for (int64_t r = 0; r < n; ++r)
+    for (int64_t c = 0; c < k; ++c)
+      out.packed[static_cast<size_t>(r * k + c)] =
+          full[static_cast<size_t>(r * pk + c)];
+  return out;
+}
+
+// `per_token_group_quant_fp8` as the kernel that EXECUTES it computes it
+// (`csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu:47-86`,
+// which is the arm taken on a CUDA-alike with a contiguous input,
+// `fp8_utils.py:602-617`), with `use_ue8m0=False` (`vision_moe.py:80`, `:122`):
+//
+//   local_absmax = eps                        :47   -- eps SEEDS the reduction
+//   local_absmax = max(local_absmax, |src|)   :53
+//   y_s = local_absmax / 448                  :68   -- a DIVIDE
+//   q   = clamp(src / y_s, -448, 448)         :85   -- a DIVIDE
+//
+// eps is `1e-10` here (`fp8_utils.py:537`, the only value any call site
+// passes). That is NOT the weight caster's `1e-4` floor, and writing both in
+// one namespace is deliberate: the two constants belong to two different
+// upstream kernels and a reference that used one for both would agree with an
+// implementation that made the same mistake.
+struct GroupQuantRef {
+  std::vector<unsigned char> q;
+  std::vector<double> scale;  // [M, K/group]
+};
+
+GroupQuantRef GroupQuantFp8(const std::vector<double>& x, int64_t m, int64_t k,
+                            int64_t group) {
+  GroupQuantRef out;
+  const int64_t g = k / group;
+  out.q.assign(static_cast<size_t>(m * k), 0u);
+  out.scale.assign(static_cast<size_t>(m * g), 0.0);
+  for (int64_t r = 0; r < m; ++r) {
+    for (int64_t j = 0; j < g; ++j) {
+      double amax = 1e-10;
+      for (int64_t i = 0; i < group; ++i)
+        amax = std::max(amax,
+                        std::fabs(x[static_cast<size_t>(r * k + j * group + i)]));
+      const double ys = amax / 448.0;
+      out.scale[static_cast<size_t>(r * g + j)] = ys;
+      for (int64_t i = 0; i < group; ++i) {
+        const size_t idx = static_cast<size_t>(r * k + j * group + i);
+        double v = x[idx] / ys;
+        if (v > 448.0) v = 448.0;
+        if (v < -448.0) v = -448.0;
+        out.q[idx] = Fp8E4M3Encode(v);
+      }
+    }
+  }
+  return out;
+}
+
+// The block-scaled GEMM, with the scales applied IN THE MAINLOOP -- once per
+// K-block into a separate f64 partial that is scaled and only then folded in
+// (`native_w8a8_block_matmul`, `tests/kernels/quant_utils.py:91-154`; the scale
+// PRODUCT is formed first, `s = As_tiles[i] * Bs[j][i]`, at `:150-151`).
+//
+// An epilogue-only application has exactly one degree of freedom per output
+// element and this scheme has `cdiv(K, block)` of them, so collapsing `part`
+// into `acc` here is a DIFFERENT function and not a rounding difference.
+std::vector<double> BlockScaledMatmul(const GroupQuantRef& a,
+                                      const BlockCastRef& b, int64_t M,
+                                      int64_t N, int64_t K) {
+  const int64_t B = 128;
+  const int64_t kb = K / B;
+  std::vector<double> acc(static_cast<size_t>(M * N), 0.0);
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; ++n) {
+      double total = 0.0;
+      for (int64_t j = 0; j < kb; ++j) {
+        double part = 0.0;
+        for (int64_t i = 0; i < B; ++i) {
+          const int64_t kk = j * B + i;
+          part += Fp8E4M3Decode(a.q[static_cast<size_t>(m * K + kk)]) *
+                  Fp8E4M3Decode(b.packed[static_cast<size_t>(n * K + kk)]);
+        }
+        const double s = a.scale[static_cast<size_t>(m * kb + j)] *
+                         b.scale[static_cast<size_t>((n / B) * b.cols + j)];
+        total += part * s;
+      }
+      acc[static_cast<size_t>(m * N + n)] = total;
+    }
+  }
+  return acc;
+}
+
+// `MoESwiGLUFFNFP8.forward` (`vision.py:285-315`) over
+// `note_vision_fused_moe_fp8` (`vision_moe.py:25-149`), transcribed.
+//
+// The router half is byte-for-byte `MoESwiGLUFFN`'s (`:289-303` against
+// `:180-200`) EXCEPT that `topk_weights` is never cast to the activation dtype
+// -- upstream's `:200` has `.to(x_flat.dtype)` and `:303` does not. That single
+// missing cast is what makes the two denominators differ, and it is the reason
+// this function does not call `MoeFfn`'s router.
+//
+// `bf16_round`, when given, rounds every value the ACTIVATION dtype would round
+// -- the two GEMM outputs -- so the reference can be run at the implementation's
+// own precision. Passing the identity instead measures the formula in double.
+std::vector<double> MoeFfnFp8(const TinySpec& s, const TinyCheckpoint& ck,
+                              const std::string& pre, int64_t ne,
+                              const std::vector<double>& x, int64_t L,
+                              int64_t E, int64_t block, MoeRouteRef* route,
+                              bool bf16_denominator = false,
+                              std::vector<double>* denom_out = nullptr) {
+  const int64_t Im = s.v_moe_inter;
+  const int64_t k = std::min<int64_t>(
+      static_cast<int64_t>(s.v_capacity_factor), ne);
+  // `gate_logits = F.linear(x.float(), self.gate_weight.float())` (:289)
+  const std::vector<double> gl =
+      Linear(x, ck.value_of(pre + "mlp.gate_weight"), nullptr, L, E, ne);
+  const std::vector<double>& rb = ck.value_of(pre + "mlp.router_bias");
+
+  if (route != nullptr) {
+    route->block = block;
+    route->num_routed = ne;
+    route->top_k = k;
+    route->ids.assign(static_cast<size_t>(L * k), -1);
+  }
+
+  // --- the weight-side cast, once per expert (`vision.py:255-259`) ----------
+  std::vector<BlockCastRef> w13, w2;
+  for (int64_t e = 0; e < ne; ++e) {
+    const std::string ep =
+        pre + "mlp.experts." + std::to_string(e) + ".";
+    const BlockCastRef g = PerBlockCastFp8(ck.value_of(ep + "fc1.weight"), Im, E);
+    const BlockCastRef u = PerBlockCastFp8(ck.value_of(ep + "fc3.weight"), Im, E);
+    BlockCastRef m13;
+    m13.rows = g.rows + u.rows;
+    m13.cols = g.cols;
+    m13.packed = g.packed;
+    m13.packed.insert(m13.packed.end(), u.packed.begin(), u.packed.end());
+    m13.scale = g.scale;
+    m13.scale.insert(m13.scale.end(), u.scale.begin(), u.scale.end());
+    w13.push_back(m13);
+    w2.push_back(PerBlockCastFp8(ck.value_of(ep + "fc2.weight"), E, Im));
+  }
+
+  std::vector<double> out(static_cast<size_t>(L * E), 0.0);
+  std::vector<double> denom(static_cast<size_t>(L), 0.0);
+  for (int64_t t = 0; t < L; ++t) {
+    std::vector<double> gp(static_cast<size_t>(ne));
+    std::vector<double> gb(static_cast<size_t>(ne));
+    for (int64_t j = 0; j < ne; ++j) {
+      gp[static_cast<size_t>(j)] = Sigmoid(gl[static_cast<size_t>(t * ne + j)]);
+      gb[static_cast<size_t>(j)] =
+          gp[static_cast<size_t>(j)] + rb[static_cast<size_t>(j)];
+    }
+    // `torch.topk(biased_scores, k=topk, sorted=False).indices` (:297)
+    std::vector<char> taken(static_cast<size_t>(ne), 0);
+    std::vector<int64_t> sel;
+    double last_selected = 1e300;
+    for (int64_t r = 0; r < k; ++r) {
+      int64_t best = -1;
+      double best_v = -1e300;
+      for (int64_t j = 0; j < ne; ++j) {
+        if (taken[static_cast<size_t>(j)]) continue;
+        if (best < 0 || gb[static_cast<size_t>(j)] > best_v) {
+          best_v = gb[static_cast<size_t>(j)];
+          best = j;
+        }
+      }
+      taken[static_cast<size_t>(best)] = 1;
+      sel.push_back(best);
+      last_selected = best_v;
+    }
+    if (route != nullptr) {
+      double best_rejected = -1e300;
+      for (int64_t j = 0; j < ne; ++j)
+        if (!taken[static_cast<size_t>(j)])
+          best_rejected = std::max(best_rejected, gb[static_cast<size_t>(j)]);
+      if (best_rejected > -1e299) {
+        const double mg = last_selected - best_rejected;
+        if (mg < route->min_margin) {
+          route->min_margin = mg;
+          route->min_margin_token = t;
+        }
+      }
+      std::vector<int64_t> asc = sel;
+      std::sort(asc.begin(), asc.end());
+      for (int64_t r = 0; r < k; ++r)
+        route->ids[static_cast<size_t>(t * k + r)] = asc[static_cast<size_t>(r)];
+    }
+    // `topk_weights = scores.gather(1, topk_ids)` (:298), renormalized (:299-302)
+    // and scaled (:303) -- and NOT cast, which is the whole difference.
+    std::vector<double> tw(static_cast<size_t>(k));
+    double sum = 0.0;
+    for (int64_t r = 0; r < k; ++r) {
+      tw[static_cast<size_t>(r)] = gp[static_cast<size_t>(sel[static_cast<size_t>(r)])];
+      sum += tw[static_cast<size_t>(r)];
+    }
+    if (k > 1)
+      for (int64_t r = 0; r < k; ++r) tw[static_cast<size_t>(r)] /= (sum + 1e-9);
+    for (int64_t r = 0; r < k; ++r) tw[static_cast<size_t>(r)] *= s.v_router_scale;
+
+    // --- the two GEMMs, per selected slot (`vision_moe.py:91-148`) ----------
+    std::vector<double> row(static_cast<size_t>(E), 0.0);
+    for (int64_t r = 0; r < k; ++r) {
+      const int64_t e = sel[static_cast<size_t>(r)];
+      std::vector<double> xt(x.begin() + static_cast<std::ptrdiff_t>(t * E),
+                             x.begin() + static_cast<std::ptrdiff_t>((t + 1) * E));
+      const GroupQuantRef aq = GroupQuantFp8(xt, 1, E, 128);
+      const std::vector<double> g13 =
+          BlockScaledMatmul(aq, w13[static_cast<size_t>(e)], 1, 2 * Im, E);
+      // `apply_moe_activation(MoEActivation.SILU, ...)` (:114-118):
+      // silu(first half) * second half.
+      std::vector<double> act(static_cast<size_t>(Im));
+      for (int64_t i = 0; i < Im; ++i) {
+        const double gv = g13[static_cast<size_t>(i)];
+        act[static_cast<size_t>(i)] =
+            (gv / (1.0 + std::exp(-gv))) * g13[static_cast<size_t>(Im + i)];
+      }
+      const GroupQuantRef bq = GroupQuantFp8(act, 1, Im, 128);
+      const std::vector<double> o =
+          BlockScaledMatmul(bq, w2[static_cast<size_t>(e)], 1, E, Im);
+      // `mul_routed_weight=True` on the second dispatch (:135) then
+      // `ops.moe_sum` (:148).
+      for (int64_t c = 0; c < E; ++c)
+        row[static_cast<size_t>(c)] += o[static_cast<size_t>(c)] * tw[static_cast<size_t>(r)];
+    }
+
+    // THE DENOMINATOR, and the only line the A/B moves.
+    double d = 0.0;
+    if (bf16_denominator) {
+      // `MoESwiGLUFFN`'s (`vision.py:188`, `:200`, `:216`): the addends are
+      // rounded to the ACTIVATION dtype and accumulated in it, then `+ 1e-9`.
+      double acc = 0.0;
+      for (int64_t r = 0; r < k; ++r)
+        acc = Bf16(acc + Bf16(tw[static_cast<size_t>(r)]));
+      d = acc + 1e-9;
+    } else {
+      // `MoESwiGLUFFNFP8`'s (`vision.py:314`): an F32 sum, then a FLOOR.
+      double acc = 0.0;
+      for (int64_t r = 0; r < k; ++r) acc += tw[static_cast<size_t>(r)];
+      d = acc < 1e-9 ? 1e-9 : acc;
+    }
+    denom[static_cast<size_t>(t)] = d;
+    for (int64_t c = 0; c < E; ++c)
+      out[static_cast<size_t>(t * E + c)] = row[static_cast<size_t>(c)] / d;
+  }
+  if (denom_out != nullptr) *denom_out = denom;
+  return out;
+}
+
 double GeluErf(double x) {
   return 0.5 * x * (1.0 + std::erf(x / std::sqrt(2.0)));
 }
@@ -511,7 +900,8 @@ double GeluErf(double x) {
 std::vector<double> Tower(const TinySpec& s, const TinyCheckpoint& ck,
                           const std::vector<double>& pixels, int64_t t,
                           int64_t gh, int64_t gw,
-                          std::vector<MoeRouteRef>* routes = nullptr) {
+                          std::vector<MoeRouteRef>* routes = nullptr,
+                          bool fp8 = false, bool bf16_denominator = false) {
   const int64_t E = s.v_embed, nh = s.v_heads, hd = s.v_head_dim();
   const int64_t L = t * gh * gw, P = s.v_patch_row(), VI = s.v_inter;
   const double eps = s.v_rms_eps;
@@ -571,9 +961,15 @@ std::vector<double> Tower(const TinySpec& s, const TinyCheckpoint& ck,
                      s.v_pyramid[static_cast<size_t>(b)] > 0;
     if (moe) {
       MoeRouteRef route;
+      // `mlp_cls = MoESwiGLUFFNFP8 if config.enable_fp8_moe else MoESwiGLUFFN`
+      // (`vision.py:369`), and the reference makes the same choice on the same
+      // predicate rather than always computing the bf16 one.
       const std::vector<double> routed =
-          MoeFfn(s, ck, pre, s.v_pyramid[static_cast<size_t>(b)], n2, L, E, b,
-                 routes != nullptr ? &route : nullptr);
+          fp8 ? MoeFfnFp8(s, ck, pre, s.v_pyramid[static_cast<size_t>(b)], n2,
+                          L, E, b, routes != nullptr ? &route : nullptr,
+                          bf16_denominator)
+              : MoeFfn(s, ck, pre, s.v_pyramid[static_cast<size_t>(b)], n2, L,
+                       E, b, routes != nullptr ? &route : nullptr);
       if (routes != nullptr) routes->push_back(route);
       for (size_t i = 0; i < hidden.size(); ++i) hidden[i] += routed[i];
     } else {
@@ -710,8 +1106,14 @@ TowerRun RunTower(const TinySpec& spec, int image_variant = 0) {
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   r.ours = Dots3NoteVisionForward(kw.pixel_values_bf16, kw.image_grid_thw,
                                   r.weights, r.params, backend, &r.capture);
+  // The reference takes the arm the IMPLEMENTATION resolved, read off the
+  // loaded weights rather than recomputed from the spec. If the two ever
+  // disagreed about which class this config selects, the comparison below would
+  // be measuring two different functions and would still be green on a fixture
+  // whose two arms happened to be close.
   r.want = ref::Tower(r.bench->spec, r.bench->ckpt,
-                      WidenBf16(kw.pixel_values_bf16), 1, 4, 4, &r.ref_routes);
+                      WidenBf16(kw.pixel_values_bf16), 1, 4, 4, &r.ref_routes,
+                      r.weights.moe_arm.fp8);
   REQUIRE(r.ours.size() == r.want.size());
   for (size_t i = 0; i < r.ours.size(); ++i)
     r.max_abs = std::max(r.max_abs,
@@ -2099,4 +2501,585 @@ TEST_CASE("dots3-note W6b: a BF16 router_bias is refused by name, not read") {
 
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// W9d (#2881) — the FP8 vision MoE arm.
+//
+// NO ORACLE. Nothing below is compared against vLLM, nothing was run on either
+// side, and the numeric size of the divergence between upstream's two MoE
+// classes is UNMEASURED. Spec §6.4 option B. What these cases establish is that
+// the port takes upstream's class and upstream's arithmetic, and that each
+// defect they were built for is detected.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A tower whose two FP8 widths are 128-aligned, so `enable_fp8_moe` resolves to
+// the FP8 class and the arm actually computes.
+//
+// NO PUBLISHED CHECKPOINT IS SHAPED LIKE THIS and the case says so rather than
+// implying otherwise: the released `moe_intermediate_size` is 2112 and upstream
+// itself raises on it.
+//
+// 256 AND NOT 128, AND THE DIFFERENCE WAS MEASURED. 128 is the smallest value
+// that satisfies `_BLOCK_SHAPE[1]`, and it was the first choice. At 128 every
+// expert tensor is exactly ONE 128x128 block, so its scale grid is a single
+// cell -- and a mutation that replaced the per-BLOCK amax with a per-TENSOR one
+// left the whole suite green, because on a one-block tensor the two are the
+// same number (spec section 4.20.4.1, M3). A fixture that cannot tell per-block
+// from per-tensor cannot gate a per-block caster. At 256 each weight is a 2x2
+// grid and the merged `w13` a 4x2 one, so the four cells disagree and
+// `Fp8BlockScaleSpread` has something to measure. It also gives the ACTIVATION
+// quantizer two groups per row instead of one.
+TinySpec Fp8MoeSpec() {
+  TinySpec s;
+  s.v_pyramid = {-1, 4};
+  s.v_embed = 256;      // the FIRST quantization's width, and the gate/up K
+  s.v_moe_inter = 256;  // the SECOND quantization's width, and the down K
+  // ...and blocks whose absolute maxima actually differ, without which
+  // the per-block scale grid cannot be told from a per-tensor one.
+  s.v_expert_block_gain = true;
+  return s;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// G0. THE LOAD-BEARING CLAIM: which class upstream selects, and whether it runs.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W9d: `enable_fp8_moe` selects three states, and the RELEASED config lands in the middle one") {
+  // ── the arithmetic, as facts rather than as prose ─────────────────────────
+  //
+  // THREE widths are in play and only the middle one fails. A reader who checks
+  // the STORED tensor will find it divisible and conclude this case is wrong,
+  // so all three are asserted.
+  const int64_t kBlock = 128;              // `_BLOCK_SHAPE[1]`, vision_moe.py:22
+  const int64_t kEmbed = 1536;             // released `embed_dim`
+  const int64_t kMoeInter = 2112;          // released `moe_intermediate_size`
+  const int64_t kStoredW13 = 2 * kMoeInter;  // `w13.shape[1]`, vision_moe.py:47
+  // The FIRST quantization (`vision_moe.py:77-81`) is over `embed_dim`: fine.
+  CHECK(kEmbed % kBlock == 0);
+  // The STORED concatenated operand (`vision.py:258`) is fine TOO -- this is
+  // the number that makes "the expert tensors are unaligned" the wrong summary.
+  CHECK(kStoredW13 == 4224);
+  CHECK(kStoredW13 % kBlock == 0);
+  // The SECOND quantization is over `intermediate_size // 2`
+  // (`vision_moe.py:70`, quantized at `:119-123`), i.e. the HALVED width, and
+  // that is the one `per_token_group_quant_fp8` rejects
+  // (`fp8_utils.py:563-566`: `assert x.shape[-1] % group_size == 0`).
+  CHECK(kMoeInter % kBlock == 64);
+  MESSAGE("W9d widths: embed_dim " << kEmbed << " %128=" << (kEmbed % kBlock)
+                                   << ", stored w13 " << kStoredW13 << " %128="
+                                   << (kStoredW13 % kBlock)
+                                   << ", HALVED activation " << kMoeInter
+                                   << " %128=" << (kMoeInter % kBlock));
+
+  // ── state 1: `enable_fp8_moe` false is upstream's OTHER branch ────────────
+  {
+    nlohmann::json d = ReleasedConfigDoc();
+    d["vision_config"]["enable_fp8_moe"] = false;
+    const Dots3NoteVisionParams v = ParseDoc(d);
+    CHECK_FALSE(v.enable_fp8_moe);
+    const vllm::Dots3NoteVisionMoeArm arm =
+        vllm::ResolveDots3NoteVisionMoeArm(v);
+    CHECK_FALSE(arm.fp8);
+    CHECK(arm.upstream_raises.empty());
+  }
+
+  // ── state 2: THE RELEASED CONFIG ─────────────────────────────────────────
+  {
+    const Dots3NoteVisionParams v = ParseDoc(ReleasedConfigDoc());
+    // The key is ABSENT from the released `vision_config`, so upstream's
+    // constructor default applies (`vision.py:69`) and this tree now reads it.
+    const nlohmann::json& raw = ReleasedConfigDoc();
+    CHECK_FALSE(raw["vision_config"].contains("enable_fp8_moe"));
+    CHECK(v.enable_fp8_moe);
+    CHECK(v.embed_dim == kEmbed);
+    CHECK(v.moe_intermediate_size == kMoeInter);
+
+    const vllm::Dots3NoteVisionMoeArm arm =
+        vllm::ResolveDots3NoteVisionMoeArm(v);
+    // Upstream selects the FP8 class here and this tower does NOT run it,
+    // because upstream's own assertion fires first.
+    CHECK_FALSE(arm.fp8);
+    REQUIRE_FALSE(arm.upstream_raises.empty());
+    MESSAGE("W9d released-config notice: " << arm.upstream_raises);
+    // The notice must name the WIDTH, the ARITHMETIC, the ASSERTION and its
+    // ANCHOR. A refusal that stops naming its specific cause is the mute-switch
+    // shape this protocol refuses, so each is asserted rather than the whole
+    // string being matched loosely.
+    CHECK(arm.upstream_raises.find("moe_intermediate_size") != std::string::npos);
+    CHECK(arm.upstream_raises.find("2112") != std::string::npos);
+    CHECK(arm.upstream_raises.find("2112 % 128 == 64") != std::string::npos);
+    CHECK(arm.upstream_raises.find("fp8_utils.py:563-566") != std::string::npos);
+    CHECK(arm.upstream_raises.find("assert x.shape[-1] % group_size == 0") !=
+          std::string::npos);
+    CHECK(arm.upstream_raises.find("vision.py:69") != std::string::npos);
+    CHECK(arm.upstream_raises.find("MoESwiGLUFFNFP8") != std::string::npos);
+    CHECK(arm.upstream_raises.find("#2881") != std::string::npos);
+    // ...and it must name the class this tower DOES run, so the reader is told
+    // what happened and not only what did not.
+    CHECK(arm.upstream_raises.find("MoESwiGLUFFN`") != std::string::npos);
+  }
+
+  // ── state 3: a 128-aligned tower takes the FP8 class ─────────────────────
+  {
+    nlohmann::json d = ReleasedConfigDoc();
+    d["vision_config"]["embed_dim"] = 1536;
+    d["vision_config"]["adapter_in_dim"] = 1536;
+    d["vision_config"]["moe_intermediate_size"] = 2048;
+    const Dots3NoteVisionParams v = ParseDoc(d);
+    CHECK(v.enable_fp8_moe);
+    const vllm::Dots3NoteVisionMoeArm arm =
+        vllm::ResolveDots3NoteVisionMoeArm(v);
+    CHECK(arm.fp8);
+    CHECK(arm.upstream_raises.empty());
+  }
+
+  // ── the FIRST width can fail too, and the notice must name THAT one ──────
+  // `embed_dim` reaches the same assertion one call earlier
+  // (`vision_moe.py:77-81`), so the message names whichever fails FIRST rather
+  // than a set. Without this subcase a resolution that only ever looked at
+  // `moe_intermediate_size` would read green.
+  {
+    // 1488 = 24 x 62, so it satisfies the parser's own
+    // `embed_dim % num_attention_heads == 0` and its even-head_dim rule while
+    // still failing the 128 one -- 1500 does not, and picking it would have
+    // made this subcase throw in the PARSER and never reach the resolution.
+    nlohmann::json d = ReleasedConfigDoc();
+    d["vision_config"]["embed_dim"] = 1488;
+    d["vision_config"]["adapter_in_dim"] = 1488;
+    d["vision_config"]["moe_intermediate_size"] = 2048;
+    const vllm::Dots3NoteVisionMoeArm arm =
+        vllm::ResolveDots3NoteVisionMoeArm(ParseDoc(d));
+    CHECK_FALSE(arm.fp8);
+    REQUIRE_FALSE(arm.upstream_raises.empty());
+    CHECK(arm.upstream_raises.find("embed_dim") != std::string::npos);
+    CHECK(arm.upstream_raises.find("1488 % 128 == 80") != std::string::npos);
+    // ...and NOT the other width, which is aligned here. A message that named
+    // both would be a set, and the point of naming one is that it is the one
+    // upstream reaches first.
+    CHECK(arm.upstream_raises.find("moe_intermediate_size") ==
+          std::string::npos);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// G1. THE DTYPE AND MEMORY-FORMAT ASSERTION — bytes, not values.
+//
+// `porting.md`'s own remedy for the defect class R5 names. A value gate cannot
+// see an inserted e8m0 round: the tokens still match, the goldens still pass,
+// and the scales are all wrong. This one can.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W9d: the FP8 cast's MEMORY FORMAT is upstream's, and no scale is rounded to e8m0") {
+  const TowerRun r = RunTower(Fp8MoeSpec());
+  REQUIRE(r.weights.moe_arm.fp8);
+  REQUIRE(r.weights.blocks.size() == 2u);
+  REQUIRE(r.weights.blocks[1].is_moe);
+  const vllm::Dots3NoteVisionMoeWeights& m = r.weights.blocks[1].moe;
+  const int64_t E = r.bench->spec.v_embed, Im = r.bench->spec.v_moe_inter;
+  const int64_t ne = m.num_routed;
+
+  // `del self.experts` (`vision.py:283`): the bf16 residency is GONE, not kept
+  // beside the fp8 one. On the released tower that is 608 experts x 3 tensors.
+  CHECK(m.expert_gate.empty());
+  CHECK(m.expert_up.empty());
+  CHECK(m.expert_down.empty());
+  REQUIRE(m.expert_gate_fp8.size() == static_cast<size_t>(ne));
+  REQUIRE(m.expert_up_fp8.size() == static_cast<size_t>(ne));
+  REQUIRE(m.expert_down_fp8.size() == static_cast<size_t>(ne));
+
+  const auto cdiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+  std::size_t scales_total = 0, scales_on_e8m0 = 0;
+  for (int64_t e = 0; e < ne; ++e) {
+    const size_t ei = static_cast<size_t>(e);
+    struct Named {
+      const vllm::Fp8BlockWeight* w;
+      const char* name;
+      int64_t n;
+      int64_t k;
+    };
+    const Named all[3] = {{&m.expert_gate_fp8[ei], "fc1", Im, E},
+                          {&m.expert_up_fp8[ei], "fc3", Im, E},
+                          {&m.expert_down_fp8[ei], "fc2", E, Im}};
+    for (const Named& t : all) {
+      CAPTURE(t.name);
+      // THE PACKED WEIGHT: one raw e4m3fn BYTE per element, `[N, K]`, and
+      // exactly `N*K` bytes. A silent dequant to bf16 is numerically BETTER
+      // than the quantized path and therefore invisible to every value
+      // comparison in this file; the byte count is what sees it.
+      CHECK(t.w->packed.dtype == vt::DType::kI8);
+      CHECK(t.w->packed.bytes.size() ==
+            static_cast<std::size_t>(t.n) * static_cast<std::size_t>(t.k));
+      CHECK(t.w->packed.shape[0] == t.n);
+      CHECK(t.w->packed.shape[1] == t.k);
+      CHECK(t.w->n == t.n);
+      CHECK(t.w->k == t.k);
+      CHECK(t.w->block_n == 128);
+      CHECK(t.w->block_k == 128);
+      // THE SCALE GRID: f32, `[cdiv(N,128), cdiv(K,128)]`, one f32 per cell.
+      // Both axes round UP, so a short final block still owns a scale and a
+      // FLOOR tiling silently drops one.
+      CHECK(t.w->scale.dtype == vt::DType::kF32);
+      CHECK(t.w->scale.shape[0] == cdiv(t.n, 128));
+      CHECK(t.w->scale.shape[1] == cdiv(t.k, 128));
+      CHECK(t.w->scale.bytes.size() ==
+            static_cast<std::size_t>(cdiv(t.n, 128)) *
+                static_cast<std::size_t>(cdiv(t.k, 128)) * sizeof(float));
+      // ...AND NOT ON THE e8m0 LATTICE. `_ceil_to_ue8m0` is
+      // `2 ** ceil(log2(x))` (`deep_gemm.py:644-645`), so a rounded scale is
+      // EXACTLY a power of two. `use_ue8m0` is False at this site
+      // (`vision.py:237`), so a scale landing on a power of two here is chance
+      // and every scale doing so is the defect.
+      // ...AND STILL PER-BLOCK. `Fp8BlockScaleSpread` is the shared probe
+      // #1189 added for exactly this: it is `max/min` over the grid, so a
+      // caster whose cells all hold one number reads EXACTLY 1.0 -- a
+      // per-TENSOR fp8 weight wearing a block-wise grid, which produces
+      // plausible values, moves the same bytes, keeps the same GEMM count and
+      // passes every other assertion in this case. Genuine per-block absmax
+      // comes from four different populations, so two cells of one real
+      // projection agree to the last bit only by accident.
+      const float spread = vllm::dense_fp8_block::Fp8BlockScaleSpread(*t.w);
+      CAPTURE(spread);
+      CHECK(spread > 1.0F);
+      CHECK(std::isfinite(spread));
+      const auto* sp = reinterpret_cast<const float*>(t.w->scale.bytes.data());
+      const std::size_t cells = t.w->scale.bytes.size() / sizeof(float);
+      // ...over MORE THAN ONE cell, which is what makes the line above mean
+      // anything: a single-cell grid has no cells to disagree and the probe
+      // returns 1.0 by definition.
+      CHECK(cells > 1u);
+      for (std::size_t c = 0; c < cells; ++c) {
+        ++scales_total;
+        int exp = 0;
+        const float frac = std::frexp(sp[c], &exp);
+        if (frac == 0.5F || frac == -0.5F) ++scales_on_e8m0;
+        CHECK(sp[c] > 0.0F);
+      }
+    }
+  }
+  REQUIRE(scales_total > 0u);
+  MESSAGE("W9d weight scales: " << scales_total << " cells, " << scales_on_e8m0
+                                << " exactly a power of two (an e8m0 round "
+                                   "would make that ALL of them)");
+  // Not "zero", because a genuine block amax CAN land on a power of two. The
+  // assertion is that the grid is not the e8m0 LATTICE, which is what an
+  // inserted round produces and what mutation M4 does.
+  CHECK(scales_on_e8m0 * 2u < scales_total);
+
+  // ── THE ACTIVATION SCALES, at the op the arm actually calls ──────────────
+  // f32 `[T, K/128]`, and again off the e8m0 lattice. `use_ue8m0` is False at
+  // both `vision_moe.py` sites (`:80`, `:122`) and `vt::QuantFp8Group` has no
+  // e8m0 arm at all; this is the assertion that would notice one appearing.
+  {
+    vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+    vt::Queue q = backend.CreateQueue();
+    const int64_t T = 5, K = 256;
+    std::vector<float> x(static_cast<std::size_t>(T * K));
+    std::mt19937 rng(20250904);
+    std::uniform_real_distribution<float> u(-3.0F, 3.0F);
+    for (float& v : x) v = u(rng);
+    vllm::dense_attn::Dev d{backend, q};
+    vllm::dense_attn::DBuf xd(d, vt::DType::kF32, {T, K});
+    d.b.Copy(d.q, xd.ptr(), x.data(), xd.bytes());
+    vllm::dense_attn::DBuf qd(d, vt::DType::kI8, {T, K});
+    vllm::dense_attn::DBuf sd(d, vt::DType::kF32, {T, K / 128});
+    vt::QuantFp8Group(d.q, qd.t(), sd.t(), xd.t(), 128);
+    CHECK(sd.t().dtype == vt::DType::kF32);
+    CHECK(sd.t().shape[0] == T);
+    CHECK(sd.t().shape[1] == K / 128);
+    CHECK(qd.bytes() == static_cast<std::size_t>(T * K));
+    std::vector<float> sc(static_cast<std::size_t>(T * K / 128));
+    sd.Download(d, sc.data());
+    std::size_t on_lattice = 0;
+    for (float v : sc) {
+      int exp = 0;
+      const float frac = std::frexp(v, &exp);
+      if (frac == 0.5F || frac == -0.5F) ++on_lattice;
+    }
+    MESSAGE("W9d activation scales: " << sc.size() << " cells, " << on_lattice
+                                      << " exactly a power of two");
+    CHECK(on_lattice * 2u < sc.size());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// G2. THE INDEPENDENT DOUBLE-PRECISION REFERENCE, whole tower.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W9d: the FP8 tower agrees with an INDEPENDENT double reference") {
+  const TowerRun r = RunTower(Fp8MoeSpec());
+  REQUIRE(r.weights.moe_arm.fp8);
+  REQUIRE(r.capture.moe_routes.size() == 1u);
+  CHECK(r.capture.moe_routes[0].fp8);
+
+  // The SELECTION first, because top-k is a DISCRETE choice whose error is
+  // bimodal: it either flips or it does not, and when it does not, no output
+  // tolerance is measuring it at all.
+  const vllm::Dots3NoteVisionMoeRoute& ours = r.capture.moe_routes[0];
+  const ref::MoeRouteRef& want = r.ref_routes[0];
+  const int64_t L = 16, K = ours.top_k;
+  REQUIRE(K == 2);
+  REQUIRE(ours.ids.size() == static_cast<std::size_t>(L * K));
+  int64_t flipped = 0;
+  for (int64_t t = 0; t < L; ++t) {
+    std::vector<int64_t> mine;
+    for (int64_t j = 0; j < K; ++j)
+      mine.push_back(ours.ids[static_cast<std::size_t>(t * K + j)]);
+    std::sort(mine.begin(), mine.end());
+    const std::vector<int64_t> theirs(
+        want.ids.begin() + static_cast<std::ptrdiff_t>(t * K),
+        want.ids.begin() + static_cast<std::ptrdiff_t>((t + 1) * K));
+    if (mine != theirs) ++flipped;
+  }
+  MESSAGE("W9d fp8 routing: " << flipped << " of " << L
+                              << " tokens selected a different SET, minimum "
+                                 "decision margin "
+                              << want.min_margin << " at token "
+                              << want.min_margin_token);
+  CHECK(flipped == 0);
+
+  // ...then the values. The bound is loose and says why: this arm QUANTIZES,
+  // so the reference and the implementation differ by real e4m3 rounding at
+  // every GEMM, not by an f32 association. The number is reported so a reader
+  // sees the room rather than only the verdict.
+  MESSAGE("W9d fp8 tower: max |impl - double ref| = "
+          << r.max_abs << " over a scale of " << r.scale << " (relative "
+          << r.rel << ")");
+  CHECK(r.rel < 5e-2);
+  // ...and it must not be vacuous: a tower that returned zeros would pass any
+  // relative bound against a zero reference.
+  REQUIRE(r.scale > 1e-3);
+}
+
+// ---------------------------------------------------------------------------
+// G3. THE DISCRIMINATING A/B — the one guarantee a shared-helper comparison
+//     cannot fake.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W9d: the FP8 arm takes upstream's F32 clamp_min denominator, NOT the bf16 one") {
+  // `router_scale` is what separates the two denominators at all. At 1.0 a
+  // normalized top-2 pair sums to 1.0 and bf16's ULP there is 2^-7, which
+  // swallows the rounding of both addends -- the two agree to the last bit and
+  // the case would be vacuous. 2.05 was SEARCHED for: at a 0.65/0.35 split it
+  // gives D_bf16 = 2.0625 against D_f32 = 2.05.
+  TinySpec s = Fp8MoeSpec();
+  s.v_router_scale = 2.05;
+  const TowerRun r = RunTower(s);
+  REQUIRE(r.weights.moe_arm.fp8);
+  REQUIRE(r.capture.moe_routes.size() == 1u);
+  const vllm::Dots3NoteVisionMoeRoute& route = r.capture.moe_routes[0];
+  const int64_t L = 16, K = route.top_k;
+  REQUIRE(route.denominator.size() == static_cast<std::size_t>(L));
+  REQUIRE(route.weights.size() == static_cast<std::size_t>(L * K));
+
+  // ── the MARGIN, measured before anything is asserted ─────────────────────
+  // Both denominators are recomputed here from the weights the implementation
+  // reported, so the margin is this fixture's own and not a remembered number.
+  double worst_rel = 0.0;
+  for (int64_t t = 0; t < L; ++t) {
+    double f32 = 0.0, bf = 0.0;
+    for (int64_t j = 0; j < K; ++j) {
+      const double w =
+          static_cast<double>(route.weights[static_cast<std::size_t>(t * K + j)]);
+      f32 += w;
+      bf = ref::Bf16(bf + ref::Bf16(w));
+    }
+    const double a = f32 < 1e-9 ? 1e-9 : f32;   // clamp_min  (vision.py:314)
+    const double b = bf + 1e-9;                 // + eps      (vision.py:216)
+    worst_rel = std::max(worst_rel, std::fabs(a - b) / std::fabs(a));
+  }
+  MESSAGE("W9d denominator A/B: worst relative gap between clamp_min(F32 sum) "
+          "and (BF16 accumulation + 1e-9) over "
+          << L << " tokens = " << worst_rel);
+  // THE FIXTURE MUST DISCRIMINATE, and this REQUIRE is what says so. Without
+  // it a fixture that stopped separating the two arms would make every
+  // assertion below pass while measuring nothing.
+  const double kTol = 1e-4;
+  REQUIRE_MESSAGE(worst_rel > 20.0 * kTol,
+                  "this fixture no longer separates the two denominators "
+                  "("
+                      << worst_rel << " <= " << 20.0 * kTol
+                      << "); the case would be vacuous, not green");
+
+  // ── which one did the arm take? ──────────────────────────────────────────
+  // The implementation reported the denominator it actually divided by, so
+  // this is a direct read rather than an inference from the output.
+  double worst_vs_f32 = 0.0, worst_vs_bf16 = 0.0;
+  for (int64_t t = 0; t < L; ++t) {
+    double f32 = 0.0, bf = 0.0;
+    for (int64_t j = 0; j < K; ++j) {
+      const double w =
+          static_cast<double>(route.weights[static_cast<std::size_t>(t * K + j)]);
+      f32 += w;
+      bf = ref::Bf16(bf + ref::Bf16(w));
+    }
+    const double got = static_cast<double>(route.denominator[static_cast<std::size_t>(t)]);
+    const double a = f32 < 1e-9 ? 1e-9 : f32;
+    const double b = bf + 1e-9;
+    worst_vs_f32 = std::max(worst_vs_f32, std::fabs(got - a) / std::fabs(a));
+    worst_vs_bf16 = std::max(worst_vs_bf16, std::fabs(got - b) / std::fabs(b));
+  }
+  MESSAGE("W9d denominator taken: worst relative distance to clamp_min(F32) = "
+          << worst_vs_f32 << ", to (BF16 + 1e-9) = " << worst_vs_bf16);
+  CHECK(worst_vs_f32 < kTol);
+  CHECK(worst_vs_bf16 > 20.0 * kTol);
+
+  // ── WHAT NO VALUE COMPARISON HERE CAN SEE, MEASURED ──────────────────────
+  //
+  // The obvious next assertion is "the tower's OUTPUT sits with the F32
+  // reference and not the BF16 one". It was written, run, and it CANNOT WORK,
+  // and the numbers are recorded here rather than the assertion being tuned
+  // until it passed.
+  //
+  // Measured on this fixture: the two reference towers differ by 0.0790 over a
+  // scale of 71.16 (relative 1.11e-3) -- the denominator's 6.1e-3 at the MoE
+  // block, diluted by the residual around it and by the adapter after it. The
+  // IMPLEMENTATION is 3.427 from the F32 reference and 3.439 from the BF16 one.
+  // Both distances are ~43x the separation being tested, because this arm
+  // QUANTIZES: a bf16 activation and a double activation land on different
+  // e4m3 codes near a boundary, which is ~1/2 e4m3 ULP -- several percent -- at
+  // every one of the four GEMMs. The right ordering is visible (3.4275 <
+  // 3.4395) and it is noise-dominated, so asserting it would be asserting a
+  // coin flip.
+  //
+  // So the DENOMINATOR ASSERTION ABOVE IS THE GATE, and it is a capture
+  // assertion rather than a value one for the same reason G1 is a byte
+  // assertion: the defect is invisible to every value comparison this fixture
+  // can make. What holds the reported value to the APPLIED one is that
+  // `VisionMoeFfn` divides by the same local `dn` it stores into the capture,
+  // one line apart -- and mutation M2, which edits that variable and reds the
+  // assertion above. Mutation M2b deliberately DECOUPLES the two (reporting
+  // clamp_min while applying the bf16 value) and the mutation table records
+  // exactly what this suite does and does not see when it does.
+  //
+  // The two reference towers are still computed and their separation asserted
+  // NONZERO, because a fixture on which the two denominators stopped moving the
+  // tower at all would mean this whole case had become decorative.
+  const vllm::multimodal::Dots3NoteProcessorConfig pcfg =
+      vllm::multimodal::LoadDots3NoteProcessorConfig(
+          r.bench->ckpt.dir() + "/preprocessor_config.json",
+          r.bench->ckpt.config_path(), "tiny-dots3");
+  const vllm::multimodal::Dots3NoteImageProcessor proc(pcfg);
+  const std::vector<uint8_t> rgb = dots3_tiny::FixtureImage(0);
+  const vllm::multimodal::ImageKwargs kw = proc.ProcessImage(
+      rgb.data(), dots3_tiny::kImageSide, dots3_tiny::kImageSide);
+  const std::vector<double> px = WidenBf16(kw.pixel_values_bf16);
+
+  const std::vector<double> tower_f32 =
+      ref::Tower(s, r.bench->ckpt, px, 1, 4, 4, nullptr, /*fp8=*/true,
+                 /*bf16_denominator=*/false);
+  const std::vector<double> tower_bf16 =
+      ref::Tower(s, r.bench->ckpt, px, 1, 4, 4, nullptr, /*fp8=*/true,
+                 /*bf16_denominator=*/true);
+  REQUIRE(tower_f32.size() == tower_bf16.size());
+  REQUIRE(tower_f32.size() == r.ours.size());
+
+  double sep = 0.0, scale = 0.0, to_f32 = 0.0, to_bf16 = 0.0;
+  for (std::size_t i = 0; i < tower_f32.size(); ++i) {
+    scale = std::max(scale, std::fabs(tower_f32[i]));
+    sep = std::max(sep, std::fabs(tower_f32[i] - tower_bf16[i]));
+    const double got = static_cast<double>(r.ours[i]);
+    to_f32 = std::max(to_f32, std::fabs(got - tower_f32[i]));
+    to_bf16 = std::max(to_bf16, std::fabs(got - tower_bf16[i]));
+  }
+  REQUIRE(scale > 1e-3);
+  MESSAGE("W9d denominator at the TOWER OUTPUT: the two references differ by "
+          << sep << " (relative " << sep / scale
+          << "); the implementation is " << to_f32 << " from the F32 one and "
+          << to_bf16
+          << " from the BF16 one, over a scale of " << scale
+          << " -- the e4m3 quantization noise is " << (to_f32 / sep)
+          << "x the separation, which is why no value assertion is made here");
+  // The choice still MOVES the tower, which is what keeps this case from being
+  // decorative. It is deliberately not a direction test.
+  CHECK(sep > 0.0);
+  CHECK(sep / scale > 1e-4);
+}
+
+// ---------------------------------------------------------------------------
+// G4. THE REFERENCE SHARES NO HELPER WITH `src/`, BY ENUMERATION.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6a+W6b+W6c+W9d: the vision references share no helper with src/, by enumeration") {
+  // The SAME instrument the audio suite runs, from
+  // `tests/vllm/models/dots3_note_ref_independence.h`. W9d gave it a source
+  // path instead of copying it, for the reason W7b, W7c-2 and W8a each gave for
+  // extending it rather than writing a second: reference code the instrument
+  // does not read is reference code whose independence nothing measures.
+  using dots3_ref_independence::Join;
+  using dots3_ref_independence::QualifiedNamesInFile;
+  using dots3_ref_independence::RefNames;
+  using dots3_ref_independence::StripCommentsAndLiterals;
+
+  const RefNames tower = QualifiedNamesInFile(DOTS3_VISION_TEST_SOURCE, "ref");
+  const RefNames resample =
+      QualifiedNamesInFile(DOTS3_VISION_TEST_SOURCE, "ref_resample");
+
+  // The instrument must be shown to have READ something. A parse that found an
+  // empty span would otherwise report "zero non-std:: names" and pass.
+  REQUIRE(tower.occurrences > 0);
+  REQUIRE(resample.occurrences > 0);
+  MESSAGE("ref: " << tower.distinct << " distinct, " << tower.occurrences
+                  << " occurrences, scopes=" << Join(tower.scopes));
+  MESSAGE("ref_resample: " << resample.distinct << " distinct, "
+                           << resample.occurrences
+                           << " occurrences, scopes=" << Join(resample.scopes));
+
+  // THE PROPERTY. `ref` holds the FP8 arm's reference since W9d, including its
+  // OWN e4m3 encoder, its own group quantizer and its own block-scaled GEMM, so
+  // one `vt::F32ToF8E4M3` or one `vllm::Dots3NoteVisionBlockCastFp8` inside it
+  // reddens this line.
+  CHECK(Join(tower.scopes) == "std");
+  CHECK(Join(resample.scopes) == "std");
+
+  // AND THE STRIPPER, because the property above is only as true as the scan
+  // that measures it. This is the same pp-number gate the audio suite carries;
+  // it is asserted in both files because both now rest on it and a shared
+  // instrument with one caller checking it is a shared instrument nobody checks
+  // from the other side.
+  const std::string bracketed =
+      "double g = 16'000.0 * vt::Scale(vllm::kOne) / 1'280.0;";
+  CHECK(StripCommentsAndLiterals(bracketed).find("vt::Scale") !=
+        std::string::npos);
+  CHECK(StripCommentsAndLiterals(bracketed).find("vllm::kOne") !=
+        std::string::npos);
+  CHECK(StripCommentsAndLiterals("u8'v' L't' 'x'").find('v') ==
+        std::string::npos);
+  CHECK(StripCommentsAndLiterals("// vt::Scale 16'000\nint a = 1;")
+            .find("vt::") == std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// G5. THE ARCH REFUSAL.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W9d: a device with no block-scaled FP8 GEMM is refused BY NAME") {
+  // The predicate the forward asks, at the device this suite runs on. CPU has
+  // both ops, which is why every case above computes at all.
+  CHECK(vllm::dense_fp8_block::BlockFp8Runnable(vt::DeviceType::kCPU));
+  CHECK(vt::OpRegistered(vt::OpId::kMatmulFp8BlockScaled, vt::DeviceType::kCPU));
+
+  // The refusal itself, on a device that has no block-scaled GEMM in ANY build.
+  // It is called directly because reaching it through a forward would need a
+  // device this host does not have; what the forward's own call site adds is
+  // the projection name, and mutation M5 is what holds that call site down.
+  std::string msg;
+  try {
+    vllm::RefuseUnrunnableFp8BlockWeight(
+        "vision_encoder.blocks.25.mlp.experts", vt::DeviceType::kMETAL);
+    FAIL("RefuseUnrunnableFp8BlockWeight returned");
+  } catch (const std::runtime_error& e) {
+    msg = e.what();
+  }
+  MESSAGE("W9d arch refusal: " << msg);
+  // It names the PROJECTION, so the reader knows this is a real loaded weight
+  // rather than a config guess...
+  CHECK(msg.find("vision_encoder.blocks.25.mlp.experts") != std::string::npos);
+  // ...the DEVICE, because that is the thing that is wrong...
+  CHECK(msg.find("no block-wise FP8 GEMM on device") != std::string::npos);
+  // ...and the ARCH CELL, which is the knob an operator can actually change.
+  // Without it "no kernel on this device" reads as a missing feature rather
+  // than a build-time arch selection. `cmake/CudaArchFeatures.cmake:290` spells
+  // the cell, and `CMakeLists.txt:1946` is why the BLOCK TU rides it.
+  CHECK(msg.find("12.0a,12.1a") != std::string::npos);
+  CHECK(msg.find("cutlass-fp8") != std::string::npos);
+  CHECK(msg.find("UNREGISTERED") != std::string::npos);
 }

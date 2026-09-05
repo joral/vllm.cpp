@@ -7983,7 +7983,33 @@ The released `vision_config` sets `moe_intermediate_size = 2112`, and
 `AssertionError` at the first routed block of the first image**, before any
 GEMM. The first quantization in the same function is safe — it quantizes
 `hidden_states` at `embed_dim = 1536`, and `1536 % 128 == 0` — so the failure is
-specific to the expert width and to nothing else in the config.
+specific to the second one.
+
+**WHICH width, exactly, because the STORED one is fine and a reader who checks
+it will conclude this section is wrong.** Three widths are in play and only the
+middle one fails:
+
+| width | value | `% 128` | where |
+|---|---|---|---|
+| `embed_dim` — the FIRST quantization, and the K of the gate/up GEMM | 1536 | **0** | `vision_moe.py:77-81` |
+| `w13.shape[1]` — the STORED concatenated fc1+fc3 operand | 4224 | **0** | `vision.py:258`, read at `vision_moe.py:47` |
+| `intermediate_size // 2` — the SECOND quantization's operand | 2112 | **64** | `vision_moe.py:70`, quantized at `:119-123` |
+
+So it is not "the expert tensors are unaligned". The tensor upstream actually
+stores is `[2 * 2112, 1536]` and both of its axes are multiples of 128. It is
+the **halving at `vision_moe.py:70`** — `activated_size = intermediate_size //
+2`, the SwiGLU tail's output width — that produces the operand the assertion
+rejects. The gate asserts all three numbers rather than describing them, so the
+distinction is executable.
+
+**The assertion is unconditional.** It sits at `per_token_group_quant_fp8`'s top
+(`fp8_utils.py:563-566`), after only the `use_ue8m0` resolution (`:560-561`) and
+the dtype default (`:562`), and above every branch in the function — the
+CUDA-alike custom-op fast path at `:602-617`, the Triton fallback at `:619-658`,
+and the `column_major_scales` / `tma_aligned_scales` layout choices at
+`:576-598`. No padded variant guards it and `activated` is allocated at exactly
+`activated_size` (`vision_moe.py:71-75`), so nothing rounds the width up before
+the call. Re-derived independently by the operator at the same SHA.
 
 This is **source-derived, not run**. §6.4 option B stands: no oracle for this
 model runs on any hardware this project owns, and the vLLM import chain in the
@@ -8054,8 +8080,10 @@ the memory-format obligation it names is undiminished.
 
    `use_ue8m0` is **false** at this call site and at both `vision_moe.py` sites
    (`vision.py:237`, `vision_moe.py:80`, `:122`), so no e8m0 rounding is applied
-   anywhere in this arm. §4.20.5 corrects the `## Owed` entry that said
-   otherwise.
+   anywhere in this arm. That is read off the CALL SITES, which pass the literal
+   `use_ue8m0=False`, and not inferred from `note_vision_fused_moe_fp8`'s
+   docstring — the docstring agrees, and a docstring is not a call site.
+   §4.20.5 corrects the `## Owed` entry that said otherwise.
 
 4. **The forward.** `MoESwiGLUFFNFP8.forward` (`vision.py:285-315`) with the
    expert GEMMs on the shared block-FP8 seams — `layers::Fp8BlockLinearMethod`
@@ -8082,10 +8110,23 @@ built for is detected.
 asserted as bytes: weight scales f32 with shape `[cdiv(N,128), cdiv(K,128)]`,
 activation scales f32 `[T, K/128]`, the packed weight exactly `N*K` bytes, and
 **no e8m0 rounding anywhere** — every scale is checked against the e8m0 lattice
-and required NOT to sit on it beyond what chance allows. `tests/vt/
-test_ops_quant_fp8_group_cpu.cpp` G1 is the in-tree model for the form. A value
-gate cannot see an inserted e8m0 round; this one can, and the mutation table
-proves it.
+and required NOT to sit on it beyond what chance allows (0 of 48 weight cells
+and 0 of 10 activation cells do, where an inserted round would put all of them).
+`tests/vt/test_ops_quant_fp8_group_cpu.cpp` G1 is the in-tree model for the
+form. A value gate cannot see an inserted e8m0 round; this one can, and mutation
+M4 proves it.
+
+It also asserts the grid is still per-BLOCK, through the shared probe #1189
+already had for it: `dense_fp8_block::Fp8BlockScaleSpread` is `max/min` over the
+grid, so a caster whose cells all hold one number reads exactly 1.0 — a
+per-TENSOR fp8 weight wearing a block-wise grid, which produces plausible
+values, moves the same bytes and keeps the same GEMM count. That assertion is
+here because mutation M3 was **green without it**, and green for a second reason
+the table records: the fixture could not tell the two apart either.
+
+`MoESwiGLUFFNFP8.process_weights_after_loading` ends in `del self.experts`
+(`vision.py:283`), and G1 asserts the bf16 residency is gone rather than kept
+beside the fp8 one. On the released tower that is 608 experts x 3 tensors.
 
 **G2 — an independent double-precision reference**, `ref_vision_fp8`, of
 `_per_block_cast_to_fp8_padded` and of `note_vision_fused_moe_fp8`'s two-GEMM
@@ -8107,16 +8148,39 @@ At `router_scale = 1` the two agree to the last bf16 bit on almost any weights,
 because a normalized top-2 pair sums to 1.0 and bf16's ULP at 1.0 is `2^-7`,
 which swallows the rounding of both addends. The two therefore separate only at
 a `router_scale` whose bf16 accumulation lands off the f32 sum, and the fixture
-searches for one rather than assuming it: at `router_scale = 2.05` a `0.65/0.35`
-split gives `D_bf16 = 2.0625` against `D_f32 = 2.05`, a **6.10e-3 relative**
-gap. The gate REQUIREs the measured margin to exceed its own tolerance by a
-stated factor before it asserts anything, so a fixture that stopped
-discriminating fails loudly instead of passing vacuously.
+searches for one rather than assuming it: `router_scale = 2.05` was found by a
+sweep over `router_scale` and the split ratio, and on the tower this fixture
+actually builds it gives a **measured 6.098e-3 relative** gap between the two
+denominators. The gate REQUIREs that measured margin to exceed its own tolerance
+by 20x before it asserts anything, so a fixture that stopped discriminating
+fails loudly instead of passing vacuously.
 
-The case then asserts that the FP8 arm's output matches the reference computed
-with the **f32 `clamp_min`** denominator and differs from the reference computed
-with the **bf16** one. That is the guarantee a shared-helper comparison cannot
-fake, and it is what mutation M2 below moves.
+**The assertion is on the DENOMINATOR the implementation reports, not on the
+tower's output, and that is a measurement rather than a preference.** The
+capture carries the divisor `VisionMoeFfn` actually formed, and it sits
+**5.815e-8** from `clamp_min(F32 sum)` and **6.061e-3** from
+`BF16 accumulation + 1e-9` — five orders of magnitude, which is not a tolerance
+question.
+
+An output-level direction test was written, run, and **cannot work**, and the
+numbers are recorded here rather than the threshold being tuned until it passed.
+At the tower output the two reference towers differ by 0.0790 over a scale of
+71.16 (relative 1.11e-3), because the residual around the MoE block and the
+adapter after it dilute the block's 6.1e-3. The implementation is 3.4275 from
+the F32 reference and 3.4395 from the BF16 one — the right ordering, and **43.4x
+the separation being tested**, because this arm QUANTIZES: a bf16 activation and
+a double activation land on different e4m3 codes near a boundary, which is about
+half an e4m3 ULP at each of the four GEMMs. Asserting that ordering would be
+asserting a coin flip.
+
+So the denominator gate is a CAPTURE assertion for the same reason G1 is a BYTE
+assertion: the defect is invisible to every value comparison this fixture can
+make. What ties the reported value to the APPLIED one is that `VisionMoeFfn`
+divides by the same local `dn` it stores, one line apart — and mutation M2,
+which edits that variable. **Mutation M2b deliberately DECOUPLES the two**,
+reporting `clamp_min` while applying the bf16 value, and the mutation table
+below records exactly what this suite does and does not see when it does. That
+is the honest boundary of this instrument.
 
 #### 4.20.4 Reachability
 
@@ -8135,6 +8199,56 @@ Each mutation below is RED-first, restored byte for byte, and reported with the
 binary sha AND the case counts — a changed sha alone does not prove a mutation
 reached the code, and this row has had a failed build read as a pass and an
 inert mutation read as one the tests survived.
+
+#### 4.20.4.1 The mutation table
+
+Baseline at the reviewed head: `test_dots3_note_vision` **19 cases / 21683 assertions**, sha `f5578787489113ec`; `test_openai_api_server_dots3_mm_forward` **31 cases / 16491 assertions**, sha `444317f9b8518c52`. Both rc 0.
+
+| # | what it changes | `test_dots3_note_vision` | `test_openai_api_server_dots3_mm_forward` |
+|---|---|---|---|
+| M1 | force `enable_fp8_moe` FALSE at the parse, so the bf16 class is selected | **RED** 4/19 cases, 5/21403 assertions<br>sha `c12b4f831cba3388` | **RED** 2/31 cases, 2/16491 assertions<br>sha `149367378fc7783c` |
+| M2 | use the BF16 arm's denominator (`bf16 accumulation + 1e-9`) in the FP8 path | **RED** 1/19 cases, 2/21683 assertions<br>sha `31de96f2842228b1` | green 0/31 cases, 0/16491 assertions<br>sha `7110c958097dfc0a` |
+| M2c | apply the BF16 denominator and leave the CAPTURE line untouched | **RED** 1/19 cases, 2/21683 assertions<br>sha `3eef586a82168d3b` | green 0/31 cases, 0/16491 assertions<br>sha `74f6e2099a04ff66` |
+| M3 | the weight-side cast stops being PER-BLOCK: one whole-tensor amax, repeated | **RED** 2/19 cases, 13/21683 assertions<br>sha `de1a49d621713986` | green 0/31 cases, 0/16491 assertions<br>sha `4f132a1c7f6c83a4` |
+| M4 | insert `_ceil_to_ue8m0` on the weight scale | **RED** 2/19 cases, 2/21683 assertions<br>sha `f5357058f6f98221` | green 0/31 cases, 0/16491 assertions<br>sha `901221c81528ce27` |
+| M5 | delete the FP8 production call site: both expert GEMMs take the bf16 method | **RED** 1/19 cases, 1/21683 assertions<br>sha `b77ba55123d4ac56` | **RED** 2/31 cases, 2/16491 assertions<br>sha `6ec86b07cd5e3483` |
+
+**Two of these mutations SURVIVED when they were first run, and both survivals
+were defects in the GATE rather than facts about the port.** Neither is reported
+as a limitation, because both were fixed and re-measured; the history is here
+because a mutation table that shows only its final greens is a table that never
+found anything.
+
+**M2b — report `clamp_min`, apply the bf16 value — left the whole suite green.**
+It is not in the table above because the code it edited no longer exists. The
+capture used to store the divisor the loop INTENDED (`denom[t] = dn`), and
+section 4.20.3 measures why nothing else could see the difference: no value
+comparison this fixture can make separates a 6.1e-3 denominator change from e4m3
+quantization noise 155x larger, so the capture was the only witness — and a
+witness that reports an intent witnesses nothing about what ran. The fix is
+structural, not another assertion: the capture now derives the divisor from the
+QUOTIENT of the weights the combine actually wrote,
+`w0 / wts[t*k]`. **M2c is that fix's proof** — the same defect as a single-site
+edit against the head, with the reporting line untouched — and it reds.
+
+A mutation that edits the witness itself as well as the code under it is not
+something any gate can catch, and this one is not claimed to. What changed is
+that the decoupling went from a one-line edit to a deliberate falsification of
+two sites.
+
+**M3 — collapse the per-block amax to a per-tensor one — also left the suite
+green, and that was the FIXTURE.** At `embed_dim = moe_intermediate_size = 128`
+every expert tensor is exactly one 128x128 block, so its scale grid is a single
+cell and per-block and per-tensor are the same number. A fixture that cannot
+tell the two apart cannot gate a per-block caster. Two things were needed and
+both are in: the FP8 fixtures moved to 256, giving each weight a 2x2 grid and
+the merged `w13` a 4x2 one; and `Values` draws uniform in `[-amp, amp]`, so over
+16384 samples every block's absmax is `amp` to within 1e-4 and then rounds to
+the SAME bf16 number — `dense_fp8_block::Fp8BlockScaleSpread` read exactly 1.0
+even at 256. `TinySpec::v_expert_block_gain` gives the routed experts a per-block
+gain cycled over `{1.0, 1.7, 2.9}`, which is what a real trained projection's
+output channels have and what this fixture lacked. G1 now asserts the spread is
+strictly above 1.0 and that the grid has more than one cell, and M3 reds.
 
 #### 4.20.5 Two record corrections
 

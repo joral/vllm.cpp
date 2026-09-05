@@ -1146,9 +1146,23 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
       for (int64_t j = 0; j < k; ++j) sum += wts[static_cast<size_t>(t * k + j)];
       // `.clamp_min(1e-9)` (:314): a FLOOR, not an added epsilon.
       const float dn = sum < eps ? eps : sum;
-      denom[static_cast<size_t>(t)] = dn;
+      const float w0 = wts[static_cast<size_t>(t * k)];
       for (int64_t j = 0; j < k; ++j)
         wts[static_cast<size_t>(t * k + j)] /= dn;
+      // THE CAPTURE RECORDS THE DIVISOR THAT WAS APPLIED, RECOVERED FROM THE
+      // WEIGHTS THIS LOOP ACTUALLY WROTE -- not the `dn` it intended to apply.
+      //
+      // The difference is the whole reason this line is shaped like this, and
+      // it was MEASURED rather than reasoned about. A mutation that reports
+      // `clamp_min(F32)` while dividing by the bf16 value left the entire
+      // suite green (spec section 4.20.4.1, M2b): no value comparison this
+      // fixture can make separates a 6.1e-3 denominator change from e4m3
+      // quantization noise 43x larger, so the capture was the only witness --
+      // and a capture that reports an INTENT witnesses nothing about what ran.
+      // Deriving it from the quotient makes "reported but not applied"
+      // unrepresentable instead of undetected.
+      denom[static_cast<size_t>(t)] =
+          w0 != 0.0f ? w0 / wts[static_cast<size_t>(t * k)] : dn;
     }
     // A SECOND buffer rather than a write-back, so `tw` still holds upstream's
     // own `topk_weights` for the capture and the gate reads the pair rather

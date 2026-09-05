@@ -71,6 +71,7 @@
 #include "vllm/entrypoints/openai/serving_models.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dots3_note.h"
+#include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // BlockGemmCount
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -2274,4 +2275,164 @@ TEST_CASE("dots3-note W7c-2: a 44.1 kHz WAV is SERVED, at the RESAMPLED span") {
   CHECK(gap_silence > 1e-1);
   CHECK(gap_other > 1e-1);
   CHECK(gap_other > 10.0 * gap_offline);
+}
+
+// ---------------------------------------------------------------------------
+// 5d. THE FP8 MoE ARM REACHES A SERVED REQUEST (W9d, #2881).
+//
+//     WHAT THIS FILE CAN AND CANNOT ASSERT is settled by 5c above and nothing
+//     here re-litigates it: every served assertion available in this file is
+//     "two answers differ", so a deterministic arithmetic defect inside the
+//     routed block leaves both answers well-defined and distinct and this suite
+//     stays green. Routed ARITHMETIC is `test_dots3_note_vision`'s job.
+//
+//     What IS this file's job, and what W9d needs from it, is REACHABILITY: is
+//     `layers::Fp8BlockLinearMethod` entered at all when `ApiServer::
+//     handle_chat_completions` serves an image on the default configuration?
+//     A tower gate cannot answer that, and "two answers differ" cannot either
+//     — a bf16 tower answers differently from another bf16 tower too.
+//
+//     `dense_fp8_block::BlockGemmCount()` can, and it is in the tree for
+//     exactly this reason: #1189's own gate design records that a x1.02 and a
+//     x1.10 scale perturbation on the per-tensor fp8 tower were demonstrably
+//     reached and still produced 16/16 identical tokens, so a token gate cannot
+//     answer "did anything reach this arm". The counter is read across ONE
+//     served request below.
+//
+//     NO PUBLISHED CHECKPOINT IS SHAPED LIKE THIS FIXTURE and the case says so
+//     rather than implying otherwise. The released `moe_intermediate_size` is
+//     2112 and upstream's own `per_token_group_quant_fp8` asserts against it
+//     (`fp8_utils.py:563-566` @ `9035151d6`), so the released tower runs the
+//     bf16 class and the cases in 5b above are its coverage, unchanged.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A pyramid tower whose two FP8 widths are 128-aligned, so `enable_fp8_moe`
+// — absent from the config and therefore TRUE by upstream's own default
+// (`vision.py:69`) — actually selects the FP8 class.
+TinySpec Fp8PyramidSpec() {
+  TinySpec s;
+  s.v_pyramid = {-1, 4};
+  // 256, matching `test_dots3_note_vision`'s own FP8 fixture and for the reason
+  // recorded there: at 128 each expert tensor is a single 128x128 block, so its
+  // scale grid cannot tell per-block from per-tensor.
+  s.v_embed = 256;
+  s.v_moe_inter = 256;
+  // ...and blocks whose absolute maxima actually differ, without which
+  // the per-block scale grid cannot be told from a per-tensor one.
+  s.v_expert_block_gain = true;
+  return s;
+}
+
+}  // namespace
+
+TEST_CASE("dots3-note W9d: a served image ENTERS the block-FP8 GEMM, and the count is exact") {
+  Served s(Fp8PyramidSpec());
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+  INFO("install log: ", log.str());
+
+  const std::uint64_t before = vllm::dense_fp8_block::BlockGemmCount();
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(ChatBody(1, 0, false).dump());
+  INFO("body: ", r.body);
+  REQUIRE(r.status == 200);
+  const std::uint64_t after = vllm::dense_fp8_block::BlockGemmCount();
+  const std::uint64_t ran = after - before;
+
+  const json j = json::parse(r.body);
+  CHECK(j.at("object") == "chat.completion");
+  CHECK(j.at("usage").at("prompt_tokens") == 3 + dots3_tiny::kExpectedImageTokens);
+
+  // TWO GEMMs per EXPERT THAT RECEIVED A TOKEN, in one routed block: the merged
+  // `gate_up` (`layers::Fp8BlockMlpGateUpMethod`, one `MergedGemmFp8Block`) and
+  // the down projection (`layers::Fp8BlockLinearMethod`, one
+  // `MatmulFp8BlockScaledD`). Upstream runs one FUSED kernel over all experts
+  // (`note_vision_fused_moe_fp8`); this tree has no grouped block-FP8 MoE op,
+  // so it runs the same arithmetic one expert at a time and skips an expert no
+  // token chose, which is upstream's own `if selected_mask.sum() == 0: continue`
+  // (`vision.py:204-205`).
+  //
+  // The fixture has 4 experts and top-2 over 16 tokens, so between 2 and 4
+  // experts are active and the count is 4, 6 or 8. A RANGE is asserted rather
+  // than a single number because the exact figure is a property of the router
+  // seed and not of the wiring — but the range EXCLUDES zero, which is the
+  // reading this case exists to rule out, and it excludes a per-token count
+  // (16 tokens x 2 slots x 2 GEMMs = 64), which is what a forward that lost the
+  // gather would produce.
+  MESSAGE("W9d served request entered the block-FP8 GEMM " << ran << " times");
+  CHECK(ran >= 4u);
+  CHECK(ran <= 8u);
+  CHECK(ran % 2u == 0u);
+}
+
+TEST_CASE("dots3-note W9d: `enable_fp8_moe` changes what the server answers") {
+  // The two checkpoints differ in `enable_fp8_moe` AND IN NOTHING ELSE: every
+  // tensor is drawn from the same seed stream, the geometry is identical, and
+  // the key is the only line that differs in `vision_config`. So a difference
+  // in what the server answers can only have come through `vision.py:369`.
+  //
+  // This is the served proof that the CLASS SELECTION is load-bearing rather
+  // than decorative. Without it, a resolution that parsed the key and then
+  // ignored it would leave every other case in this file green.
+  TinySpec fp8 = Fp8PyramidSpec();
+  TinySpec bf16 = Fp8PyramidSpec();
+  bf16.v_enable_fp8_moe = false;
+
+  const auto answer = [](const TinySpec& spec) {
+    Served s(spec);
+    MmServerHarness h(s.config, *s.model, Fixture());
+    std::ostringstream log;
+    REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+            oai::MultiModalChatInstall::kInstalled);
+    const ApiServer::DispatchResult r =
+        h.server.handle_chat_completions(ChatBody(4, 0, true).dump());
+    INFO("body: ", r.body);
+    REQUIRE(r.status == 200);
+    return json::parse(r.body)
+        .at("choices")
+        .at(0)
+        .at("logprobs")
+        .at("content")
+        .at(0);
+  };
+
+  const json with_fp8 = answer(fp8);
+  const json without = answer(bf16);
+  MESSAGE("enable_fp8_moe=true  logprob0 ", with_fp8.dump());
+  MESSAGE("enable_fp8_moe=false logprob0 ", without.dump());
+  CHECK(with_fp8 != without);
+}
+
+TEST_CASE("dots3-note W9d: the RELEASED expert width serves the bf16 class, and enters NO block-FP8 GEMM") {
+  // The other side of the same coin, and the case that keeps W6b's served path
+  // honest. `enable_fp8_moe` is TRUE here too — the key is absent, exactly as
+  // on the released checkpoint — but `moe_intermediate_size` is not a multiple
+  // of 128, so upstream's own class would raise and this tower runs the bf16
+  // one. The served answer must still be produced, and NOTHING must enter the
+  // block-FP8 GEMM.
+  TinySpec spec;
+  spec.v_pyramid = {-1, 4};
+  spec.v_embed = 128;
+  spec.v_moe_inter = 100;  // 100 % 128 == 100: upstream asserts here
+  Served s(spec);
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  const std::uint64_t before = vllm::dense_fp8_block::BlockGemmCount();
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(ChatBody(1, 0, false).dump());
+  INFO("body: ", r.body);
+  REQUIRE(r.status == 200);
+  const std::uint64_t ran = vllm::dense_fp8_block::BlockGemmCount() - before;
+  MESSAGE("W9d released-shaped width entered the block-FP8 GEMM " << ran
+                                                                  << " times");
+  CHECK(ran == 0u);
+  CHECK(json::parse(r.body).at("usage").at("prompt_tokens") ==
+        3 + dots3_tiny::kExpectedImageTokens);
 }

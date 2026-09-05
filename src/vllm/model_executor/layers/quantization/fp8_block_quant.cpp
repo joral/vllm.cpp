@@ -66,12 +66,19 @@ constexpr int64_t kSupportedBlockK = 128;
 
 const char* kIssue = "https://github.com/mudler/vllm.cpp/issues/1189";
 
-// The `cutlass-fp8` cell of `cmake/CudaArchFeatures.cmake`, which is what
-// decides whether `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu` is compiled
-// at all and therefore whether its registrar ever runs. Written here because
-// the refusal below is the one place a user is told WHY the op is absent, and
-// "no kernel on this device" without the cell reads as a missing feature
-// rather than a build-time arch selection they can change.
+// The `cutlass-fp8` cell of `cmake/CudaArchFeatures.cmake:290`, which is what
+// decides whether `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu` is compiled at
+// all and therefore whether its registrar ever runs. Written here because the
+// refusal below is the one place a user is told WHY the op is absent, and "no
+// kernel on this device" without the cell reads as a missing feature rather
+// than a build-time arch selection they can change.
+//
+// THE CELL'S OWN DESCRIPTION NAMES THE OTHER TU, so the obvious objection to
+// this constant is that it points at the per-tensor GEMM. It does not:
+// `CMakeLists.txt:1946` says in terms that `cuda_matmul_fp8_block_cutlass.cu`
+// (#1189 M5) "rides the SAME cell", and `:1954-1957` adds both TUs to the one
+// `VT_CUTLASS_FP8_ARCHS` guard. An operator who widens `cutlass-fp8` therefore
+// does get the block kernel, which is what makes this a knob worth naming.
 const char* kCutlassFp8Archs = "12.0a,12.1a";
 
 }  // namespace
