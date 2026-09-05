@@ -316,6 +316,42 @@ bool AnyRowSplicedByCombine(const std::vector<int32_t>& seq_lens,
                             const std::vector<int32_t>& prefill_len,
                             const int32_t* idx_mapping, int num_reqs);
 
+// SPEC-DFLASH2 A2-2 (#2802): THE VERIFY ROUTE PREDICATE, extracted for the same
+// reason `CombineSplicesRow` was — one rule, one expression.
+//
+// Upstream writes it once, in one sampler, at
+// `vllm/v1/worker/gpu/model_runner.py:1129` @ pin 5559679229:
+//
+//     if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+//
+// We have TWO sampling entry points (`sample_tokens` and
+// `sample_tokens_async`), so the same rule is now asked in two places, and a
+// third place — the async input combine's refusal — asks its NEGATION. All
+// three call this.
+//
+// PER STEP, AND THAT IS THE POINT. `num_draft_tokens` is the batch TOTAL,
+// `sum(num_draft_tokens_per_req)`. The forward produced ONE expanded logits
+// tensor for the whole step and either the rejection sampler consumes it or the
+// plain sampler does; there is no per-request choice to make. A per-REQUEST
+// reading of the same rule — "this row drafted nothing, so it is a decode row"
+// — answers differently on a MIXED step, where some rows carry drafts and
+// others carry none, and it would hand the plain sampler a tensor whose rows
+// are not one-per-request. This repository has already shipped a per-request
+// refusal paired with a per-step route predicate (#2710), where it survived 27
+// mutations because every test used `num_reqs == 1`.
+inline bool StepRoutesToVerify(int32_t step_num_draft_tokens) {
+  return step_num_draft_tokens > 0;
+}
+
+// TRUE when batch row `i` carried drafts this step. This is the PER-ROW fact,
+// and it is a different question from `StepRoutesToVerify` — it decides only
+// per-row bookkeeping inside the verify arm (the acceptance telemetry), never
+// the route. Named so the two readings cannot be confused for each other, and
+// so a test can put them side by side on a mixed step.
+inline bool RowCarriesDraftTokens(int32_t row_num_draft_tokens) {
+  return row_num_draft_tokens > 0;
+}
+
 }  // namespace vllm::v1
 
 #endif  // VLLM_V1_WORKER_GPU_PREPARE_INPUTS_H_

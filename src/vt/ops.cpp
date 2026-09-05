@@ -5029,8 +5029,9 @@ void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor
                                                                               seeds);
 }
 
-void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled, const Tensor& logits,
-                           const Tensor& draft_sampled, const Tensor& cu_num_logits) {
+void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled, Tensor& target_argmax,
+                           const Tensor& logits, const Tensor& draft_sampled,
+                           const Tensor& cu_num_logits) {
   const int64_t num_logits = CheckSamplingLogits(q, logits, "greedy_rejection_sample");
   VT_CHECK(cu_num_logits.rank == 1 && cu_num_logits.shape[0] >= 1 &&
                cu_num_logits.dtype == DType::kI32 && cu_num_logits.IsContiguous() &&
@@ -5052,9 +5053,19 @@ void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled, const
                num_sampled.device == q.device,
            "greedy_rejection_sample: num_sampled must be i32 [num_reqs] contiguous on the queue "
            "device");
+  // The per-row argmax scratch is the CALLER's buffer, for the lifetime reason
+  // spelled out beside the declaration (SPEC-DFLASH2 A2-2, #2802). It is checked
+  // exactly like the outputs, because it is one: the argmax kernel writes it and
+  // the accept kernel reads it, both after this call returns on a discrete
+  // backend.
+  VT_CHECK(target_argmax.rank == 1 && target_argmax.shape[0] == num_logits &&
+               target_argmax.dtype == DType::kI32 && target_argmax.IsContiguous() &&
+               target_argmax.device == q.device,
+           "greedy_rejection_sample: target_argmax must be i32 [num_logits] contiguous on the "
+           "queue device");
   if (num_reqs == 0) return;
   reinterpret_cast<GreedyRejectionSampleFn>(GetOp(OpId::kGreedyRejectionSample, q.device.type))(
-      q, sampled, num_sampled, logits, draft_sampled, cu_num_logits);
+      q, sampled, num_sampled, target_argmax, logits, draft_sampled, cu_num_logits);
 }
 
 namespace {

@@ -193,6 +193,13 @@ SUITES=(
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
   test_rocm_strix_ourarm_staged
+  # The TOKENGATE job's build stage (#2895). `--no-build-isolation` makes pip
+  # skip the pin's [build-system] requires, so the harness has to install them
+  # itself, and the hand-kept list it used had drifted three names behind the
+  # pin. That cost a dgx lease and a queue position for a 3-second traceback.
+  # Bash and the standard library over one committed script: no GPU, no lease,
+  # no toolchain, no network, and nothing in it can skip.
+  test_tokengate_buildreq
   test_check_conflict_markers
   test_check_tree_compiles
   test_prepush_checker_names

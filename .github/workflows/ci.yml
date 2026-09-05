@@ -634,6 +634,20 @@ jobs:
         # toolchain, no checkpoint, no network, under a second.
         run: |
           python3 tests/scripts/test_rocm_strix_ourarm_staged.py
+      - name: The TOKENGATE job installs the PIN's build requirements (#2895)
+        # Registered in TWO places, like the suites above, and in the same change
+        # that adds it -- the paragraph on the render-compare suite records what
+        # happens otherwise. `.agents/scripts/tokengate-e126687-job.sh` builds
+        # vLLM with `pip wheel --no-build-isolation`, which makes pip skip
+        # `pyproject.toml`'s `[build-system] requires` entirely, and the list the
+        # script installed by hand had fallen three names behind the pin. Job
+        # efc30c74 spent a lease and a queue position to die in 3 seconds on
+        # `No module named 'setuptools_rust'`.
+        #
+        # Nothing here can skip: the standard library over one committed script,
+        # in scratch directories. No GPU, no lease, no vLLM checkout, no network.
+        run: |
+          python3 tests/scripts/test_tokengate_buildreq.py
       - name: The pre-push hook refuses a checker it names but cannot find
         # #1779. The hook named six checkers, three of which had been deleted,
         # and skipped each missing one in silence while still exiting 0. The

@@ -3364,3 +3364,61 @@ TEST_CASE("runner: the logit dump fires on the ASYNC branch the default takes") 
   for (size_t v = 1; v < row.size(); ++v) if (row[v] > row[best]) best = v;
   CHECK(static_cast<int32_t>(best) == sampled);
 }
+
+// ─── SPEC-DFLASH2 A2-2 (#2802): THE VERIFY DOWNLOAD'S PAGE-LOCKED STAGING ────
+//
+// A fresh review found the copy-queue verify route copying into a plain
+// `std::vector<int32_t>`. A device-to-host `cudaMemcpyAsync` into PAGEABLE host
+// memory is host-synchronous — the driver stages it through its own pinned
+// buffer and the call returns only when the bytes are across — so the fork and
+// ready events around that copy were decorative and no later wave could have
+// obtained overlap from them. The destination is now `PinnedGrowStaging`, which
+// allocates through `vt::Backend::AllocPinned`, as this tree's async sampled-id
+// route already did (`src/vllm/v1/worker/gpu/async_output.cpp`) and as upstream
+// gets for free by copying into torch CPU memory (async_utils.py:124-125).
+//
+// THE PART THIS TIER CAN GATE is the growth rule, and it is the part that could
+// silently reintroduce the defect the same review found in the accept walk's
+// argmax scratch. A grow must RETAIN the block it replaces: a copy already
+// issued into the old block is still writing it, and freeing it is a
+// use-after-free that is invisible while the wait is in step and wrong the
+// moment A2-4 moves the wait. On CPU `AllocPinned` forwards to `Alloc`, so page
+// locking itself is not observable here; the retain rule is.
+//
+// RED-first, by mutation: making `Get` free the previous block before allocating
+// the new one (the shape the CUDA argmax global had) reds the `live_blocks()`
+// assertions below while every token case in this binary stays green — the
+// tokens never move on this backend either, which is exactly why the rule needs
+// its own assertion.
+TEST_CASE("A2-2: the verify download staging is page-locked and a grow RETAINS the old block") {
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vllm::v1::PinnedGrowStaging staging;
+  CHECK(staging.live_blocks() == 0);
+
+  int32_t* small = staging.Get(backend, 4);
+  REQUIRE(small != nullptr);
+  CHECK(staging.live_blocks() == 1);
+  CHECK(staging.elems() == 4);
+  for (int i = 0; i < 4; ++i) small[i] = 100 + i;
+
+  // A request that FITS returns the same block: the steady state allocates
+  // nothing, which is the reason this is a member and not a local.
+  CHECK(staging.Get(backend, 4) == small);
+  CHECK(staging.Get(backend, 1) == small);
+  CHECK(staging.live_blocks() == 1);
+
+  // A GROW hands back a new block and keeps the old one allocated.
+  int32_t* big = staging.Get(backend, 64);
+  REQUIRE(big != nullptr);
+  CHECK(big != small);
+  CHECK(staging.live_blocks() == 2);
+  CHECK(staging.elems() == 64);
+  // The retained block is still ours to read: nothing freed it, so a copy that
+  // was already writing it is writing memory this object still owns.
+  CHECK(small[0] == 100);
+  CHECK(small[3] == 103);
+
+  // A second grow retains again; the destructor releases every block.
+  staging.Get(backend, 256);
+  CHECK(staging.live_blocks() == 3);
+}

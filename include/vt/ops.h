@@ -2576,8 +2576,8 @@ using ComputeProbsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ComputeLogprobsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using RandomSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 // --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3).
-using GreedyRejectionSampleFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&,
-                                         const Tensor&);
+using GreedyRejectionSampleFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&,
+                                         const Tensor&, const Tensor&);
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). See the section at the
 // bottom of this header for the full contracts.
 using ApplyPenaltiesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -5470,12 +5470,24 @@ void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor
 //                 deterministic and the ported legacy-sampler assertions read
 //                 directly. Recorded deviation.
 //   num_sampled   [num_reqs] i32            OUT; accepted_length + 1
+//   target_argmax [num_logits] i32          SCRATCH, written then read by this
+//                 op: the per-expanded-row argmax of `logits`, upstream's
+//                 `_compute_global_target_argmax` output (:923-946). It is a
+//                 PARAMETER and not a private static for one reason
+//                 (SPEC-DFLASH2 A2-2, #2802): the CUDA arm launches two kernels
+//                 and returns while both are still queued, so the buffer between
+//                 them has to be owned by whoever owns the in-flight window. A
+//                 process-global grow-only scratch cannot be: a second caller
+//                 with more rows frees it under the first caller's queued accept
+//                 kernel. The caller allocates it, keeps it alive until it has
+//                 waited, and frees it then —
+//                 `vllm::v1::RejectionSamplerDeviceOutput` is that owner.
 //
 // Argmax tie-break is LOWEST INDEX (torch.argmax), identical to vt::GreedyArgmax,
 // so a k=0 request reduces EXACTLY to the non-speculative greedy sampler.
 void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled,
-                           const Tensor& logits, const Tensor& draft_sampled,
-                           const Tensor& cu_num_logits);
+                           Tensor& target_argmax, const Tensor& logits,
+                           const Tensor& draft_sampled, const Tensor& cu_num_logits);
 
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). Ported from
 // vllm/model_executor/layers/utils.py (apply_penalties), vllm/_custom_ops.py

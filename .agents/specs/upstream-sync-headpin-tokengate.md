@@ -310,6 +310,75 @@ known to be the same object, and writing either into a provenance field would
 manufacture a fact. The capture this wave queues resolves it by measurement: a
 manifest written from that job records a commit it actually ran.
 
+### 2.7 The job could not build, and why the repair reads the requirement from the tree
+
+Job `efc30c74-005e-4e80-bc28-bd34f5b76b77` ran on `dgx:gpu0` and exited **4**
+three seconds into the build stage
+([#2895](https://github.com/mudler/vllm.cpp/issues/2895)):
+
+```
+File "<string>", line 21, in <module>
+ModuleNotFoundError: No module named 'setuptools_rust'
+```
+
+Everything the job asserts before that passed: `COMPUTE_CAP=12.1`,
+`SUM DEVICE_RC=0`, `HEAD_SHA` confirmed at `e126687a9a8`, `SUM PIPREQ_RC=0`. The
+goldens, the differ and the staged-input block are not implicated, and neither
+is the device guard.
+
+**The mechanism.** The build runs `pip wheel --no-deps --no-build-isolation`, and
+`--no-build-isolation` makes pip skip `pyproject.toml`'s `[build-system]
+requires` **entirely**. Nothing else in the job put a build dependency in the
+venv except one hand-kept list, `pip wheel setuptools setuptools_scm ninja cmake
+numpy`. At the target the `requires` are `cmake>=3.26.1`, `ninja`,
+`packaging>=24.2`, `setuptools>=77.0.3,<81.0.0`, `setuptools-scm>=8.0`,
+`setuptools-rust>=1.9.0`, `torch==2.13.0`, `wheel` and `jinja2`; the list was
+three names behind. `setup.py:21` at the pin is
+`from setuptools_rust.build import build_rust`, which is the frame in the
+traceback.
+
+**The repair does not add three names.** It installs
+`requirements/build/cuda.txt` out of the clone the job already made at
+`$TARGET_SHA`. `pyproject.toml` names that file itself — "Should be mirrored in
+`requirements/build/cuda.txt`" — and at `e126687a9a8` the mirror covers all nine
+`requires` and adds `build`, `protobuf` and `regex`. A list read from the tree
+cannot drift from the pin. A list retyped into the harness silently can, and
+that is the defect rather than the three missing names: the next pin advance
+would reproduce it.
+
+**Upstream's mirror comment is an intention, not a guarantee**, so the job now
+also asserts the outcome. It parses `[build-system] requires` out of the cloned
+`pyproject.toml` and requires every distribution named there to resolve in the
+build venv, refusing with `BUILDREQ_RC=1` and **exit 3** — the existing
+"build prerequisites missing" code — and naming what is absent. It checks
+presence, not version specifiers: pip resolved the versions when it installed
+the mirror, and the class of failure that stops the build is a name nothing
+installed.
+
+**The assertion is falsifiable without a lease.**
+`tests/scripts/test_tokengate_buildreq.py` extracts that program from the
+committed script and runs it against scratch trees it writes: a distribution
+that resolves, one that does not, PEP 503 spellings of one name, an extras
+marker, and a `pyproject.toml` whose `requires` cannot be read. Run against the
+pin's real `pyproject.toml` on a host with none of the build tools it prints
+`BUILDREQ MISSING cmake setuptools-scm setuptools-rust` and exits 1. The same
+suite pins the three things the repair must not have moved: the ten staged-input
+`assert_sha` calls, the compute-capability guard, and the exit map in which
+DRIFT is 7 and no instrument failure is.
+
+**The checker and the shell that obeys it fail independently, so both are
+pinned.** Running the extracted program says what it RETURNS and reaches none of
+the lines that act on that return value. A first review found every one of them
+unmeasured: `BUILDREQ_RC=$?` replaced by a literal, the `-ne 0` branch replaced
+by `if false`, the five-line refusal deleted outright, and `exit 3` turned into
+`exit 0` all left the suite green, and so did repointing the checker at a
+snapshot instead of the clone — which is the fix's whole thesis. The
+compute-capability guard was in the same state: deleting the whole
+`if [ "$CAP" != "12.1" ]` block, or the `CAP=` line it compares, changed
+nothing the suite could see. `TheShellRefusesWhenTheEmbeddedAssertionReds` and
+`test_the_compute_capability_guard_survives` close both, and §4 records each
+mutation going red.
+
 ## 3. Risks
 
 - **The queue.** `dgx:gpu0` had eleven jobs ahead of this one at submission. The
@@ -348,6 +417,16 @@ manifest written from that job records a commit it actually ran.
 | The integrity block catches a corrupted BAR | flip one byte of the staged `greedy_ids.npy`, rerun | **rc 9**, mismatch named, other nine still checked |
 | A drift leaves the job with its own status | `DIFF_RC` 0 / 1 / 2 / unset through the job's exit map | **0 / 7 / 8 / 0** |
 | The token harness reads no pin constant | full read + the §2.1 probe with controls | zero hits, controls 1/5/4 |
+| The device guard is pinned: its refusal | delete the whole `if [ "$CAP" != "12.1" ]` block | **suite rc 1**, `test_the_compute_capability_guard_survives` |
+| The device guard is pinned: its input | delete the `CAP="$(nvidia-smi …)"` line | **suite rc 1**, same case |
+| The device guard is pinned: its exit | wrong-device branch `exit 2` → `exit 0` | **suite rc 1**, same case |
+| The shell reads the CHECKER's status | `BUILDREQ_RC=$?` → `BUILDREQ_RC=0` | **suite rc 1**, `test_the_status_the_refusal_tests_is_the_checkers_own` |
+| The shell BRANCHES on it | `if [ "$BUILDREQ_RC" -ne 0 ]` → `if false` | **suite rc 1**, `test_a_red_checker_stops_the_job_with_the_prerequisites_code` |
+| The branch REFUSES | that branch's `exit 3` → `exit 0` | **suite rc 1**, same case |
+| The refusal exists at all | delete all five lines of it | **suite rc 1**, both cases |
+| The ABSENT-file branch refuses too | its `exit 3` → `exit 0` | **suite rc 1**, `test_a_missing_requirements_file_refuses_instead_of_building` |
+| The checker reads the CLONE | `$WORK/vllm/pyproject.toml` → `$WORK/snapshot-pyproject.toml` | **suite rc 1**, `test_the_checker_is_handed_the_cloned_tree_not_a_snapshot` |
+| Red before the repair | the 16-case suite against the parent's script | **13 red**; the 3 green in both directions are the must-not-move guards |
 | The capture at the target on GB10 | `efc30c74-005e-4e80-bc28-bd34f5b76b77` | **PENDING**, queued |
 
 Every rc above was read directly, never after a pipe.
@@ -416,6 +495,30 @@ Every rc above was read directly, never after a pipe.
   for the first of those; re-counted here it is 67, and the count that belongs
   in the record is the one this wave measured rather than the one it was
   handed.
+- **[#2794](https://github.com/mudler/vllm.cpp/issues/2794): whether the leased
+  container can satisfy the pin's Rust workspace.** The target carries
+  `rust/Cargo.toml` and a `rust-toolchain.toml` on channel 1.95, and the
+  container's toolchain is unknown. `setup.py:1495` passes
+  `optional=not should_require_rust_frontend()` and `VLLM_REQUIRE_RUST_FRONTEND`
+  is unset, so an absent `cargo` **should** be tolerated and the frontend
+  skipped. Read from the source, never observed: the build has not yet reached
+  that line on the fleet. The next run answers it, and it is recorded rather
+  than probed because probing it costs the same lease the run needs.
+- **[#2794](https://github.com/mudler/vllm.cpp/issues/2794): whether
+  `--max-runtime 5h` covers a COLD build.** The job's ccache remote store at
+  `$WS/ccache-remote` is empty, because the run that would have filled it never
+  reached compilation. Every published timing for this tree's CUDA builds is a
+  warm one, so the budget for a cold `MAX_JOBS=4` build at `TORCH_CUDA_ARCH_LIST=12.1`
+  is an estimate. The build stage is a no-op once the wheel is persisted and
+  `STAGE=build` is separable from `STAGE=capture`, so a timeout costs a requeue
+  and not the measurement.
+
+  Both are anchored on #2794 and not on #2895. #2895 is the build failure, and
+  the change that records these questions closes it; an `## Owed` bullet whose
+  issue closes in the same commit points at a closed issue from the moment it
+  lands. #2794 is the obligation that outlives it — the declared token-exact
+  gate at `e126687a9a` — and the leased run that discharges it is the same run
+  that answers both questions.
 - **The other strict goldens at the target** — 27B W4A4, 32B-NVFP4A16, 35B,
   Coder. The pin advance re-captured all four at `5559679229`; none has been
   re-captured at `e126687a9a`, and this wave does not attempt it (#2794).

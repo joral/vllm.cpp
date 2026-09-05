@@ -78,21 +78,32 @@ number.
 ```parity-pin
 vllm_commit = e126687a9a828d513c01a07cd69f025f27d63280
 vllm_runtime_version = 0.28.1rc1.dev132+ge126687a9
-vllm_distribution_version = 0.28.1rc1.dev132+ge126687a9.precompiled
+vllm_distribution_version = 0.28.1rc1.dev132+ge126687a9
 flashinfer_version = 0.6.18
 ```
 
-**The `.precompiled` suffix is a BUILD-MODE property, and the next oracle build
-may not carry it.** The distribution string above was measured under
-`VLLM_USE_PRECOMPILED=1`. A SOURCE build at the same revision produced
+**This field now records the SOURCE build, corrected 2026-09-04 on developer
+instruction (#2896).** The `.precompiled` suffix is a BUILD-MODE property, and
+recording it made the harness unsatisfiable on this architecture: `online_gate.py`
+compares this field for EQUALITY, and on aarch64 `VLLM_USE_PRECOMPILED=1`
+downloads nothing and leaves a 13,872-byte editable install with **no compiled
+extensions** — so the only mode that matched the string could not execute a
+kernel, while the only mode that can execute was refused. No cross-engine
+measurement was possible at this pin in either direction.
+
+**The new value is measured, not transcribed**, which is the constraint this block
+exists to enforce. `VLLM_USE_PRECOMPILED=0 VLLM_TARGET_DEVICE=cuda` at this
+revision produced
 `vllm-0.28.1rc1.dev132+ge126687a9-cp312-cp312-linux_aarch64.whl`, with no suffix
-([`sync/2026-09-03-e126687-runhalf.md`](sync/2026-09-03-e126687-runhalf.md) §2).
-`online_gate.py` compares this field for EQUALITY, so a source-built oracle is
-refused on it. The value recorded is the one that was measured, because the
-alternative is writing a string nobody read, which is the #520 failure exactly.
+([`sync/2026-09-03-e126687-runhalf.md`](sync/2026-09-03-e126687-runhalf.md) §2,
+lines 52 and 56). Writing a string nobody read is the #520 failure and is not what
+happened here.
+
 Whoever next builds the oracle records WHICH mode they used and, if the field is
 wrong for it, corrects it from THAT measurement — never by editing the block to
-make a run pass.
+make a run pass. **A build that carries `.precompiled` on aarch64 is not a
+runnable oracle**, so a future correction back toward it needs a measurement
+showing the install can actually serve.
 
 **`vllm_runtime_version` must carry a `+g<sha>` segment naming `vllm_commit`.**
 That is a permanent constraint of this design, not a property of today's values:

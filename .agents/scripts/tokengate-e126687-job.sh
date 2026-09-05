@@ -119,9 +119,98 @@ if [ "$STAGE" = "build" ] || [ "$STAGE" = "all" ]; then
       python3 -m venv "$WORK/venv" || { sum "VENV_RC=1"; exit 3; }
     fi
     "$WORK/venv/bin/pip" install -q -U pip wheel setuptools setuptools_scm ninja cmake numpy
+
+    # THE BUILD REQUIREMENTS COME FROM THE TREE, NOT FROM THIS FILE. The wheel
+    # build below passes `--no-build-isolation`, which makes pip SKIP
+    # pyproject.toml's [build-system] requires ENTIRELY, so whatever this venv
+    # lacks the build simply does not get. The line above used to be the only
+    # answer to that, and it is a HAND-KEPT list: job
+    # efc30c74-005e-4e80-bc28-bd34f5b76b77 reached the build stage and died in 3
+    # seconds at setup.py:21, `from setuptools_rust.build import build_rust`,
+    # because the pin's requires had moved past the list and `packaging`,
+    # `setuptools-rust` and `jinja2` were all absent.
+    #
+    # pyproject.toml at $TARGET_SHA says its requires "Should be mirrored in
+    # requirements/build/cuda.txt", and at e126687a9 that file is a superset of
+    # them. Installing THAT file, out of the clone we just checked out, cannot
+    # drift from the pin. A list retyped here silently can, which is the defect
+    # above and the reason this is not simply three more names on line 121.
+    BUILDREQ="$WORK/vllm/requirements/build/cuda.txt"
+    if [ ! -f "$BUILDREQ" ]; then
+      sum "BUILDREQ_RC=1  $BUILDREQ is absent at $TARGET_SHA"
+      exit 3
+    fi
+    say "--- build requirements, read from the tree at $TARGET_SHA ---"
+    sed 's/^/BUILDREQ /' "$BUILDREQ"
+    "$WORK/venv/bin/pip" install -q -r "$BUILDREQ" > "$OUT/pipbuildreq.log" 2>&1 \
+      || { sum "BUILDREQ_RC=1 see pipbuildreq.log"; tail -30 "$OUT/pipbuildreq.log"; exit 3; }
+
     "$WORK/venv/bin/pip" install -q -r "$WORK/vllm/requirements/cuda.txt" > "$OUT/pipreq.log" 2>&1 \
       || { sum "PIPREQ_RC=1 see pipreq.log"; tail -30 "$OUT/pipreq.log"; exit 3; }
     sum "PIPREQ_RC=0"
+
+    # --- BUILD-REQUIRES ASSERTION begin ---
+    # ASSERT what the build actually needs, read from the pin's OWN
+    # pyproject.toml rather than from anything written here. "Should be mirrored
+    # in requirements/build/cuda.txt" is upstream's intention, not a guarantee,
+    # and the failure it hides is precisely the one that cost efc30c74: a name
+    # in `requires` that nothing installed. Deriving the list means this cannot
+    # go stale when the pin advances -- it will say which name is missing
+    # instead of handing the next lease a traceback.
+    #
+    # It checks PRESENCE and not the version specifier. pip resolved the
+    # versions when it installed the file above; what this catches is a NAME
+    # that nothing installed, which is the ModuleNotFoundError class that
+    # actually stops the build.
+    #
+    # `tests/scripts/test_tokengate_buildreq.py` extracts this program and runs
+    # it against scratch trees, so the checker is falsifiable without a lease.
+    "$WORK/venv/bin/python" - "$WORK/vllm/pyproject.toml" <<'PY'
+import importlib.metadata as md
+import re
+import sys
+import tomllib
+
+path = sys.argv[1]
+with open(path, "rb") as fh:
+    requires = tomllib.load(fh).get("build-system", {}).get("requires", [])
+if not requires:
+    print("BUILDREQ ERROR no [build-system] requires in " + path)
+    sys.exit(2)
+
+
+def dist_name(spec):
+    """The distribution a PEP 508 requirement names, without its constraints."""
+    return re.split(r"[\s<>=!~;\[(]", spec.strip(), maxsplit=1)[0]
+
+
+# `setuptools_rust` and `setuptools-rust` are ONE distribution, and pyproject
+# and the mirror do not always agree on the spelling. No normalisation is
+# written here because `importlib.metadata` already applies PEP 503 to the name
+# it is given -- verified on this interpreter, where `annotated-doc`,
+# `annotated_doc` and `annotated.doc` all resolve.
+missing = []
+for spec in requires:
+    name = dist_name(spec)
+    try:
+        found = md.version(name)
+    except md.PackageNotFoundError:
+        print("BUILDREQ ABSENT  " + spec)
+        missing.append(name)
+    else:
+        print("BUILDREQ PRESENT " + name + "==" + found + "  (" + spec + ")")
+print("BUILDREQ REQUIRES=%d ABSENT=%d" % (len(requires), len(missing)))
+if missing:
+    print("BUILDREQ MISSING " + " ".join(missing))
+    sys.exit(1)
+PY
+    BUILDREQ_RC=$?
+    if [ "$BUILDREQ_RC" -ne 0 ]; then
+      sum "BUILDREQ_RC=1  the venv does not satisfy [build-system] requires at $TARGET_SHA"
+      exit 3
+    fi
+    sum "BUILDREQ_RC=0  every [build-system] requires distribution is installed"
+    # --- BUILD-REQUIRES ASSERTION end ---
 
     say "--- build (MAX_JOBS=4; unconstrained parallelism has OOM-rebooted this fleet) ---"
     export VLLM_USE_PRECOMPILED=0 VLLM_TARGET_DEVICE=cuda
