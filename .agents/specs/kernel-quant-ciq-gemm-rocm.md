@@ -311,6 +311,56 @@ Same caveat as the Q6_K-only measurement: this is not the issue's own `-n 128
 row has produced toward gate (c) — closing gate (c) itself still needs the
 issue's exact recipe run, oracle side included.
 
+## Gate (c), the issue's own recipe
+
+**Built and ran the pinned oracle at the exact SHA the spec's `## Upstream
+anchor` cites** (`10bf611e533d81f739128304991c5e133c6aebd8`, tag `b10451`),
+in a linked worktree (`/tmp/llama-cpp-b10451`) so the developer's own
+checkout was never touched, `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1200`, on the
+same RX 9060 XT. `llama-bench -m Ornith-1.5-9B-Q4_K_M.gguf -p 512 -n 128
+-ngl 99` reproduces the issue's own numbers closely: pp512 1773-1862 tok/s
+(issue: 1691), tg128 48.65-49.05 tok/s (issue: 48.51) — same tool, same
+checkpoint, same recipe, and the oracle stands.
+
+**`rocprofv3 --kernel-trace --stats` total kernel time, `-r 5` (llama-bench's
+own default rep count), idle host verified (`rocm-smi`: 44°C, 0% GPU, no
+other `/dev/kfd` holder; `uptime` load average 2.66-3.14, which is this
+project's own recorded honest-caveat shape for "idle GPU, busy host" rather
+than a fully quiet machine):**
+
+| | Oracle (llama.cpp `b10451`) | Ours, scalar (`VT_ROCM_QUANT_WMMA=0`) | Ours, WMMA (this row) |
+|---|---:|---:|---:|
+| Total (`-r 5`) | 13,581.8 ms | 179,037.6 ms | 93,576.5 ms |
+| Per-run average | 2,716.4 ms | 35,807.5 ms | 18,715.3 ms |
+| Ratio vs oracle | 1.00x | 13.18x slower | 6.89x slower |
+
+Single-run (`-r 1`, closer in shape to how the issue's own table reads):
+oracle 2,972.3 ms, scalar 36,352.0 ms, WMMA 19,128.8 ms. **This row's WMMA
+total is under the gate's stated 20,000 ms threshold on both single-run and
+per-run-average readings, on the real checkpoint, the pinned oracle
+revision, and the production call site** — the strongest form of evidence
+this spec has for gate (c). Scalar-to-WMMA improvement on this full `-p 512
+-n 128` workload (prefill AND decode combined, so Q4_K/Q6_K's isolated
+kernel gains are diluted by every OTHER kernel in the forward pass): 1.90x
+(`-r 1`) to 1.91x (`-r 5`), consistent between the two.
+
+**What does NOT reconcile, stated rather than elided:** the oracle side
+measured here (2,716-2,972 ms) is 6.3-6.9x SMALLER than the issue's cited
+18,812 ms, and the scalar side (35,807-36,352 ms) is 3.0-3.1x smaller than
+its cited 108,817 ms — different ratios, so this is not simply "the issue
+used more repetitions" (that would scale both sides by the same factor).
+Candidates not distinguished here: a different exact prompt (the issue does
+not record one; this measurement's is a real 512-token English paragraph,
+built and pinned to exactly 512 tokens against this checkpoint's own
+tokenizer, `/tmp/prompt512.txt`, not preserved in this commit), ROCm/driver
+drift on this box between 2026-08-27 and this measurement, or a recipe
+detail the issue's one-line citation does not carry. Closing this gap is
+follow-up work, not assumed away: **gate (c) is reported here as narrowly
+SATISFIED against its own stated absolute threshold, on a faithful same-tool
+same-checkpoint same-pinned-oracle reproduction — not as reconciled against
+the issue's original absolute figures**, which stay an open question this
+paragraph names rather than answers.
+
 Not yet closed: Q5_K and the M/N tail remain `## Owed`, as scoped above. W2
 (launch-site replacement) refers to the scalar arm's retirement once every
 format is covered; today both arms coexist by design.
