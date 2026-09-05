@@ -16,8 +16,10 @@ Base: `5386a9eb8`
 
 ## Now
 
-`ACTIVE`. This is the **eighth and final** component of gap A24. What A24 still
-owes after it is in `## Owed`, and none of it is a ninth component.
+`DONE`. This is the **eighth and final** component of gap A24, and with it every
+one of A24's eight components computes and stores at upstream's own model dtype.
+What A24 still owes after it is in `## Owed`, and none of it is a ninth
+component. The measurements are in `## Outcome`.
 
 ---
 
@@ -361,6 +363,163 @@ than an exit code.
 
 ---
 
+
+---
+
+## Outcome
+
+Recorded at `DONE`, per AGENTS.md: what was measured, what was rejected, and why
+each default has its value.
+
+### O1. Gateability, and the pin
+
+§0's commands were re-run at this row's head. `git -C ~/_git/LTX-2 rev-parse
+HEAD` is `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`, `git status --porcelain` is
+empty, torch is 2.11.0+cu130 with numpy 2.3.5 and einops 0.8.2. **No lease was
+taken, no GPU work ran, nothing was downloaded and `CHECKPOINT_ROOT` was not
+resolved.** §0 was right that none was needed.
+
+### O2. The red, literally, through the production entry point
+
+At this branch's base the two loader call sites already asked for `kBF16` and the
+head read every tensor through `Ltx2VaeWeights::Get`, which refuses a bf16 bag by
+name. `Load` with a `duration_head_path` plus `Generate` with an auto duration:
+
+```text
+test_ltx2_video.cpp:13619: FATAL ERROR: REQUIRE_NOTHROW( res = engine->Generate(gen) )
+  THREW exception: "vt: ltx2 vae: missing parameter duration_head.video_input_proj.bias
+  at src/vllm/model_executor/models/ltx2_audio_vae.cpp:42"
+[doctest] test cases: 1 | 0 passed | 1 failed | 124 skipped
+[doctest] assertions: 1 | 0 passed | 1 failed |
+```
+
+Green after, on the same case: `1 passed | 0 failed`, `assertions: 12 | 12
+passed`. The focused suites are `test_ltx2_video` 126/126 with 5051 assertions
+and `test_ltx2_pipeline` 76/76 with 4682.
+
+### O3. WHICH CLAIM IS MEASURED BY WHAT
+
+The row claims **both** widths and keeps them apart, which is wave 5's review
+finding applied at the outset.
+
+* **STORAGE — claimed and measured in BYTES.** Two bags built from the same
+  fifteen tensors: `f32.Bytes() == 2 * bf16.Bytes()` exactly, and
+  `bf16.Bytes() == elements * SizeOf(kBF16)`. On the production path the trace
+  carries `duration_head_weight_bytes == duration_head_weight_elems * 2`. No byte
+  count is quoted anywhere; the observable is the ratio.
+* **ARITHMETIC — claimed for the head's PRODUCED VALUES, not for the buffers.**
+  The activations stay in `std::vector<float>` and this row does **not** claim
+  they are half. `Ltx2DurationWidthCounts` counts values that could not have come
+  out of a bf16 store, taken AFTER each store point: 0 on the bf16 arm with
+  `values > 0` as the control, and non-zero on the f32 arm over the identical
+  fixture and tensor set in the same test.
+
+### O4. The rules, and the blast radius each mutation produced
+
+Every mutation was confirmed **applied** and **compiled** before its result was
+read, and restored with `git checkout --` plus a `git diff --quiet` check, then
+rebuilt. The coverage column was emitted by the generator **before** any mutation
+ran, so the agreement is a prediction met and not a description.
+
+| # | mutation | compiled | failing case(s) | fixtures moved | coverage predicted |
+|---|---|---|---|---|---|
+| M1 | delete the production call site in `Generate` | yes | both production cases | — | — |
+| M2 | the PREFIXED loader site alone -> `kF32` | yes | the prefixed case ONLY | — | — |
+| M3 | the BARE fallback loader site alone -> `kF32` | yes | the bare case ONLY | — | — |
+| M4 | R1 `two_round` | yes | the value gate | **5** | **5** |
+| M5 | R2 `add_f32` | yes | the value gate | **3** | **3** |
+| M6 | R3 `gelu_narrow` | yes | the value gate | **2** | **2** |
+| M7 | R5 `attn_f32` | yes | the value gate | **6** | **6** |
+| M8 | R4 `exp_f32` | yes | the value gate AND the production case | **9** | **9** |
+| M9 | `Bytes()` sizes the bf16 arm by `sizeof(float)` | yes | both production cases, the ratio case, and two upsampler cases | — | — |
+| M10 | drop the third-width refusal | yes | the refusal case ONLY | — | — |
+| M11 | drop the head's module-boundary narrowing | yes | the value gate | 4 assertions | — |
+
+**M10 first ran INCONCLUSIVE.** Its mutated text did not compile, and a mutation
+that does not build reads as a passing test. It was corrected and re-run; the
+compile rc is recorded for every mutation for that reason.
+
+**M2 and M3 separate, which is the point of running them apart.** Wave 5 reverted
+two loader sites together and could not see either alone. Here each site reds
+exactly one case and neither reds the other's.
+
+### O5. THE FINDING M5 PRODUCED, and the repair it forced
+
+M5 first ran **GREEN**: deleting the rounding after the modality-embedding add
+left `test_ltx2_video` at 5051 of 5051 and `test_ltx2_pipeline` at 4682 of 4682.
+The cause was a narrowing this port added and upstream does not have.
+`Ltx2DurationAttentionPool` re-narrowed its input tokens on entry, which
+re-rounded exactly the values the deleted store point produced.
+
+`AttentionPooler` is a submodule: upstream hands it whatever the enclosing
+forward stored, and `torch.cat` of two bf16 tensors is bf16 because the
+projections stored bf16. The entry narrowing was removed, both suites stayed
+green — it had changed no value — and M5 then reds 3 fixtures, its predicted
+coverage. **The header note this row wrote is what it cost:** a narrowing
+upstream does not do is the same class of defect as one it does, and on top of a
+real store point it does not produce a wrong answer, it produces a rule that
+cannot be measured.
+
+### O6. THE SECOND CALL SITE NOTHING REACHED
+
+`Ltx2VideoEngine::Load` has two `Ltx2LoadDurationHeadWeights` sites, and the
+bare-spelling fixture (`paths.duration_head_bare`) had existed since #2900 with
+**no case using it**. The fallback was therefore unreached and M3 could not have
+been seen. A production case for it was added before the mutations were read.
+
+### O7. The digest, and why it exists
+
+The goldens carry an FNV-1a digest of the bf16 weight and token words per
+fixture, so the two sides agree on the WEIGHTS before they are asked to agree on
+the answer. glibc's `sin` and torch's float64 `sin` are not bit-equal — about one
+f64 result in a thousand differs — and **0 of 7,798,713** values this table draws
+differ after the f32-then-bf16 narrowing. That is a measurement with a libm and a
+torch version attached, not a guarantee.
+
+It earned itself on its first run: the C++ side had seeded FNV-1a with
+`ltx2_video.cpp`'s own `DigestF32` constant, `1469598103934665603`, which is a
+digit short of the published offset basis `0xCBF29CE484222325`. The nine values
+were already bit-exact; only the digests disagreed, which is precisely the
+separation the digest was added to give. `DigestF32` itself is self-consistent
+and was left alone.
+
+### O8. What is NOT mutated, named rather than implied
+
+* **`emb_f32`** (the modality embedding not narrowed) has no arithmetic mutation
+  because it is a STORAGE guarantee: the bag holds bf16 words, so the embedding
+  cannot be un-narrowed without changing the bag's arm. M2 and M3 are that
+  mutation and both red.
+* **`soft_bf16`** (the attention scores and weights narrowed) has no local
+  mutation: this port never narrows them, and producing the rule would mean
+  editing `vt::AttentionCross`, a shared seam this row does not own. It is gated
+  by its golden column, which separates 3 fixtures, and M7 mutates the adjacent
+  store. Recorded in `## Owed`.
+
+### O9. Reader anchors
+
+`ltx2_video.cpp`'s READER ANCHORS list had rotted for the **ninth** time — the
+wip commit's net +2 lines moved the last five. It was re-derived with the test
+case's own rule, and **re-derived again after the replacement**, because a
+replacement that shifts lines invalidates the list it just wrote. It did not
+shift, and the derived and recorded lists match.
+
+### O10. Why each default has its value
+
+* **The value gate is bit-exact, never a band.** A bf16 result is upstream's word
+  or a different one, and §3.2's funnel means a band would swallow six of the
+  seven rules.
+* **The frame count is an equality, never a band.** A discrete selection has
+  bimodal error. §3.3 measured 10 of 1000 samples flipping the count by eight
+  frames on the `8k + 1` grid.
+* **`GeluTanh` keeps its f64 pointwise expression.** §3.1 measured it bit-equal to
+  upstream's f32 `gelu` at bf16 in 0 of 200, so narrowing it is neither needed nor
+  free — it would move the f32 arm's goldens. The debt stays owed there.
+* **The f64 accumulation stays.** Bit-equal to torch's bf16 `Linear` in 0 of 4096
+  at the widest shipped shape, because at a bf16 store the f32-vs-f64 reduction
+  difference sits far below one ulp.
+
+---
+
 ## Owed
 
 * **The FP8 and NVFP4 arms** of the duration head — A22, upstream's four
@@ -374,6 +533,12 @@ than an exit code.
 * **`query_tokens`' narrowing is unmeasurable by any value gate at this
   component's shipped widths** (§3.2 N3): 0 of 93 bit-exact pooler fixtures
   separate it. It is gated by a count, and the value gate for it is owed.
+* **`soft_bf16` has no local MUTATION**, only a golden column. Producing the rule
+  — narrowing the attention scores and the softmax output — means editing
+  `vt::AttentionCross`, a shared seam this row does not own. Its golden column
+  separates 3 of the 9 fixtures and M7 mutates the adjacent store, so the rule is
+  gated by value; what is owed is a mutation that proves the gate detects it.
+  See `## Outcome` O8.
 * **`GeluTanh`'s f64 pointwise expression stays WIDER than upstream on the f32
   arm.** It is bit-equal at bf16 (§3.1), so this row neither needs nor makes the
   change; `ltx2_duration_head.cpp:69-78` keeps recording it as visible debt.
