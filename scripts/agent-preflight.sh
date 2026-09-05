@@ -204,6 +204,14 @@ SUITES=(
   test_check_tree_compiles
   test_prepush_checker_names
   test_ab_arms_differ
+  # The variadic-load harness's own controls (#2970). It measures two
+  # engines on a leased GPU, but every property it CLAIMS -- linear
+  # percentiles, a closed loop that really overlaps, a warmup the
+  # measured window cannot see, a token count that comes from `usage`
+  # and never from a chunk count -- is a property of the client and the
+  # report. All of them are checkable against a loopback mock with no
+  # lease, no toolchain and no weights, which is where they belong.
+  test_variadic_harness
   test_ltx25_pixel_ab_harness
   test_ltx2_dit_attn_knob_arms
   test_ltx25_ab_memwatch

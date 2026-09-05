@@ -499,6 +499,10 @@ jobs:
           python3 tests/scripts/test_agent_pr_body.py
           python3 tests/scripts/test_agent_issue_index.py
           python3 tests/scripts/test_ab_arms_differ.py
+          # The variadic-load harness's controls (#2970). Standard
+          # library plus a loopback mock server: no numpy, no GPU, no
+          # network beyond 127.0.0.1.
+          python3 tests/scripts/test_variadic_harness.py
           # The ROCM-TIER-DIVERGENCE (#2590) attribution suite stays HERE, and
           # its two siblings do not (#2705). This one drives
           # `scripts/tier-delta-attribution.py`, which imports `statistics` and
