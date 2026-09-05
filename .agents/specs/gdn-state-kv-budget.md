@@ -94,18 +94,29 @@ the pinned tip).
    floor is 16.) It then pads the mamba page up to the attention page exactly
    (`:917-935`).
 
-2. `vllm/v1/core/kv_cache_utils.py::_unify_hybrid_kv_cache_specs` (:1073-1131)
+2. `vllm/v1/core/kv_cache_utils.py::unify_hybrid_kv_cache_specs` (the leading
+   underscore was dropped upstream before the `5559679229` pin, so this
+   citation was already stale there)
    finishes the unification for any residual mismatch, so every layer of a
    hybrid model has ONE page size.
 
-3. `vllm/v1/core/kv_cache_utils.py::get_num_blocks` (:993-1011) and
-   `_get_kv_cache_config_uniform_page_size` (:1399-1416) then size the whole
-   pool from the memory budget and share it:
+3. `vllm/v1/core/kv_cache_utils.py::get_kv_cache_config_from_groups` then sizes
+   the whole pool from the memory budget and shares it. At the `e126687a9a`
+   pin the free function `get_num_blocks` this spec used to cite is GONE:
+   the division is inlined into that caller and the override is factored out
+   into `vllm/v1/core/kv_cache_utils.py::may_override_num_blocks`, with the
+   `page_size * group_size` divisor replaced by
+   `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_bytes_per_block`. The three
+   `def get_num_blocks*` symbols that remain elsewhere at the pin
+   (`kv_cache_coordinator.py`, `single_type_kv_cache_manager.py`,
+   `kv_offload/tiering/example/manager.py`) are `get_num_blocks_to_allocate`
+   methods on a different concern and are NOT the successor. The arithmetic
+   below is unchanged in substance, only relocated:
 
    ```python
-   group_size = max(len(group.layer_names) for group in kv_cache_groups)
-   page_size  = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
-   num_blocks = get_num_blocks(vllm_config, group_size, available_memory, page_size)
+   bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+   num_blocks      = available_memory // bytes_per_block
+   num_blocks      = may_override_num_blocks(vllm_config, num_blocks)
    ```
 
    Each `KVCacheTensor` is `page_size * num_blocks` and is `shared_by` one layer

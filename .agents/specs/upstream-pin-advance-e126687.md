@@ -414,3 +414,34 @@ consistency. Each is a command, not a description.
   The pinned registry is unreconciled in both directions. Filed by this wave,
   owned by no row yet, and listed here as AGENTS.md §"Every change starts from an
   issue" requires.
+  **Citations REPAIRED 2026-09-05, wave MATRIX** (this file's `## Owed` keeps the
+  entry because the issue's items 1 and 4 are not discharged). What landed: all
+  fifteen re-anchored by symbol at the pin, plus five citations #2819 never
+  reported. Three of those five were already stale at `5559679229` and so fall
+  outside its before/after delta (`olmo.py`, `ouro.py`, `persimmon.py`,
+  `plamo2.py`, `fuyu.py` were deleted upstream between 2026-07-09 and 2026-07-25,
+  and `_unify_hybrid_kv_cache_specs` lost its leading underscore before that pin
+  too); one more is a SECOND `gritlm.py::GritLM` site on the `MODEL-EMBED` row,
+  which `scripts/check-symbol-anchors.py` reports only once because its `seen`
+  set is keyed on `(path, symbol)`.
+  **#2819's own third characterisation is also wrong.** It says the anchor
+  checker "cannot see" the OLMo divergence because "our row cites `olmo2.py`,
+  which still exists". `olmo2.py` exists at NEITHER pin — vLLM `b83be00cdd`
+  (vllm#48100) deleted it on 2026-07-09 — and the checker reports the row at both
+  pins. It was absent from the delta only because it was stale before the advance,
+  not because the instrument is blind to it.
+  **Still owed, and NOT discharged here:** item 1's behaviour question (what
+  `Olmo3ForCausalLM` routing to `TransformersForCausalLM` means for our
+  Olmo2-alias implementation, and what moved with `KimiLinearForCausalLM` into
+  `vllm/models/kimi_k3/`) needs its own row; item 4's registry-coverage
+  re-derivation at `e126687a9a` needs its own wave, and until it runs this
+  matrix's header still names `5559679229` as the pinned oracle source and its
+  355-row at-the-pin claim is unre-derived.
+- [#2971](https://github.com/mudler/vllm.cpp/issues/2971) —
+  `scripts/check-symbol-anchors.py` keys its report on `(path, symbol)`, so a
+  citation repeated at N sites is reported once and its summary count reads as a
+  site count when it is not. This masked a second stale `gritlm.py::GritLM` site
+  in the matrix and two more in `.agents/sync/2026-09-03-e126687-advance.md`,
+  which appeared only once the spec-side copies were repaired — a repair that
+  RAISES the count. Found by wave MATRIX while repairing #2819, not fixed there
+  because it changes a checker's reporting contract. Owned by no row yet.
