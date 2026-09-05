@@ -245,7 +245,36 @@ per-leg summaries, and `results.txt`. Per-request records stay on the share.
 
 ## Now
 
-`ACTIVE`. The spec is committed. The harness and the run follow it.
+`ACTIVE`. The spec, the harness, its controls and the method page are committed.
+The results page carries the percentile method applied to the predecessor's own
+records, which reverses that page's mean time-to-first-token conclusion above
+p90. The sweep itself is queued.
+
+**The queued job, and how to finish the page from it.** `rc` job
+`7b5084ab-f214-4d8d-b1fe-1eca86efb1e8` on `dgx:gpu0`, submitted with
+`--max-runtime 6h` and `RUNGS="1 4 8" ROUNDS=2 NPROMPTS=128 OUTLEN=192
+CORPUS_COUNT=144`, running `/workspace/exl3-variadic/harness/job.sh`. It is
+resumable: resubmit the same command after a crash and it skips what is already
+recorded.
+
+When it finishes:
+
+1. `rc logs 7b5084ab-f214-4d8d-b1fe-1eca86efb1e8` — read `results.txt` for
+   `G-BYTES`, the resolved server configuration, the paged-route decision, and
+   each leg's return code.
+2. The report is at `/mnt/nas_share/rc/exl3-variadic/out/report.md`, and
+   `benchmarks/variadic/report.py --dir <that out/> --glob '*-r*-c*.json'`
+   regenerates it from the per-request records at any time, with no GPU.
+3. Copy `results.txt`, `report.md`, the `*.clientlog` files and
+   `corpus-manifest.json` into
+   `docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/`, fill the results
+   page's empty sections from the report, and move its index row from `Partial`
+   to `Measured`.
+4. Check `G-RESOLVED` in `results.txt` before publishing any `c = 8` number: a
+   leg whose server resolved `max_num_seqs` below its rung measured a different
+   configuration than it claims.
+5. Check the round-to-round spread table before quoting any cell as a value.
+   Above 10%, quote the spread.
 
 ## Owed
 
