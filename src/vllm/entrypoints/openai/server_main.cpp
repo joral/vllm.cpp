@@ -308,6 +308,9 @@ struct Args {
   // --disable-jump-forward forces off (the env var still overrides). The
   // token-unique forced-run subset only; see .agents/specs/sglang-enablement.md.
   std::optional<bool> enable_jump_forward = std::nullopt;
+  // C-ABI vllm_model_params.disable_sliding_window (ABI v26). Unset (default) =>
+  // the sliding window is ENABLED, which is upstream's own `= False`.
+  std::optional<bool> disable_sliding_window = std::nullopt;
   // Tool-call / reasoning dialect selection (mirrors vLLM's --tool-call-parser
   // and --reasoning-parser). THE DEFAULTS ARE TODAY'S HARDCODED BEHAVIOUR:
   // "hermes" is exactly what OpenAIServingChat was constructed with before this
@@ -644,6 +647,21 @@ Args ParseArgs(int argc, char** argv) {
         Usage(argv[0], 2);
       }
       a.enable_jump_forward = flag == "--enable-jump-forward";
+    } else if (flag == "--disable-sliding-window" ||
+               flag == "--enable-sliding-window") {
+      // ENG-ATTENTION-WINDOW W3 (#2388): vLLM spells this
+      // `--disable-sliding-window` (`ModelConfig.disable_sliding_window`,
+      // config/model.py:248), so this carries the upstream name. The `--enable-`
+      // spelling is the explicit opposite, matching the jump-forward pair above;
+      // upstream has no such flag because its field defaults to False, and
+      // neither does anything different from omitting both.
+      if (a.disable_sliding_window.has_value()) {
+        std::cerr << "server: sliding-window flag "
+                     "(--[enable|disable]-sliding-window) specified more than "
+                     "once\n";
+        Usage(argv[0], 2);
+      }
+      a.disable_sliding_window = flag == "--disable-sliding-window";
     } else if (flag == "--generation-config") {
       a.generation_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--tool-call-parser") {
@@ -1292,6 +1310,7 @@ int VllmServerMain(int argc, char** argv) {
     // (env-resolved, OFF); --[enable|disable]-jump-forward forces it, and
     // VT_ENABLE_JUMP_FORWARD still overrides at resolution time.
     engine_params.enable_jump_forward = args.enable_jump_forward;
+    engine_params.disable_sliding_window = args.disable_sliding_window;
     // --kv-transfer-config: the external KV connector, mirroring vLLM's own
     // flag and JSON shape. Absent (default) leaves the optional unset, which is
     // the inert no-connector path the server has always run. A malformed
