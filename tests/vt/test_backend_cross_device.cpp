@@ -3398,7 +3398,7 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
 // oracle, running on the host against device memory the backend reports
 // host-addressable. So assertion (1) alone is GREEN on a backend with no kernel
 // at all. Assertion (2) is `vt::OpRegistered`, a NATIVE-ONLY probe by design
-// (src/vt/op_provider.cpp:799-823), and it is the only one of the three that can
+// (src/vt/op_provider.cpp:801-825), and it is the only one of the three that can
 // tell a native kernel from the tier. Assertion (3) catches the same thing from
 // the other side, by counting.
 //

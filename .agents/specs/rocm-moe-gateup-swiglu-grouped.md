@@ -61,7 +61,7 @@ is smaller than the missing set.
 | Role | Path |
 |---|---|
 | Numerics donor (the golden) | `src/vt/cpu/cpu_quant_gemm.cpp:282-299`, `MoeGateUpSwiGLUGroupedKernel` |
-| Seam contract | `src/vt/ops.cpp:256-285` (`vt::MoeGateUpSwiGLUGrouped`), `include/vt/ops.h:2192-2194` (`MoeGateUpSwiGLUGroupedFn`) |
+| Seam contract | `src/vt/ops.cpp:256-285` (`vt::MoeGateUpSwiGLUGrouped`), `include/vt/ops.h:2197-2199` (`MoeGateUpSwiGLUGroupedFn`) |
 | Epilogue definition | `src/vt/cuda/cuda_quant_dot.cu:1090-1142`, `QuantDotGemmGroupedFusedSwiGLUKernel` — read for the epilogue formula only |
 | Reused ROCm GEMM | `src/vt/rocm/rocm_grouped_gemm.hip:896`, `MatmulBTQuantGroupedKernelRocm` |
 | HIP idiom, TU shape | `src/vt/rocm/rocm_moe_chain.hip` |
@@ -151,7 +151,7 @@ The file's own header note at `:3845-3858` says why:
 
 1. the device result matches the CPU oracle at `Nmse <= kNmseTol`;
 2. `vt::OpRegistered(op, DeviceType::kROCM)` is true — the native-only probe
-   (`src/vt/op_provider.cpp:799-823`), the **only** one of the three that can
+   (`src/vt/op_provider.cpp:801-825`), the **only** one of the three that can
    tell a native kernel from the reference tier, because the tier computes the
    same answer and an oracle-equality assertion is green with no kernel at all;
 3. `vt::GetReferenceTierHits()` does not increase across the call.
@@ -196,6 +196,19 @@ the brief names.
   wave, not a prerequisite. Tracked by #2942.
 - **The device gate.** A `gfx1151` run of the new case, proving all three
   assertions with a non-zero assertion count. Tracked by #2942.
+- **The KERNEL BODY is unreached on any default configuration.** The
+  `RegisterOp` line IS reached by default — `glm5_next_forward.cpp:307-310`
+  probes it on every non-CPU queue before any environment variable is read, so
+  the refusal at `:315-327` stops firing on ROCm the moment this lands. The
+  kernel itself is another matter: both production call sites are behind an
+  opt-in that defaults OFF.
+  `glm5_next_forward.cpp:331` needs `VT_GLM5_NEXT_DEVICE_EXPERTS=1` (#2464), and
+  Laguna's fused gate/up arm (`laguna.cpp:1032`, reached from `:1247`) needs
+  `VT_LAGUNA_FUSED_GATEUP=1` (`:1052-1058`). `vt::MergedGemm`
+  (`merged_gemm.cpp:38-40`) refuses a non-CPU device without this op and has no
+  caller under `src/vllm/` today. So on a default ROCm run nothing executes
+  `MoeGateUpSwiGLUEpilogueK`. Tracked by #2942, and by #2464 for the GLM-5.3
+  half, which owns the SIGSEGV that made its gate default off.
 - **`kKdaGatedDeltaRule` on ROCm.** Not reached today
   (`glm5_next_kda.cpp:322`); it becomes reachable the day the KDA arm takes a
   device queue. Tracked by #2942.
