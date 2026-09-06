@@ -3594,6 +3594,24 @@ void GPUModelRunner::propose_after_verify(int num_reqs) {
   propose_drafts(num_sampled, num_rejected);
 }
 
+// SPEC-MTP I5d: propose drafts after a plain (no-draft, e.g. FIRST) decode step
+// so the next step verifies them. Each generating row sampled exactly one token
+// (num_sampled=1, num_rejected=0); discarded prefill-chunk rows are skipped
+// inside propose_drafts.
+//
+// SPEC-DFLASH2 A2-4 (#2920) lifted this out of `sample_tokens` so
+// `sample_tokens_async`'s decode arm calls the SAME derivation rather than
+// writing a second copy of it — the shape A2-2 already established for
+// `propose_after_verify` above. Upstream needs neither, because its single
+// `if self.speculator is not None:` tail (gpu/model_runner.py:1524-1547 @ pin
+// 5559679229) runs after BOTH of `sample()`'s routes.
+void GPUModelRunner::propose_after_decode(int num_reqs) {
+  if (!spec_on()) return;
+  std::vector<int32_t> num_sampled(static_cast<size_t>(num_reqs), 1);
+  std::vector<int32_t> num_rejected(static_cast<size_t>(num_reqs), 0);
+  propose_drafts(num_sampled, num_rejected);
+}
+
 // ARCH-ONE-SURFACE ROW 6: the pooling counterpart of sample_tokens. Mirror of
 // gpu/model_runner.py:1586-1607 (pool instead of sample) over the landed
 // PoolingRunner (pool/pooling_runner.py:29-42). The stashed forward result of
@@ -3953,15 +3971,12 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     stage_upload(*dinp, dinp->last_sampled,
                  input_batch_.last_sampled_tokens.data(), num_reqs);
   }
-  // SPEC-MTP I5d: propose drafts after a plain (no-draft, e.g. first) decode step
-  // so the next step verifies them. Each generating row sampled exactly one token
-  // (num_sampled=1, num_rejected=0); discarded prefill-chunk rows are skipped
-  // inside propose_drafts. No-op unless a speculator is configured.
-  if (spec_on()) {
-    std::vector<int32_t> num_sampled(static_cast<size_t>(num_reqs), 1);
-    std::vector<int32_t> num_rejected(static_cast<size_t>(num_reqs), 0);
-    propose_drafts(num_sampled, num_rejected);
-  }
+  // SPEC-MTP I5d: propose drafts after a plain (no-draft, e.g. first) decode
+  // step so the next step verifies them. SPEC-DFLASH2 A2-4 (#2920) named the
+  // derivation `propose_after_decode` so `sample_tokens_async`'s decode arm
+  // applies it instead of writing it out a second time. No-op unless a
+  // speculator is configured.
+  propose_after_decode(num_reqs);
   return out;
 }
 
@@ -5362,6 +5377,21 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   // scheduler's update_from_output when get_output() materializes).
   //
   skeleton.req_ids.reserve(static_cast<size_t>(num_reqs));
+
+  // SPEC-DFLASH2 A2-4 (#2920): WHERE THIS STEP'S COMMITTED IDS ENDED UP.
+  //
+  // The three write-back branches below differ in exactly one way that the
+  // propose tail cares about: whether the ids this step committed are readable
+  // ON THE HOST when the tail runs. The host branch Synchronizes and writes
+  // `input_batch_.last_sampled_tokens` itself, so they are. Both CUDA branches
+  // scatter them with a kernel queued on the main queue and nothing waits it —
+  // the mirror branch deliberately leaves the host array's VALUES stale, and the
+  // UMA branch writes the host array from a kernel that has not run yet. Every
+  // propose arm reads host state (the block drafters take their anchor from
+  // `last_sampled_tokens`; the n-gram matcher reads the token row), so the tail
+  // must know which branch ran rather than assume the host one did. Set by the
+  // branch, read once, and never re-derived from the platform predicates above.
+  bool committed_ids_on_host = false;
 #ifdef VLLM_CPP_CUDA
   // W4 device-resident scatter. Preferred whenever the mirror is engaged
   // (async_device_mirror(): CUDA + VT_ASYNC_DEVICE_MIRROR, INTEGRATED OR DISCRETE):
@@ -5442,6 +5472,65 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
           static_cast<int32_t>(ids[i]);
       input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
     }
+    // This branch waited the queue and wrote the host array from the ids it read.
+    committed_ids_on_host = true;
+  }
+
+  // ─── SPEC-DFLASH2 A2-4 (#2920): PROPOSE AFTER A PLAIN DECODE STEP ──────────
+  //
+  // A2-2 gave this function a verify arm and put `propose_after_verify` inside
+  // it, so a step that DRAFTS proposed correctly and a step that did not
+  // proposed nothing at all. A speculative engine's FIRST step carries no
+  // drafts — there is no previous step to have proposed — so with the veto
+  // lifted that engine would sample, propose nothing, and every step after it
+  // would find nothing to verify: `pending_drafts_` stays empty, the async
+  // scheduler's `-1` placeholders have nothing to fill, and `FillDraftsForStep`
+  // refuses by name.
+  //
+  // Upstream cannot have this gap because it has ONE propose tail for both
+  // routes: `sample()` picks the sampler on `input_batch.num_draft_tokens == 0`
+  // (gpu/model_runner.py:1129 @ pin 5559679229) and the single
+  // `if self.speculator is not None:` at :1524-1547 proposes from whichever
+  // sampler ran. `propose_after_decode` is that tail's decode half, named once
+  // and applied here and in `sample_tokens`, so the two entry points cannot
+  // derive `num_sampled` / `num_rejected` differently. The ROUTE stays the one
+  // expression too: this is simply the fall-through of the
+  // `StepRoutesToVerify(...)` branch above, not a second reading of it.
+  if (spec_on()) {
+    VT_CHECK(committed_ids_on_host,
+             "sample_tokens_async: the speculative propose reads this step's "
+             "committed ids from the host (the block drafters' anchor is "
+             "last_sampled_tokens, the n-gram matcher reads the token row), and "
+             "this step's device-resident write-back left them unread — the "
+             "device-resident propose is owed by row SPEC-DFLASH2 (#2920) and "
+             "removes this refusal");
+    // RESTORE THE ONE PIECE OF HOST BOOKKEEPING THE PROPOSE ARMS READ. The
+    // async arm deletes `sample_tokens`'s token-VALUE append on purpose (the
+    // scheduler's update_from_output feeds detok and penalties when
+    // `get_output()` materializes), but `propose_drafts_ngram` matches over
+    // `token_ids_cpu[:num_tokens_no_spec]` and the counter above was just
+    // advanced past a column nobody wrote. Left out, the n-gram matcher reads a
+    // zero where this step's token belongs and drafts off it — which, verify
+    // being lossless, costs acceptance and raises nothing. Written for the
+    // committed rows only, at the column the counter just moved past, from the
+    // same `last_sampled_tokens` the branch above wrote, and only under
+    // `spec_on()` so the production async path stays byte-identical.
+    for (int i = 0; i < num_reqs; ++i) {
+      if (i < static_cast<int>(exec_state_.discard.size()) &&
+          exec_state_.discard[static_cast<size_t>(i)]) {
+        continue;
+      }
+      const int n = input_batch_.num_tokens_no_spec[static_cast<size_t>(i)];
+      if (n <= 0) continue;
+      const size_t idx = static_cast<size_t>(i) *
+                             static_cast<size_t>(input_batch_.max_model_len) +
+                         static_cast<size_t>(n - 1);
+      if (idx < input_batch_.token_ids_cpu.size()) {
+        input_batch_.token_ids_cpu[idx] =
+            input_batch_.last_sampled_tokens[static_cast<size_t>(i)];
+      }
+    }
+    propose_after_decode(num_reqs);
   }
 
   // discard_request_mask (gpu_model_runner.py:3625-3628 -> outputs.py:303): the
