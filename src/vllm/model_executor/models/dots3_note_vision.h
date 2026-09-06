@@ -85,7 +85,10 @@
 //       both outside the cell and both are this row's own e2e hosts.
 //       `VisionMoeFfn`'s `Dots3NoteVisionFp8UnrunnableHere` guard is where this
 //       is decided and said; the spec's `## Owed` carries the unblocking
-//       condition, which is #1189 milestone M5 reaching those arches.
+//       condition, which is a block-scaled FP8 GEMM registered for those
+//       arches. W9d cited #1189 milestone M5 as its owner; that issue is
+//       DELETED and 404s, so the condition is stated with no number and #3007
+//       owns re-establishing the live one.
 //   (b) A blockwise-QUANTIZED CHECKPOINT, the `-fp8` sibling that ships
 //       `weight_scale_inv` on disk instead of the bf16 experts this cast
 //       converts at load. `Dots3NoteVisionRefusal` still names W9 for it, it is
@@ -324,7 +327,12 @@ struct Dots3NoteVisionParams {
 // from the PADDED `w13` and is 128-aligned by construction. The second
 // quantization (`:119-123`) therefore cannot fail once the first one passed.
 struct Dots3NoteVisionMoeArm {
-  // `MoESwiGLUFFNFP8` was selected AND can execute here.
+  // `MoESwiGLUFFNFP8` is the class this CONFIG selects, and this GEOMETRY can
+  // express it. That is the ONLY question this field answers:
+  // `ResolveDots3NoteVisionMoeArm` takes no device, so `true` does not say the
+  // arm executes here. `Dots3NoteVisionFp8UnrunnableHere` below answers the
+  // DEVICE question, and it refuses a `true` read on `thor:gpu0` (sm_110) and
+  // `orin:gpu0` (sm_87).
   bool fp8 = false;
   // Non-empty exactly when `enable_fp8_moe` selected the FP8 class and this
   // tower runs the bf16 one anyway. Names the width, the assertion and the

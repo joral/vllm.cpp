@@ -9616,16 +9616,23 @@ Carried openly under option B (§6.4), not waived:
   Triton kernel that compiles for whatever arch it is given. The refusal is the
   deliberate choice over a silent bf16 fallback and it is not what is owed; what
   is owed is the kernel. **Unblocking condition: a block-scaled FP8 GEMM
-  registered for those arches** — [#1189](https://github.com/mudler/vllm.cpp/issues/1189)
-  milestone M5 widening `VT_CUTLASS_FP8_ARCHS` past `12.0a,12.1a`, or an
-  equivalent arm — after which `BlockFp8Runnable` answers true there and this
-  entry closes with no change to this row's code. **The practical bound today is
-  small and is not inflated here:** no host this project owns holds the released
-  576.89 GB checkpoint (§6.2), so what this actually reaches is a smaller
-  dots3-note-shaped checkpoint with a 128-aligned `embed_dim` and the default
-  `enable_fp8_moe`, plus this row's own future e2e on Thor or Orin, which is the
-  case that will meet it first. **No gate in this tree can measure it**: every
-  test runs on a CPU queue and CPU registers both ops, so
+  registered for those arches** — widening `VT_CUTLASS_FP8_ARCHS` past
+  `12.0a,12.1a`, or an equivalent arm — after which `BlockFp8Runnable` answers
+  true there and this entry closes with no change to this row's code. The
+  condition is stated with no issue number on purpose. W9d first cited it as
+  `#1189` milestone M5, and `#1189` is a DELETED issue: it returns 404 to an
+  authenticated caller and to an anonymous one alike, so the citation named an
+  owner no reader could reach.
+  [#3007](https://github.com/mudler/vllm.cpp/issues/3007) owns re-establishing
+  that owner tree-wide, including the refusal string `fp8_block_quant.cpp`'s
+  `kIssue` hands to operators; when it lands, this entry takes the live number
+  from it. **The practical bound today is small and is not inflated here:** no
+  host this project owns holds the released 576.89 GB checkpoint (§6.2), so what
+  this actually reaches is a smaller dots3-note-shaped checkpoint with a
+  128-aligned `embed_dim` and the default `enable_fp8_moe`, plus this row's own
+  future e2e on Thor or Orin, which is the case that will meet it first. **No
+  gate in this tree can measure it**: every test runs on a CPU queue and CPU
+  registers both ops, so
   `test_dots3_note_vision`'s G5 asserts the predicate and the message and cannot
   execute the throw from a served request. Owner: this row, W9d. Issue
   [#2881](https://github.com/mudler/vllm.cpp/issues/2881).
