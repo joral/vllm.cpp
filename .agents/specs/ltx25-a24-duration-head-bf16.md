@@ -413,6 +413,18 @@ finding applied at the outset.
   out of a bf16 store, taken AFTER each store point: 0 on the bf16 arm with
   `values > 0` as the control, and non-zero on the f32 arm over the identical
   fixture and tensor set in the same test.
+* **WHAT THE ARITHMETIC COUNTER CANNOT SEE, named because two headers said
+  otherwise.** Counting after the store makes it zero by idempotence on the bf16
+  arm whether the store point is present or not, so it detects a store point told
+  the WRONG ARM and not one that is MISSING. Fresh review proved both halves:
+  deleting the R3 store outright left the two production cases green with
+  `not_bf16` still 0, while handing that same store `kF32` made it non-zero and
+  red both. The instrument is not dead — it is narrower than its prose was, and
+  the missing-store half is carried by the bit-exact goldens and by
+  `CHECK(seconds == BF16(seconds))`. `ltx2_duration_head.h` called it "how many
+  of the values the head PRODUCED could not have come out of a bf16 store" and
+  `ltx2_video.h` called it "the only instrument on this path that can see a dtype
+  that is too wide"; both now say what it measures.
 
 ### O4. The rules, and the blast radius each mutation produced
 
@@ -533,6 +545,31 @@ shift, and the derived and recorded lists match.
 * **The f64 accumulation stays.** Bit-equal to torch's bf16 `Linear` in 0 of 4096
   at the widest shipped shape, because at a bf16 store the f32-vs-f64 reduction
   difference sits far below one ulp.
+* **`exp` keeps its f64 argument, and this is the THIRD f64 site, not the
+  second.** `ltx2_duration_head.cpp:429` computes
+  `std::exp(static_cast<double>(log_duration[b]))` where upstream's
+  `log_duration.exp()` (`duration_head.py:117-118`) is f32 opmath. The two
+  bullets above enumerated the accumulator and `GeluTanh` and omitted it, and
+  fresh review found the omission. It is pre-existing from the wiring row
+  ([#2900](https://github.com/mudler/vllm.cpp/issues/2900)) and bit-exact against
+  upstream on all nine emitted fixtures, so no value is wrong — but it is the
+  same TOO WIDE polarity as the other two, which is why an enumeration of them
+  has to be complete rather than nearly so. It is not narrowed for the same
+  reason `GeluTanh` is not: R4 stores the result at bf16 one line later, so the
+  narrowing is absorbed, while changing the expression would move the f32 arm's
+  goldens for a difference no fixture separates. The debt stays visible here.
+* **The pooler's entry contract is DOCUMENTED, not guarded.** Removing the entry
+  narrowing was the M5 repair, and it leaves `Ltx2DurationAttentionPool` — a
+  public entry point — requiring by contract that a bf16-arm caller hands it
+  already-stored activations. No `Require` enforces that, for two reasons.
+  Checking it walks the whole token buffer on every render-path call to re-derive
+  what `Ltx2DurationPredict`, the only production caller, establishes by
+  construction. And it would refuse the use the entry point exists for: the bf16
+  pooler case feeds un-narrowed `DurBf16Token` values deliberately, because
+  narrowing them would make its central assertion unfalsifiable — every returned
+  value would sit on the bf16 grid even with the pooler's own store point
+  deleted, which is the one thing that case can see. The contract governs
+  COMPOSITION, not safety. Both the declaration and the case now say so.
 
 ---
 

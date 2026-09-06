@@ -132,6 +132,16 @@ std::vector<Ltx2DurationHeadTensorSpec> EnumerateLtx2DurationHeadTensors(
 // reports, and AGENTS.md names this exact blind spot: a token gate cannot detect
 // a dtype that is too wide. The INPUT tokens are deliberately not counted; they
 // are the caller's data, not the head's product.
+//
+// WHAT IT MEASURES IS NARROWER THAN "THE HEAD'S WIDTH", and the difference
+// matters to whoever reads the number next. Each count is taken at its store
+// point AFTER that store has run, so on the bf16 arm it is zero by idempotence
+// whether the store point is there or not. It therefore detects a store point
+// handed the WRONG ARM — an f32 head, or one site reverted while the others
+// stay — and NOT a store point that is missing altogether: deleting one outright
+// leaves this counter at zero. That half is covered by the bit-exact goldens and
+// by the assertion that the returned seconds survive a bf16 round trip, both of
+// which a deleted store does move.
 struct Ltx2DurationWidthCounts {
   int64_t not_bf16 = 0;
   int64_t values = 0;
@@ -141,6 +151,25 @@ struct Ltx2DurationWidthCounts {
 // localizes instead of arriving as one wrong scalar. `tokens` is
 // [batch, token_count, pooler_hidden_dim]; the result is
 // [batch, num_queries, pooler_hidden_dim].
+//
+// THE ENTRY CONTRACT ON THE BF16 ARM, WHICH IS A CONTRACT AND NOT A GUARD.
+// `tokens` are the CALLER'S already-stored activations, and this function does
+// not narrow them. Upstream's pooler is a submodule and narrows nothing either:
+// it receives whatever the enclosing forward stored, which is why an entry
+// narrowing here MASKED a real store-point defect for a whole review round
+// (see the note at the head of the definition). `Ltx2DurationPredict`, the only
+// caller in this tree, satisfies the contract by storing at the projection and
+// again after the modality-embedding add.
+//
+// No `Require` enforces it, deliberately. Checking it means walking the whole
+// token buffer on every render-path call to re-derive something the one
+// production caller establishes by construction, and it would refuse the use
+// this entry point EXISTS for: a pooler case localizes a defect by choosing its
+// own input, and the bf16 pooler case does exactly that. Handing it f32 tokens
+// is well defined and is the sharper gate, because a pooler whose own store
+// point was deleted then returns values that are visibly not on the bf16 grid.
+// What the contract governs is COMPOSITION, not safety: tokens off the grid are
+// simply not the chain upstream builds.
 std::vector<float> Ltx2DurationAttentionPool(const Ltx2DurationHeadConfig& config,
                                              const Ltx2VaeWeights& weights, const float* tokens,
                                              int64_t batch, int64_t token_count,

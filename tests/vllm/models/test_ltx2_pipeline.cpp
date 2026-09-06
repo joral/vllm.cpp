@@ -5904,6 +5904,14 @@ TEST_CASE("ltx2 duration head bf16: the pooler reads the bf16 arm and rounds its
   const vllm::Ltx2DurationHeadConfig config = DurBf16Config(k);
   const DurBf16Bags bags = BuildDurBf16Bags(config, k.amplitude);
 
+  // THE TOKENS ARE FED UN-NARROWED ON PURPOSE, and that is the pooler's entry
+  // contract being exercised rather than broken. The contract says a bf16-arm
+  // caller hands it values it already stored; `Ltx2DurationPredict` is the only
+  // caller that does. Handing this case narrowed tokens would make its central
+  // assertion unfalsifiable — every returned value would sit on the bf16 grid
+  // even with the pooler's OWN store point deleted, which is the one thing this
+  // case exists to see. Off-grid input is well defined here; it is simply not
+  // the composition upstream builds.
   const int64_t tokens = k.video_tokens + k.audio_tokens;
   std::vector<float> stream(static_cast<size_t>(tokens * k.hidden));
   for (size_t i = 0; i < stream.size(); ++i) {

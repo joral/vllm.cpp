@@ -646,11 +646,18 @@ struct Ltx2ConditioningTrace {
   int64_t duration_head_weight_bytes = 0, duration_head_weight_elems = 0;
   // ARITHMETIC — how many values the head PRODUCED that could not have come out
   // of a bf16 store, out of how many it produced. Zero on this arm because every
-  // store point rounds; essentially the whole population on the f32 one. This is
-  // the only instrument on this path that can see a dtype that is too wide, and
-  // `duration_head_values` is the control that says it looked at anything: a
-  // counter that ran over nothing also reports zero. Both are 0 when no auto
-  // duration was resolved, which is every request that named its own count.
+  // store point rounds; essentially the whole population on the f32 one. It is
+  // the instrument on THIS path, which has no other way to see a dtype that is
+  // too wide, and `duration_head_values` is the control that says it looked at
+  // anything: a counter that ran over nothing also reports zero. Both are 0 when
+  // no auto duration was resolved, which is every request that named its own
+  // count.
+  //
+  // It is NOT the only instrument on the claim, and reading it as one overstates
+  // it. Each count is taken after its own store has run, so it sees a store
+  // point told the wrong arm and not a store point that is missing — deleting
+  // one leaves this at zero. The head's bit-exact goldens and the assertion that
+  // the returned seconds survive a bf16 round trip cover that half.
   int64_t duration_head_not_bf16 = 0, duration_head_values = 0;
   // True when the text tower encoded the request's own prompt; false when the
   // conditioning came from `prompt_embeds_path`.
