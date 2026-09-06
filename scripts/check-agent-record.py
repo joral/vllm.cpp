@@ -406,7 +406,17 @@ MATRICES = {
     # `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
     # anywhere in this project's reach (spec `## Owed`, inheriting #1452) and
     # because `AttnBlock3d` remains the declared staged remainder.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 58),
+    # 59 since 2026-09-05: +`KERNEL-QUANT-CIQ-GEMM-ROCM`, the RDNA4 rocWMMA
+    # int8 tile arm of the ROCm keep-quant GEMM prefill path (issue #2109). A
+    # separate row from `KERNEL-QUANT-CIQ-GEMM-CUDA` above rather than a
+    # column on it: the two share a name pattern and a Q8_K-family activation
+    # format, but serve different providers (`kROCM` vs `kCUDA`), gate against
+    # different oracles (this row's own real-model `rocprofv3` trace on the
+    # actual RX 9060 XT hardware vs the CUDA row's DGX GB10 run), and the CUDA
+    # row's spec (`cuda-keepquant-gemm.md`) makes no claim about this row's
+    # architecture-gated WMMA tile mechanism, which does not exist on CUDA.
+    # Bumped because the row EXISTS, never to make a state transition pass.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 59),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
