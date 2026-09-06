@@ -1,36 +1,51 @@
-=== MUTATION: percentile -> nearest rank ===
-FAIL: test_a_nearest_rank_implementation_would_fail_this (__main__.PercentileContract.test_a_nearest_rank_implementation_would_fail_this)
-FAIL: test_matches_hand_computed_linear_interpolation (__main__.PercentileContract.test_matches_hand_computed_linear_interpolation)
-Ran 19 tests in 22.471s
-FAILED (failures=2)
-=== MUTATION: warmup phase merged into the measured window ===
-FAIL: test_an_engine_without_metrics_falls_back_to_usage (__main__.AcceptanceFromMetrics.test_an_engine_without_metrics_falls_back_to_usage)
-FAIL: test_the_metrics_delta_becomes_a_rate (__main__.AcceptanceFromMetrics.test_the_metrics_delta_becomes_a_rate)
-FAIL: test_concurrency_four_really_overlaps (__main__.ClosedLoopConcurrency.test_concurrency_four_really_overlaps)
-FAIL: test_concurrency_one_never_overlaps (__main__.ClosedLoopConcurrency.test_concurrency_one_never_overlaps)
-FAIL: test_measured_wall_clock_excludes_the_warmup_phase (__main__.WarmupIsExcluded.test_measured_wall_clock_excludes_the_warmup_phase)
-FAIL: test_measured_window_holds_no_warmup_request (__main__.WarmupIsExcluded.test_measured_window_holds_no_warmup_request)
-Ran 19 tests in 23.500s
-FAILED (failures=6)
-=== MUTATION: concurrency ignored: always one worker ===
-=== MUTATION: token count taken from the chunk count ===
-FAIL: test_first_chunk_tokens_tracks_the_servers_granularity (__main__.ChunkingIsRecovered.test_first_chunk_tokens_tracks_the_servers_granularity)
-FAIL: test_the_coarse_engine_pays_for_its_chunking_in_raw_ttft (__main__.ChunkingIsRecovered.test_the_coarse_engine_pays_for_its_chunking_in_raw_ttft)
-FAIL: test_tokens_per_chunk_comes_from_usage_not_from_the_chunk_count (__main__.ChunkingIsRecovered.test_tokens_per_chunk_comes_from_usage_not_from_the_chunk_count)
-FAIL: test_a_server_without_usage_is_marked_chunks_not_counted_silently (__main__.UsageIsMandatory.test_a_server_without_usage_is_marked_chunks_not_counted_silently)
-Ran 19 tests in 22.407s
-FAILED (failures=4)
-=== MUTATION: absent acceptance reported as zero ===
-FAIL: test_an_engine_exposing_nothing_reports_absent_not_zero (__main__.AcceptanceFromMetrics.test_an_engine_exposing_nothing_reports_absent_not_zero)
-FAIL: test_concurrency_four_really_overlaps (__main__.ClosedLoopConcurrency.test_concurrency_four_really_overlaps)
-FAIL: test_concurrency_one_never_overlaps (__main__.ClosedLoopConcurrency.test_concurrency_one_never_overlaps)
-Ran 19 tests in 22.789s
-FAILED (failures=3)
-=== MUTATION: TTFT correction dropped ===
-FAIL: test_the_coarse_engine_pays_for_its_chunking_in_raw_ttft (__main__.ChunkingIsRecovered.test_the_coarse_engine_pays_for_its_chunking_in_raw_ttft)
-Ran 19 tests in 22.224s
-FAILED (failures=1)
-=== MUTATION: corpus seed ignored ===
-FAIL: test_same_seed_gives_the_same_bytes (__main__.CorpusIsDeterministic.test_same_seed_gives_the_same_bytes)
-Ran 19 tests in 22.106s
-FAILED (failures=1)
+MUTATION CONTROLS for benchmarks/variadic/, against tests/scripts/test_variadic_harness.py
+==========================================================================================
+
+THIS FILE IS A SUMMARY, NOT A CAPTURE. An earlier capture is deliberately not
+kept: it was taken at a head whose suite ran 19 tests (the suite now runs 28), it
+recorded no result at all for one of its seven mutations, and several of its
+listed failures were the flaky mock later fixed in `ef2c714cf` rather than the
+mutation under test. A stale capture that reads as evidence is worse than a
+summary that says what it is.
+
+ROUND 1, by the implementer, 7 mutations at `2ec2f216a`. Each reverted
+byte-for-byte and the tree verified clean afterwards.
+
+  percentile -> nearest rank                       RED, 2 cases
+  warmup phase merged into the measured window     RED, 6 cases
+  concurrency ignored: always one worker           DEADLOCK (see below)
+  token count taken from the chunk count           RED, 4 cases
+  absent acceptance reported as zero               RED, 3 cases
+  TTFT chunking correction dropped                 RED, 1 case
+  corpus seed ignored                              RED, 1 case
+
+The concurrency mutation does not fail an assertion: it deadlocks against the
+start barrier, which is sized from the REQUESTED concurrency, so a worker-count
+mismatch cannot run at all rather than running and reporting a wrong number.
+That is a stronger property than detection, and it is why the suite times out
+under that mutation instead of going red.
+
+ROUND 2, by a fresh reviewer at `ef2c714cf`, 13 mutations, full suite each time,
+tree restored and verified with `git status --porcelain` and `git diff` after
+every one. Ten went red. FOUR CAME BACK GREEN, and those four are the finding:
+
+  M4   measured_wall_s = warm + measured           GREEN -> repaired, see below
+  M11  tpot divided by n instead of n-1            GREEN -> repaired
+  M14  PCTS = (50,50,50,50)                        GREEN -> repaired
+  M15  cold-start min(ttft) -> max(ttft)           GREEN -> repaired
+
+Each of the four is now held by a control that goes red without it, added in
+`29bd08a6a`:
+
+  M4   ThroughputDenominatorExcludesWarmup   (warmup made 4x the measured phase)
+  M11  TpotMatchesUpstream                   (exact arithmetic against the mock)
+  M14  PercentileHeaderMatchesWhatIsComputed (header derived from PCTS)
+  M15  ColdStartNamesTheFirstRequest         (synthetic leg, first != cheapest)
+
+The reviewer also cross-checked `report.percentile` against `numpy.percentile`
+over n = 1..59 with 60 random draws each at eleven percentiles: maximum absolute
+difference 1.36e-12. An independent 27,000-pair cross-check by the implementer is
+in `numpy-percentile-crosscheck.txt`.
+
+The suite runs 28 tests at this head and is registered in
+`scripts/agent-preflight.sh` and `.github/workflows/ci.yml`.

@@ -12,14 +12,15 @@ Issue [#2970](https://github.com/mudler/vllm.cpp/issues/2970).
 
 | File | What it is |
 |---|---|
-| `job-as-run.sh` | the job exactly as submitted to `rc`, byte-identical to `benchmarks/variadic/job.sh` at the measured commit |
+| `job-as-run.sh` | the job as submitted to `rc`, byte-identical to `benchmarks/variadic/job.sh` at the measured commit |
+| `results.txt` | the job's own `RESULT` lines: device, boot id, lease, checkpoint sha256 values, `G-BYTES`, `G-RESOLVED`, the build recipe, the paged-route decision, and each leg's client return code |
+| `report.md` | the report as `benchmarks/variadic/report.py` printed it over the nine completed legs |
 | `corpus-manifest.json` | the prompt corpus: every source sha256, the seed, the band weights, the realised character lengths, and the corpus's own sha256 |
-| `results.txt` | the job's own `RESULT` lines: device, boot id, lease, checkpoint sha256 values, build recipe, resolved server configuration, and each leg's client return code |
-| `report.md` | the report as the job printed it, from `benchmarks/variadic/report.py` |
+| `corpus-token-histogram.md` | the corpus measured with the target checkpoint's own tokenizer, before the lease |
 | `*.clientlog` | one per leg, the client's own stdout including its `CLIENT_RESULT` line |
-| `mutation-controls.txt` | the seven mutations run against `tests/scripts/test_variadic_harness.py`, and what each one broke |
-| `numpy-percentile-crosscheck.txt` | 27,000 pairs of `report.percentile` against `numpy.percentile`, over random samples of 1 to 40 values at nine percentiles |
-| `headtohead-recomputed-report.md` | the report as printed over the PREDECESSOR's four legs, converted by `benchmarks/variadic/adapt_headtohead.py`. Its with-warmup mean time to first token reproduces that page's four published values exactly, which is what makes it a rereading of the same bytes rather than a new run |
+| `mutation-controls.txt` | both rounds of mutations run against `tests/scripts/test_variadic_harness.py`, and what each one broke |
+| `numpy-percentile-crosscheck.txt` | 27,000 pairs of `report.percentile` against `numpy.percentile` |
+| `headtohead-recomputed-report.md` | the report over the PREDECESSOR's four legs, via `benchmarks/variadic/adapt_headtohead.py` |
 
 The harness itself is committed at
 [`benchmarks/variadic/`](../../../benchmarks/variadic) and is not duplicated
