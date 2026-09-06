@@ -13866,3 +13866,104 @@ TEST_CASE("ltx2 video: auto_duration refuses MIN > MAX and refuses doubling an e
     }
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IC-LoRA REFERENCE VIDEO and its CONDITIONING ATTENTION MASK
+// Row LTX25-IC-LORA-REF-VIDEO, issue #3020,
+// spec .agents/specs/ltx25-ic-lora-ref-video.md (gaps A15 and A16).
+//
+// These are the REACHABILITY cases, and they are the only proof this row has.
+// They enter through `LoadVideoEngine` and `Generate` — where
+// `vllm_video_generate` arrives — and not through
+// `Ltx2AppendIcLoraReferenceConditionings`. The value-level cases for the ported
+// pieces live in `test_ltx2_iclora_reference` and per .agents/reachability.md
+// they localize a failure rather than prove one: they stay green when the
+// production call site is deleted.
+//
+// THE SEAM THIS ROW RETIRES. Before it, `Ltx2ModalityInput::attention_mask` and
+// its whole consumption chain — `Ltx2PrepareSelfAttentionMask`, `self_bias` on
+// host and device, `vt::AttentionCross`'s additive bias — were assigned at
+// exactly four sites, all of them inside a `BuildModalities` helper in
+// `test_ltx2.cpp` and `test_ltx2_device.cpp`. Nothing in `src/` wrote either
+// field. The mask case below is the production assignment.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// An `ic_lora` engine. The kind is a LOAD extra, because `ICLoraPipeline` is a
+// pipeline CLASS upstream (ic_lora.py:60) and not a per-request mode: stage 2
+// runs `loras=()` against stage 1's `loras=tuple(loras)` (`:108` against `:119`),
+// which is a property of how the weights are held.
+vllm::multimodal::VideoModelParams IcLoraParams(const ltx2_fixture::Paths& paths) {
+  vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "ic_lora";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("ic_lora");
+  return mp;
+}
+
+// 128x128 and NOT the 64x64 every other case uses, deliberately. The distilled
+// two-stage recipe runs stage 1 at half resolution, so the reference clip is
+// read at 64x64, and the fixture VAE's (8, 32, 32) factors then give a 2 x 2 x 2
+// reference latent — 8 tokens. At 64x64 the same arithmetic gives a 1 x 1
+// SPATIAL grid, where a row-major and a column-major patchify are identical and
+// a downscale factor of 2 collapses to the same single token as a factor of 1.
+// A reduced fixture that degenerates the axis it gates is this campaign's
+// recorded failure, so the geometry is chosen against it.
+vllm::multimodal::VideoGenParams IcLoraGen(const std::string& out_dir, const std::string& clip) {
+  vllm::multimodal::VideoGenParams gen;
+  gen.num_frames = 9;
+  gen.height = 128;
+  gen.width = 128;
+  gen.has_seed = true;
+  gen.seed = 7;
+  gen.output_dir = out_dir;
+  gen.ref_video_dir = clip;
+  return gen;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 ic-lora: a reference clip REACHES the render through the public ABI") {
+  // THE RED-FIRST CASE. Before this row `pipeline_kind=ic_lora` resolved to no
+  // recipe and `ref_video_dir` was refused outright on every kind but `retake`,
+  // so nothing here could reach the new code at all.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  // Stage 1 renders at 64x64 and the fixture's factors are (8, 32, 32), so the
+  // reference clip encodes to 2 x 2 x 2 = 8 tokens.
+  const std::string clip = WriteRetakeClip(ws.root + "/ic_clip", 9, 64, 64);
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(IcLoraGen(ws.root + "/ic_out", clip));
+
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.completed);
+  CHECK_MESSAGE(trace.ic_lora_reference_tokens == 8,
+                "the reference clip did not append one latent frame's worth of tokens per latent "
+                "frame; got " << trace.ic_lora_reference_tokens);
+  // The lower bound: a clip that encoded to zeros has the right shape, the right
+  // token count and renders.
+  CHECK(trace.ic_lora_reference_absmax > 0.0);
+  // The output geometry comes from the request, not from the reference.
+  CHECK(result.frame_count == 9);
+
+  // THE RENDER DEPENDS ON THE REFERENCE CLIP'S PIXELS. `ic_lora_reference_absmax`
+  // observes the ENCODE and says nothing about whether the encoded latent was
+  // ever handed to the phase. A build that read the clip, encoded it, recorded
+  // the trace and then appended zeros satisfies every check above and renders a
+  // clip of the right length. Two DIFFERENT references at the same seed must
+  // therefore produce different pixels.
+  const std::string other = WriteRetakeClip(ws.root + "/ic_clip_b", 9, 64, 64, /*seed_base=*/113);
+  REQUIRE(ReadAll(clip + "/frame_000000.ppm") != ReadAll(other + "/frame_000000.ppm"));
+  const vllm::multimodal::VideoResult from_other =
+      engine->Generate(IcLoraGen(ws.root + "/ic_out_b", other));
+  const std::string frame_a = ReadAll(std::string(result.frame_dir) + "/frame_000000.ppm");
+  const std::string frame_b = ReadAll(std::string(from_other.frame_dir) + "/frame_000000.ppm");
+  REQUIRE(frame_a.size() == frame_b.size());
+  CHECK_MESSAGE(frame_a != frame_b,
+                "two different reference clips rendered byte-identical frames at the same seed, "
+                "so the encoded reference latent never reached the phase");
+}

@@ -1072,6 +1072,37 @@ struct Ltx2ConditioningTrace {
   uint64_t retake_latent_digest = 0;
   double retake_latent_absmax = 0.0;
 
+  // ── IC-LoRA REFERENCE VIDEO and its ATTENTION MASK ────────────────────────
+  //    (row LTX25-IC-LORA-REF-VIDEO, #3020 — gaps A15 and A16)
+  //
+  // Observed for the reason the retake block above is: the whole mechanism is
+  // APPENDED TOKENS plus an attention BIAS, and neither is visible in a frame
+  // count, an output resolution or a finished clip. A build that read the
+  // reference clip, encoded it, and then appended nothing renders a video of
+  // exactly the right length with exactly the right soundtrack.
+  //
+  // `ic_lora_reference_tokens` is how many tokens the reference item appended,
+  // measured as the sequence GROWTH across the item rather than recomputed from
+  // the latent shape — a count derived from the shape would agree with itself on
+  // a build that computed the shape and appended nothing.
+  int64_t ic_lora_reference_tokens = 0;
+  // The encoded reference latent, before any denoising. The lower bound a token
+  // count cannot make: a zeroed latent has the right size and the right count.
+  uint64_t ic_lora_reference_digest = 0;
+  double ic_lora_reference_absmax = 0.0;
+  // The self-attention STRENGTH mask actually handed to the DiT, and NOT the one
+  // that was built. `rows` is `Ltx2ModalityInput::attention_mask_rows` at the
+  // forward — 0 when no mask was handed over — so a build that constructed the
+  // mask and then dropped the pointer is separated from one that passed it.
+  //
+  // `min` and `max` are both recorded because an ALL-ONES mask is the identity:
+  // it renders correctly, it has the right shape, and it is exactly what a
+  // downsample that lost its values produces. A mask whose min equals its max is
+  // not attenuating anything.
+  int64_t ic_lora_attention_mask_rows = 0;
+  double ic_lora_attention_mask_min = 0.0;
+  double ic_lora_attention_mask_max = 0.0;
+
   // ── THE SAMPLER (row LTX25-RES2S-LOOP, #921) ──────────────────────────────
   //
   // TWO COUNTERS, BECAUSE THERE ARE TWO QUESTIONS AND ONE NUMBER CANNOT ANSWER
