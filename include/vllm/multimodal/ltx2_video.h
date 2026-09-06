@@ -622,6 +622,43 @@ inline constexpr char kLtx2NegativeAudioPromptEmbedsExtra[] =
 // already gated. Until that lands, this trace is a change detector and the
 // composition's VALUES rest on the per-brick oracles either side of it.
 struct Ltx2ConditioningTrace {
+  // ── WHAT THE DURATION HEAD SAID (row LTX25-DURATION-HEAD-WIRE, #2900) ─────
+  //
+  // `duration_frames` is 0 when no auto duration was resolved, which is every
+  // request that named its own count and every engine loaded without a head.
+  // Both fields exist so a test can assert the count CAME FROM THE HEAD rather
+  // than inferring it from a frame count that a recipe could also have produced;
+  // upstream logs the same two numbers at blocks.py:881-888.
+  double duration_seconds = 0.0;
+  int64_t duration_frames = 0;
+  // ── AND THE HEAD'S TWO WIDTHS (A24 wave 6, row LTX25-A24-DURATION-HEAD-BF16,
+  //    issue #2955) ──────────────────────────────────────────────────────────
+  //
+  // STORAGE and ARITHMETIC are DIFFERENT CLAIMS and they get different fields,
+  // because wave 5 of this gap failed review for gating one while claiming the
+  // other. Neither is inferable from the two numbers above: a frame count is an
+  // integer either arm can produce, and `duration_seconds` is one scalar.
+  //
+  // STORAGE — `Ltx2VaeWeights::Bytes()` over the resident bag, beside how many
+  // parameters it holds. The RATIO is the claim (2 on this arm, 4 on the f32
+  // one), so no byte count is quoted anywhere. Recorded per render like the two
+  // upsampler bags above, and 0/0 when the engine loaded no head.
+  int64_t duration_head_weight_bytes = 0, duration_head_weight_elems = 0;
+  // ARITHMETIC — how many values the head PRODUCED that could not have come out
+  // of a bf16 store, out of how many it produced. Zero on this arm because every
+  // store point rounds; essentially the whole population on the f32 one. It is
+  // the instrument on THIS path, which has no other way to see a dtype that is
+  // too wide, and `duration_head_values` is the control that says it looked at
+  // anything: a counter that ran over nothing also reports zero. Both are 0 when
+  // no auto duration was resolved, which is every request that named its own
+  // count.
+  //
+  // It is NOT the only instrument on the claim, and reading it as one overstates
+  // it. Each count is taken after its own store has run, so it sees a store
+  // point told the wrong arm and not a store point that is missing — deleting
+  // one leaves this at zero. The head's bit-exact goldens and the assertion that
+  // the returned seconds survive a bf16 round trip cover that half.
+  int64_t duration_head_not_bf16 = 0, duration_head_values = 0;
   // True when the text tower encoded the request's own prompt; false when the
   // conditioning came from `prompt_embeds_path`.
   bool from_prompt = false;
@@ -1458,8 +1495,14 @@ class Ltx2VideoEngine : public VideoEngine {
   // half of the prompt encoding, after the connector. Passing it in rather than
   // re-encoding is what keeps the audio-only arm from owning a second copy of
   // the connector composition.
+  // `video_encoding` is deliberately absent, not forgotten: this mirrors
+  // `T2AOneStagePipeline`, whose duration call passes `video_encoding=None`
+  // (t2a_one_stage.py:103-107). `auto_min_seconds`/`auto_max_seconds` carry the
+  // AutoDuration window; `wants_auto` false means the caller gave a count.
   static VideoResult GenerateAudioOnly(Impl& im, const VideoGenParams& gen,
-                                       const float* audio_context, int64_t context_tokens);
+                                       const float* audio_context, int64_t context_tokens,
+                                       bool wants_auto_duration, double auto_min_seconds,
+                                       double auto_max_seconds);
 };
 
 // Does this checkpoint set hold an LTX-2.5 DiT? Exposed for the registry and for

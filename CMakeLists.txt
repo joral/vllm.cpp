@@ -1147,6 +1147,7 @@ add_library(vllm STATIC
   src/vllm/v1/sample/ops/bad_words.cpp
   src/vllm/v1/sample/logits_processor/builtin.cpp
   src/vllm/v1/sample/sampler.cpp
+  src/vllm/v1/spec_decode/metrics.cpp
   src/vllm/v1/spec_decode/rejection_sampler.cpp
   src/vllm/v1/spec_decode/ngram_proposer.cpp
   src/vllm/v1/spec_decode/draft_model_proposer.cpp
@@ -1725,6 +1726,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_moe_router.hip
     src/vt/rocm/rocm_moe_chain.hip
     src/vt/rocm/rocm_grouped_gemm.hip
+    src/vt/rocm/rocm_moe_gate_up_swiglu.hip
     src/vt/rocm/rocm_exl3.hip
     src/vt/rocm/rocm_sample.hip
     src/vt/rocm/rocm_gdn_state.hip
@@ -1734,6 +1736,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gdn_fused.hip
     src/vt/rocm/rocm_mla_fused_norm_rope.hip
     src/vt/rocm/rocm_mla_ops.hip
+    src/vt/rocm/rocm_mla_attn.hip
     src/vt/rocm/rocm_skinny_gemm.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
@@ -1751,6 +1754,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_moe_router.hip
       src/vt/rocm/rocm_moe_chain.hip
       src/vt/rocm/rocm_grouped_gemm.hip
+      src/vt/rocm/rocm_moe_gate_up_swiglu.hip
       src/vt/rocm/rocm_exl3.hip
       src/vt/rocm/rocm_sample.hip
       src/vt/rocm/rocm_gdn_state.hip
@@ -1760,6 +1764,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gdn_fused.hip
       src/vt/rocm/rocm_mla_fused_norm_rope.hip
       src/vt/rocm/rocm_mla_ops.hip
+      src/vt/rocm/rocm_mla_attn.hip
       src/vt/rocm/rocm_skinny_gemm.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
@@ -2996,6 +3001,11 @@ endif()
 # absent `vllm-bench` and report a verdict about a binary it did not build.
 if(TARGET test_bench_kv_cache_dtype AND TARGET vllm-bench)
   add_dependencies(test_bench_kv_cache_dtype vllm-bench)
+endif()
+# #2759: the same ordering, for the same reason, for the EOS / chat-template
+# flag gate.
+if(TARGET test_bench_eos_chat_template AND TARGET vllm-bench)
+  add_dependencies(test_bench_eos_chat_template vllm-bench)
 endif()
 
 # Render the compiled-arch manifest (issue #1357). Last, so it observes whatever

@@ -44,6 +44,7 @@
 #include "vt/ops.h"
 #include "vt/quant.h"
 #include "vt/recipes.h"
+#include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_runtime.h"
 
 namespace {
@@ -2664,6 +2665,8 @@ TEST_CASE("keep-quant Q6_K GEMM runs at the production launch geometry") {
 namespace vt::rocm {
 int KQuantDecodeCoopWarps(vt::DType wdt, int64_t m, int64_t nsb);
 uint64_t KQuantCoopDispatchCount();
+uint64_t KQuantWmmaDispatchCount();
+uint64_t KQuantWmmaQ4KDispatchCount();
 void Q8KQuantizeForTest(vt::Queue& q, void* scratch, const void* act, vt::DType dtype,
                         int64_t row_stride, int64_t rows, int64_t nsb, bool candidate);
 bool Q8KCandidateSelectedForTest(const char* env_value, bool gfx1100_default_accepted,
@@ -3296,6 +3299,411 @@ TEST_CASE("ROCm Q6_K decode spreads one row's superblocks over several warps") {
     }
   }
 }
+
+// KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4 (issue #2109), W1: the RDNA4 WMMA int8
+// tile arm of the Q6_K prefill GEMM. Runs ONLY on gfx1200/gfx1201 — every
+// other ROCm target keeps the scalar arm the case above already covers, so
+// this returns early rather than skip-reporting on hardware it does not
+// target (`GcnArchNameIsGfx12PrefillWmma` is the same host gate the kernel's
+// own dispatch decision uses, per `include/vt/rocm/rocm_arch.h`).
+TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  // Tile-aligned M and N (both multiples of 16, and not equal, so the grid
+  // exercises a non-square m_tiles x n_tiles), K spanning more than one
+  // superblock so the per-superblock scale reset is exercised more than once.
+  constexpr int64_t M = 32, N = 48, K = 512;
+  constexpr int64_t kBlockBytes = 210;  // sizeof(BlockQ6_K)
+  constexpr int kDOff = 208;            // the superblock scale's byte offset
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+  const size_t row_bytes = static_cast<size_t>(nsb) * kBlockBytes;
+  const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+  std::mt19937 rng(2109);
+  std::vector<uint8_t> wt(wn);
+  for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+  for (int64_t r = 0; r < N; ++r)
+    for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+      uint8_t* blk = wt.data() + r * row_bytes + bIdx * kBlockBytes;
+      const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+      const uint16_t h = vt::F32ToF16(0.0125f * jitter);
+      std::memcpy(blk + kDOff, &h, 2);
+    }
+
+  const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+  const std::vector<float> act = RandomVec(an, 2110, -0.5f, 0.5f);
+
+  std::vector<float> ref(on, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> ca = act;
+    std::vector<uint8_t> cw = wt;
+    Tensor tout = T2(ref.data(), cd, M, N);
+    Tensor tact = T2(ca.data(), cd, M, K);
+    Tensor twt = Tensor::Contiguous(cw.data(), vt::DType::kQ6_K, cd, {N, K});
+    vt::MatmulBTQuant(cq, tout, tact, twt);
+    cpu.DestroyQueue(cq);
+  }
+
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  const Device d{DeviceType::kROCM, 0};
+  DevBuf da(rocm, q, an);
+  DevBufBytes dwt(rocm, q, wn);
+  da.Upload(act);
+  dwt.Upload(wt.data());
+  Tensor tact = T2(da.ptr(), d, M, K);
+  Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kQ6_K, d, {N, K});
+
+  // f32 and bf16 OutT are two different template instantiations of the
+  // kernel; both must be reached and both must match the oracle.
+  for (bool bf16_out : {false, true}) {
+    CAPTURE(bf16_out);
+    const uint64_t wmma_before = vt::rocm::KQuantWmmaDispatchCount();
+    if (!bf16_out) {
+      DevBuf dout(rocm, q, on);
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    } else {
+      DevBufBytes dout(rocm, q, on * sizeof(uint16_t));
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      std::vector<uint16_t> got(on);
+      dout.Download(got.data());
+      std::vector<float> gotf(on);
+      for (size_t i = 0; i < on; ++i) gotf[i] = vt::BF16ToF32(got[i]);
+      CHECK(Nmse(ref, gotf) <= kNmseTol);
+    }
+    const uint64_t wmma_after = vt::rocm::KQuantWmmaDispatchCount();
+    // Reachability (AGENTS.md "Nothing lands dead"): deleting the WMMA launch
+    // site's call in a scratch copy leaves this counter flat and reds this
+    // case, which the NMSE checks above cannot do on their own — the scalar
+    // fallback would still pass them.
+    CHECK(wmma_after > wmma_before);
+  }
+  rocm.DestroyQueue(q);
+}
+
+// Same row, Q4_K arm (issue #2109's `## Owed`, landed in a follow-up wave):
+// Q4_K's scale granularity is 32-wide, twice the 16-wide WMMA K-tile, and it
+// carries a second per-sub-block correction (`dmin * sumi`) Q6_K has no
+// equivalent of, so this is not just the Q6_K case with a different dtype —
+// it exercises a materially different code path in `KQuantGemmKWmmaQ4K`.
+TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  constexpr int64_t M = 32, N = 48, K = 512;
+  constexpr int64_t kBlockBytes = 144;  // sizeof(BlockQ4_K)
+  constexpr int kDOff = 0, kDminOff = 2;
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+  const size_t row_bytes = static_cast<size_t>(nsb) * kBlockBytes;
+  const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+  std::mt19937 rng(2412);
+  std::vector<uint8_t> wt(wn);
+  for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+  for (int64_t r = 0; r < N; ++r)
+    for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+      uint8_t* blk = wt.data() + r * row_bytes + bIdx * kBlockBytes;
+      const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+      auto put16 = [&](int off, float v) {
+        const uint16_t h = vt::F32ToF16(v);
+        std::memcpy(blk + off, &h, 2);
+      };
+      put16(kDOff, 0.0125f * jitter);
+      put16(kDminOff, 0.0075f * jitter);
+    }
+
+  const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+  const std::vector<float> act = RandomVec(an, 2413, -0.5f, 0.5f);
+
+  std::vector<float> ref(on, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> ca = act;
+    std::vector<uint8_t> cw = wt;
+    Tensor tout = T2(ref.data(), cd, M, N);
+    Tensor tact = T2(ca.data(), cd, M, K);
+    Tensor twt = Tensor::Contiguous(cw.data(), vt::DType::kQ4_K, cd, {N, K});
+    vt::MatmulBTQuant(cq, tout, tact, twt);
+    cpu.DestroyQueue(cq);
+  }
+
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  const Device d{DeviceType::kROCM, 0};
+  DevBuf da(rocm, q, an);
+  DevBufBytes dwt(rocm, q, wn);
+  da.Upload(act);
+  dwt.Upload(wt.data());
+  Tensor tact = T2(da.ptr(), d, M, K);
+  Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kQ4_K, d, {N, K});
+
+  for (bool bf16_out : {false, true}) {
+    CAPTURE(bf16_out);
+    const uint64_t wmma_before = vt::rocm::KQuantWmmaQ4KDispatchCount();
+    if (!bf16_out) {
+      DevBuf dout(rocm, q, on);
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    } else {
+      DevBufBytes dout(rocm, q, on * sizeof(uint16_t));
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      std::vector<uint16_t> got(on);
+      dout.Download(got.data());
+      std::vector<float> gotf(on);
+      for (size_t i = 0; i < on; ++i) gotf[i] = vt::BF16ToF32(got[i]);
+      CHECK(Nmse(ref, gotf) <= kNmseTol);
+    }
+    const uint64_t wmma_after = vt::rocm::KQuantWmmaQ4KDispatchCount();
+    CHECK(wmma_after > wmma_before);
+  }
+  rocm.DestroyQueue(q);
+}
+
+// The M/N tail (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4's `## Owed`, closed in a
+// follow-up wave): a real prompt is essentially never a multiple of 16, and
+// the WMMA arm used to require EXACT alignment on both M and N, so it fell
+// back to scalar for the whole call whenever either dimension had a
+// remainder — losing the row's entire benefit on the common case, not just
+// the ragged edge. M=37, N=50 are chosen so NEITHER dimension is aligned
+// (floor(37/16)=32, floor(50/16)=48), exercising the WMMA corner, the
+// bottom-row remainder, and the right-column remainder all in one case.
+TEST_CASE("keep-quant GEMM matches the CPU oracle when M and N are not multiples of 16") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  constexpr int64_t M = 37, N = 50, K = 512;
+  struct Fmt {
+    vt::DType dt;
+    int64_t block_bytes;
+    int d_off, dmin_off;
+    const char* name;
+  };
+  const Fmt fmts[] = {
+      {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
+      {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
+  };
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+
+  for (const Fmt& f : fmts) {
+    CAPTURE(std::string(f.name));
+    const size_t row_bytes = static_cast<size_t>(nsb) * f.block_bytes;
+    const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+    std::mt19937 rng(3716);
+    std::vector<uint8_t> wt(wn);
+    for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+    for (int64_t r = 0; r < N; ++r)
+      for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+        uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+        const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+        auto put16 = [&](int off, float v) {
+          const uint16_t h = vt::F32ToF16(v);
+          std::memcpy(blk + off, &h, 2);
+        };
+        put16(f.d_off, 0.0125f * jitter);
+        if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+      }
+
+    const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+    const std::vector<float> act = RandomVec(an, 3717, -0.5f, 0.5f);
+
+    std::vector<float> ref(on, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ca = act;
+      std::vector<uint8_t> cw = wt;
+      Tensor tout = T2(ref.data(), cd, M, N);
+      Tensor tact = T2(ca.data(), cd, M, K);
+      Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {N, K});
+      vt::MatmulBTQuant(cq, tout, tact, twt);
+      cpu.DestroyQueue(cq);
+    }
+
+    vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+    Queue q = rocm.CreateQueue();
+    const Device d{DeviceType::kROCM, 0};
+    DevBuf da(rocm, q, an);
+    DevBufBytes dwt(rocm, q, wn);
+    da.Upload(act);
+    dwt.Upload(wt.data());
+    Tensor tact = T2(da.ptr(), d, M, K);
+    Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {N, K});
+
+    const uint64_t wmma_before = f.dt == vt::DType::kQ6_K
+                                     ? vt::rocm::KQuantWmmaDispatchCount()
+                                     : vt::rocm::KQuantWmmaQ4KDispatchCount();
+    DevBuf dout(rocm, q, on);
+    Tensor tout = T2(dout.ptr(), d, M, N);
+    vt::MatmulBTQuant(q, tout, tact, twt);
+    CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    const uint64_t wmma_after = f.dt == vt::DType::kQ6_K
+                                    ? vt::rocm::KQuantWmmaDispatchCount()
+                                    : vt::rocm::KQuantWmmaQ4KDispatchCount();
+    // Reachability: the WMMA arm must still fire for its floor(M/16)x
+    // floor(N/16) corner even though the full shape is not aligned — a
+    // silent full fallback to scalar would pass the NMSE check above just
+    // as well, which is exactly why #2109's own real-model measurement
+    // needed a hand-trimmed prompt before this fix.
+    CHECK(wmma_after > wmma_before);
+    rocm.DestroyQueue(q);
+  }
+}
+
+// The M=37/N=50 case above misaligns BOTH dimensions at once, which exercises
+// the WMMA corner, the bottom-row remainder, and the right-column remainder
+// together but never isolates one remainder shape from the other. An
+// independent review of this row found the tail-fill launch's host-side grid
+// still sized to the FULL m*n domain (relying on a skip guard rather than
+// enumerating only the remainder), which the M=37/N=50 case cannot catch
+// either way since it only asserts correctness, not launch geometry — a
+// bug in an "only M has a remainder" or "only N has a remainder" split
+// specifically (for example an off-by-one at the boundary between the
+// bottom strip and the right strip) could still pass that combined case by
+// coincidence. These two shapes isolate each split on its own: M=37/N=48
+// has a bottom-strip-only remainder (N is an exact multiple of 16, so
+// right_strip == 0), and M=32/N=50 has a right-strip-only remainder (M is
+// an exact multiple of 16, so bottom_strip == 0).
+TEST_CASE("keep-quant GEMM matches the CPU oracle when only one of M/N is misaligned") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  constexpr int64_t K = 512;
+  struct Fmt {
+    vt::DType dt;
+    int64_t block_bytes;
+    int d_off, dmin_off;
+    const char* name;
+  };
+  const Fmt fmts[] = {
+      {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
+      {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
+  };
+  struct Shape {
+    int64_t m, n;
+    const char* label;
+  };
+  const Shape shapes[] = {
+      {37, 48, "M misaligned, N aligned (bottom-strip-only remainder)"},
+      {32, 50, "N misaligned, M aligned (right-strip-only remainder)"},
+  };
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+
+  for (const Shape& shape : shapes) {
+    CAPTURE(std::string(shape.label));
+    const int64_t M = shape.m, N = shape.n;
+    for (const Fmt& f : fmts) {
+      CAPTURE(std::string(f.name));
+      const size_t row_bytes = static_cast<size_t>(nsb) * f.block_bytes;
+      const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+      std::mt19937 rng(4827);
+      std::vector<uint8_t> wt(wn);
+      for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+      for (int64_t r = 0; r < N; ++r)
+        for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+          uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+          const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+          auto put16 = [&](int off, float v) {
+            const uint16_t h = vt::F32ToF16(v);
+            std::memcpy(blk + off, &h, 2);
+          };
+          put16(f.d_off, 0.0125f * jitter);
+          if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+        }
+
+      const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+      const std::vector<float> act = RandomVec(an, 4828, -0.5f, 0.5f);
+
+      std::vector<float> ref(on, 0.0f);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> ca = act;
+        std::vector<uint8_t> cw = wt;
+        Tensor tout = T2(ref.data(), cd, M, N);
+        Tensor tact = T2(ca.data(), cd, M, K);
+        Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {N, K});
+        vt::MatmulBTQuant(cq, tout, tact, twt);
+        cpu.DestroyQueue(cq);
+      }
+
+      vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+      Queue q = rocm.CreateQueue();
+      const Device d{DeviceType::kROCM, 0};
+      DevBuf da(rocm, q, an);
+      DevBufBytes dwt(rocm, q, wn);
+      da.Upload(act);
+      dwt.Upload(wt.data());
+      Tensor tact = T2(da.ptr(), d, M, K);
+      Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {N, K});
+
+      const uint64_t wmma_before = f.dt == vt::DType::kQ6_K
+                                       ? vt::rocm::KQuantWmmaDispatchCount()
+                                       : vt::rocm::KQuantWmmaQ4KDispatchCount();
+      DevBuf dout(rocm, q, on);
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      const uint64_t wmma_after = f.dt == vt::DType::kQ6_K
+                                      ? vt::rocm::KQuantWmmaDispatchCount()
+                                      : vt::rocm::KQuantWmmaQ4KDispatchCount();
+      // Reachability: the WMMA arm must still fire for its aligned corner
+      // even though one dimension is a remainder-only split.
+      CHECK(wmma_after > wmma_before);
+      rocm.DestroyQueue(q);
+    }
+  }
+}
 #endif  // VLLM_CPP_HIP
 
 TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
@@ -3384,6 +3792,170 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
       vt::MatmulBTQuantGrouped(q, tout, tact, twt, te);
       CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
       dev.DestroyQueue(q);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GLM-5.3-Flash on ROCm (BACKEND-ROCM, #2942). The ONE op the Flash forward asks
+// the op table for and does not get on a ROCm queue.
+//
+// READ THIS BEFORE LOOSENING ANY ASSERTION HERE, and read the note at the MLA
+// registration case below for the general form of the trap. The portable
+// reference tier computes the SAME ANSWER as a native kernel — it IS this
+// oracle, running on the host against device memory the backend reports
+// host-addressable. So assertion (1) alone is GREEN on a backend with no kernel
+// at all. Assertion (2) is `vt::OpRegistered`, a NATIVE-ONLY probe by design
+// (src/vt/op_provider.cpp:801-825), and it is the only one of the three that can
+// tell a native kernel from the tier. Assertion (3) catches the same thing from
+// the other side, by counting.
+//
+// `glm5_next_forward.cpp:307-310` reads BOTH kMoeGateUpSwiGLUGrouped and
+// kMatmulBTQuantGrouped through `vt::OpRegistered` before it builds an operand,
+// and refuses the device when either is false. ROCm has had the second since
+// `rocm_ops.hip:261`; this case covers the first.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is NATIVE on ROCm") {
+  // The CPU golden (cpu_quant_gemm.cpp:282-299) is the composite this op is
+  // DEFINED against: two grouped keep-quant GEMMs into f32 temporaries, then
+  //   gate = min(g, limit); up = clamp(u, ±limit); out = gate·sigmoid(gate)·up
+  // with no extra scale, because the grouped GEMM already folded the weight
+  // FinalFactor into g and u. Fixture, block builders and tolerance are the
+  // kMatmulBTQuantGrouped case's above — the same shape, so a divergence here is
+  // the epilogue and not the GEMM.
+  constexpr int64_t P = 3, N = 8, K = 512;      // K%256==0 (K-quant superblocks)
+  constexpr int64_t E = 4;                       // experts
+  const std::vector<int32_t> eids = {2, 0, 3};   // routed experts (non-sorted)
+
+  struct Fmt { vt::DType dt; int64_t block_bytes; int d_off; int dmin_off; const char* name; };
+  const Fmt fmts[] = {
+    {vt::DType::kQ8_0, 34, 0, -1, "q8_0"},
+    {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
+    {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
+    {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},
+  };
+
+  const bool rocm_built = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  // ASSERTION 2, and it is NOT `if (!OpAvailable) continue`. The harness header
+  // says a device that has not registered an op is SKIPPED rather than failed,
+  // and that is right for a partial backend in general — but here the missing
+  // registration IS the defect under test: it is what makes
+  // `glm5_next_forward.cpp:315-327` refuse a ROCm queue by name.
+  if (rocm_built) {
+    CHECK(vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kROCM));
+    // Its partner, already landed. Asserted beside it because the forward reads
+    // the PAIR and half the pair is not half the capability.
+    CHECK(vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, DeviceType::kROCM));
+  }
+
+  // Both limits, because the finite one is the arm a naive port drops: with
+  // limit=+inf the two clamps are no-ops and out == silu(g)·u, so an epilogue
+  // that forgot them entirely would still be green.
+  const float limits[] = {std::numeric_limits<float>::infinity(), 1.5f};
+
+  for (const Fmt& f : fmts) {
+    // As std::string: doctest stringifies a bare `const char*` as `1`, so the
+    // capture in the case above cannot name the format that failed.
+    CAPTURE(std::string(f.name));
+    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t blocks_per_row = K / elems_per_block;
+    const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
+    const size_t wn = static_cast<size_t>(E) * N * row_bytes;
+
+    // Two INDEPENDENT weight banks. Same bytes in both would make a swapped
+    // gate_w/up_w argument order invisible, and the clamp is asymmetric
+    // (min on gate, ±clamp on up), so the swap is a real defect this catches.
+    auto build_bank = [&](uint32_t seed, float base_d, float base_dmin) {
+      std::mt19937 rng(seed);
+      std::vector<uint8_t> w(wn);
+      for (uint8_t& b : w) b = static_cast<uint8_t>(rng() & 0xFF);
+      for (int64_t r = 0; r < E * N; ++r)
+        for (int64_t bIdx = 0; bIdx < blocks_per_row; ++bIdx) {
+          uint8_t* blk = w.data() + r * row_bytes + bIdx * f.block_bytes;
+          const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+          auto put16 = [&](int off, float v) {
+            uint16_t h = vt::F32ToF16(v); std::memcpy(blk + off, &h, 2);
+          };
+          if (f.d_off >= 0) put16(f.d_off, base_d * jitter);
+          if (f.dmin_off >= 0) put16(f.dmin_off, base_dmin * jitter);
+        }
+      return w;
+    };
+    const std::vector<uint8_t> gate_wt = build_bank(901, 0.0125f, 0.0075f);
+    const std::vector<uint8_t> up_wt = build_bank(902, 0.0110f, 0.0060f);
+
+    const size_t an = static_cast<size_t>(P) * K, on = static_cast<size_t>(P) * N;
+    const std::vector<float> act = RandomVec(an, 903, -0.5f, 0.5f);
+
+    // Filled by the first (infinite) limit and compared against by the second,
+    // so the finite arm can prove it actually clamped.
+    std::vector<float> ref_unclamped;
+    for (float limit : limits) {
+      CAPTURE(limit);
+      std::vector<float> ref(on, 0.0f);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> ca = act;
+        std::vector<uint8_t> cg = gate_wt, cu = up_wt;
+        std::vector<int32_t> ce = eids;
+        Tensor tout = T2(ref.data(), cd, P, N);
+        Tensor tact = T2(ca.data(), cd, P, K);
+        Tensor tg = Tensor::Contiguous(cg.data(), f.dt, cd, {E * N, K});
+        Tensor tu = Tensor::Contiguous(cu.data(), f.dt, cd, {E * N, K});
+        Tensor te = TI32(ce.data(), cd, P);
+        vt::MoeGateUpSwiGLUGrouped(cq, tout, tact, tg, tu, te, limit);
+        cpu.DestroyQueue(cq);
+      }
+      // The finite-limit arm must actually CLAMP something, or it is the
+      // infinite arm again under another name and the clamp stays untested
+      // while reading green. Proved by DIFFERENCE against the infinite arm on
+      // the same inputs, not by "the output is non-zero".
+      if (!std::isfinite(limit)) {
+        ref_unclamped = ref;
+      } else {
+        REQUIRE(ref_unclamped.size() == ref.size());
+        bool clamp_bit_moved = false;
+        for (size_t i = 0; i < ref.size(); ++i)
+          if (ref[i] != ref_unclamped[i]) clamp_bit_moved = true;
+        REQUIRE(clamp_bit_moved);
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kMoeGateUpSwiGLUGrouped, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBuf da(dev, q, an);
+        DevBufBytes dg(dev, q, wn);
+        DevBufBytes du(dev, q, wn);
+        DevBufI32 de(dev, q, P);
+        DevBuf dout(dev, q, on);
+        da.Upload(act);
+        dg.Upload(gate_wt.data());
+        du.Upload(up_wt.data());
+        de.Upload(eids);
+        Tensor tact = T2(da.ptr(), d, P, K);
+        Tensor tg = Tensor::Contiguous(dg.ptr(), f.dt, d, {E * N, K});
+        Tensor tu = Tensor::Contiguous(du.ptr(), f.dt, d, {E * N, K});
+        Tensor te = TI32(de.ptr(), d, P);
+        Tensor tout = T2(dout.ptr(), d, P, N);
+        // ASSERTION 3. `OpRegistered` says a native provider EXISTS; this says
+        // the call did not fall through to the tier anyway.
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::MoeGateUpSwiGLUGrouped(q, tout, tact, tg, tu, te, limit);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        // ASSERTION 1. Green with no kernel at all — never read it alone.
+        CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
     }
   }
 }
@@ -3719,9 +4291,8 @@ TEST_CASE("ROCm registers the W1 MLA ops natively rather than serving them from 
       (vt::OpRegistered(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM) ? "1" : "0") +
       " kDsaTopkSelect=" +
       (vt::OpRegistered(vt::OpId::kDsaTopkSelect, DeviceType::kROCM) ? "1" : "0") +
-      " kMlaDecodeAttention=" +
-      (vt::OpRegistered(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM) ? "1" : "0") +
-      " — the GLM-5.3 speed axis stays VOID while any of these is 0";
+      " — the GLM-5.3 speed axis stays VOID while either is 0. "
+      "kMlaDecodeAttention left this list when #2926 landed it.";
   MESSAGE(owed);
 }
 
@@ -4075,26 +4646,336 @@ TEST_CASE("what an unregistered ROCm op actually does on this board: tier, or re
       (eligible ? "1" : "0");
   MESSAGE(tier);
 
-  // The probe op must be one ROCm does not register. `kMlaDecodeAttention` is
-  // that today and W3 is what changes it; when it does, there is nothing left
-  // to probe here and this case has no business failing for that reason.
-  if (vt::OpRegistered(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM)) {
-    MESSAGE("kMlaDecodeAttention is now registered on ROCm (W3 landed) — probe skipped");
+  // The probe op must be one ROCm does not register. It USED to be
+  // `kMlaDecodeAttention`; #2926 registered that one, so the probe moved to
+  // `kDsaIndexerLogits`, which is still owed. When that one lands too there is
+  // nothing left to probe here and this case has no business failing for it.
+  //
+  // MOVING THE PROBE IS NOT A WEAKENING. The quantity under test is what the
+  // BOARD does with an unregistered op, not which op happens to be
+  // unregistered, so any op with no ROCm kernel answers the same question.
+  if (vt::OpRegistered(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM)) {
+    MESSAGE("kDsaIndexerLogits is now registered on ROCm — nothing left to probe");
     return;
   }
 
   const unsigned long long before = vt::GetReferenceTierHits();
   if (eligible) {
     // The tier is live: the miss installs a host kernel and counts itself.
-    CHECK_NOTHROW((void)vt::GetOp(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+    CHECK_NOTHROW((void)vt::GetOp(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM));
     CHECK(vt::GetReferenceTierHits() > before);
     MESSAGE("VERDICT: the tier is LIVE here — the missing MLA ops are a SPEED cost");
   } else {
     // No tier: `GetOp` refuses by name rather than handing a host kernel a
     // pointer the host may not dereference.
-    CHECK_THROWS((void)vt::GetOp(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+    CHECK_THROWS((void)vt::GetOp(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM));
     CHECK(vt::GetReferenceTierHits() == before);
     MESSAGE("VERDICT: the tier is WITHDRAWN here — the missing MLA ops are a REFUSAL, "
             "so W2/W3 block GENERATION and not only measurement");
   }
+}
+
+// ─── #2926: the two attention ops GLM-5.3 non-flash reaches ─────────────────
+//
+// These are the two ops that, before `src/vt/rocm/rocm_mla_attn.hip`, had no
+// ROCm registration and therefore REFUSED on `gfx1151` — the reference tier is
+// withdrawn on a part reporting `PageableMemoryAccess = 0`
+// (`docs/ROCM.md:83-85`), so an unregistered op is not a slow path. The
+// oracle-equality assertions below are the numerics; the `OpRegistered` case
+// further down is what can tell a native kernel from the tier, because on a
+// board where the tier IS live it computes the same answer on the host.
+
+TEST_CASE("MlaPrefillAttention matches the CPU oracle: causal, non-causal, windowed") {
+  // UNEQUAL query and key lengths on the FIRST request, which is the whole
+  // point. FlashAttention's causal mask is BOTTOM-RIGHT aligned — query `i`
+  // sees keys `j <= i + (len_k - len_q)` (`flash_attn.py:223`,
+  // `cpu_mla_prefill.cpp`'s `causal_shift`) — so a TOP-LEFT implementation is
+  // green on a square request and wrong here. Request 0 is 3 queries over 5
+  // keys (shift 2); request 1 is 2 over 2 (shift 0), so both alignments are in
+  // the same call.
+  constexpr int64_t kHeads = 3, kQkDim = 9, kVDim = 6;
+  constexpr int64_t kTotalQ = 5, kTotalK = 7, kReqs = 2;
+  const std::vector<int32_t> cu_q = {0, 3, 5};
+  const std::vector<int32_t> cu_k = {0, 5, 7};
+
+  const std::vector<float> query = RandomVec(static_cast<size_t>(kTotalQ * kHeads * kQkDim), 51001);
+  const std::vector<float> key = RandomVec(static_cast<size_t>(kTotalK * kHeads * kQkDim), 51002);
+  const std::vector<float> value = RandomVec(static_cast<size_t>(kTotalK * kHeads * kVDim), 51003);
+  const std::vector<float> out_seed(static_cast<size_t>(kTotalQ * kHeads * kVDim), -7.25f);
+  const std::vector<float> lse_seed(static_cast<size_t>(kHeads * kTotalQ), -7.25f);
+
+  // arm 0 causal, arm 1 NON-causal (the context-chunk call, "Context is
+  // unmasked", `flash_attn.py:246`), arm 2 causal + sliding window. A window
+  // with `causal=false` is refused by ops.cpp, so the pair is not spelled.
+  for (int arm = 0; arm < 3; ++arm) {
+    CAPTURE(arm);
+    vt::MlaPrefillAttentionArgs args;
+    args.scale = 0.37f;
+    args.causal = arm != 1;
+    args.max_seqlen_q = 3;
+    args.max_seqlen_k = 5;
+    if (arm == 2) args.window_size = vt::AttentionWindow{1, 0};
+
+    std::vector<float> ref(out_seed), ref_lse(lse_seed);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> qh = query, kh = key, vh = value;
+      std::vector<int32_t> cqh = cu_q, ckh = cu_k;
+      Tensor to = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kTotalQ, kHeads, kVDim});
+      Tensor tl = Tensor::Contiguous(ref_lse.data(), DType::kF32, cd, {kHeads, kTotalQ});
+      Tensor tq = Tensor::Contiguous(qh.data(), DType::kF32, cd, {kTotalQ, kHeads, kQkDim});
+      Tensor tk = Tensor::Contiguous(kh.data(), DType::kF32, cd, {kTotalK, kHeads, kQkDim});
+      Tensor tv = Tensor::Contiguous(vh.data(), DType::kF32, cd, {kTotalK, kHeads, kVDim});
+      Tensor tcq = Tensor::Contiguous(cqh.data(), DType::kI32, cd, {kReqs + 1});
+      Tensor tck = Tensor::Contiguous(ckh.data(), DType::kI32, cd, {kReqs + 1});
+      vt::MlaPrefillAttention(cq, to, &tl, tq, tk, tv, tcq, tck, args);
+      cpu.DestroyQueue(cq);
+    }
+    // The oracle actually wrote: a seeded buffer that came back unchanged would
+    // make every comparison below vacuous.
+    REQUIRE(ref != out_seed);
+    REQUIRE(ref_lse != lse_seed);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMlaPrefillAttention, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dq(dev, q, query.size()), dk(dev, q, key.size()), dv(dev, q, value.size()),
+          dout(dev, q, out_seed.size()), dlse(dev, q, lse_seed.size());
+      dq.Upload(query);
+      dk.Upload(key);
+      dv.Upload(value);
+      dout.Upload(out_seed);
+      dlse.Upload(lse_seed);
+      void* dcq = dev.Alloc(cu_q.size() * sizeof(int32_t));
+      void* dck = dev.Alloc(cu_k.size() * sizeof(int32_t));
+      dev.Copy(q, dcq, cu_q.data(), cu_q.size() * sizeof(int32_t));
+      dev.Copy(q, dck, cu_k.data(), cu_k.size() * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {kTotalQ, kHeads, kVDim});
+      Tensor tl = Tensor::Contiguous(dlse.ptr(), DType::kF32, d, {kHeads, kTotalQ});
+      Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {kTotalQ, kHeads, kQkDim});
+      Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {kTotalK, kHeads, kQkDim});
+      Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {kTotalK, kHeads, kVDim});
+      Tensor tcq = Tensor::Contiguous(dcq, DType::kI32, d, {kReqs + 1});
+      Tensor tck = Tensor::Contiguous(dck, DType::kI32, d, {kReqs + 1});
+
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::MlaPrefillAttention(q, to, &tl, tq, tk, tv, tcq, tck, args);
+      dev.Synchronize(q);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      CHECK(Nmse(ref_lse, dlse.Download()) <= kNmseTol);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+
+      dev.Free(dcq);
+      dev.Free(dck);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("MlaDecodeAttention matches the CPU oracle: dense, windowed, selected, sink") {
+  // A SHUFFLED block table, so a kernel that read page `i` for logical block `i`
+  // is green on an identity table and wrong here. `kVDim < kHeadSize` is the MLA
+  // shape: the QK dot spans the FULL row and V is its LEADING slice
+  // (`triton_mla.py:236`).
+  constexpr int64_t kBatch = 2, kHeads = 3, kHeadSize = 9, kVDim = 6;
+  constexpr int64_t kBlocks = 8, kBlockSize = 4, kMaxBlocks = 2;
+  const std::vector<int32_t> block_table = {6, 1,   //
+                                            3, 7};
+  const std::vector<int32_t> seq_lens = {7, 3};
+  constexpr int64_t kTopk = 4;
+
+  const std::vector<float> query =
+      RandomVec(static_cast<size_t>(kBatch * kHeads * kHeadSize), 52001);
+  const std::vector<float> cache =
+      RandomVec(static_cast<size_t>(kBlocks * kBlockSize * kHeadSize), 52002);
+  const std::vector<float> sink = RandomVec(static_cast<size_t>(kHeads), 52003);
+  const std::vector<float> out_seed(static_cast<size_t>(kBatch * kHeads * kVDim), -6.5f);
+  const std::vector<float> lse_seed(static_cast<size_t>(kBatch * kHeads), -6.5f);
+
+  // A `-1` INSIDE the live count (upstream's "no token" sentinel,
+  // sparse_attn_indexer.py:431-432) and a count SHORTER than the row, so both
+  // the sentinel skip and the count clamp are exercised.
+  const std::vector<int32_t> sel = {5, 1, -1, 3,   //
+                                    0, 2, -1, -1};
+  const std::vector<int32_t> sel_cnt = {4, 2};
+
+  // arm 0 dense, 1 windowed, 2 selected, 3 sink, 4 selected + sink.
+  for (int arm = 0; arm < 5; ++arm) {
+    CAPTURE(arm);
+    const bool selected = arm == 2 || arm == 4;
+    const bool sinked = arm == 3 || arm == 4;
+
+    // Shared, POINTER-FREE settings. The two Tensor* members are set per side
+    // (host oracle / device) against tensors that live on that side, so no
+    // pointer here ever outlives its tensor.
+    vt::MlaDecodeAttentionArgs base;
+    base.scale = 0.41f;
+    base.num_kv_splits = 0;
+    base.max_seq_len = 7;
+    if (arm == 1) base.window_size = vt::AttentionWindow{2, 0};
+
+    std::vector<float> ref(out_seed), ref_lse(lse_seed);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> qh = query, ch = cache, sh = sink;
+      std::vector<int32_t> bth = block_table, slh = seq_lens, selh = sel, cnth = sel_cnt;
+      Tensor to = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kBatch, kHeads, kVDim});
+      Tensor tl = Tensor::Contiguous(ref_lse.data(), DType::kF32, cd, {kBatch, kHeads});
+      Tensor tq =
+          Tensor::Contiguous(qh.data(), DType::kF32, cd, {kBatch, kHeads, kHeadSize});
+      Tensor tc =
+          Tensor::Contiguous(ch.data(), DType::kF32, cd, {kBlocks, kBlockSize, kHeadSize});
+      Tensor tb = Tensor::Contiguous(bth.data(), DType::kI32, cd, {kBatch, kMaxBlocks});
+      Tensor ts = Tensor::Contiguous(slh.data(), DType::kI32, cd, {kBatch});
+      Tensor ti = Tensor::Contiguous(selh.data(), DType::kI32, cd, {kBatch, kTopk});
+      Tensor tn = Tensor::Contiguous(cnth.data(), DType::kI32, cd, {kBatch});
+      Tensor tk = Tensor::Contiguous(sh.data(), DType::kF32, cd, {kHeads});
+      vt::MlaDecodeAttentionArgs cargs = base;
+      if (selected) {
+        cargs.topk_indices = &ti;
+        cargs.valid_counts = &tn;
+      }
+      if (sinked) cargs.attn_sink = &tk;
+      vt::MlaDecodeAttention(cq, to, &tl, tq, tc, tb, ts, cargs);
+      cpu.DestroyQueue(cq);
+    }
+    // The oracle actually wrote: a seeded buffer that came back unchanged would
+    // make every comparison below vacuous.
+    REQUIRE(ref != out_seed);
+    REQUIRE(ref_lse != lse_seed);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMlaDecodeAttention, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dq(dev, q, query.size()), dc(dev, q, cache.size()),
+          dout(dev, q, out_seed.size()), dlse(dev, q, lse_seed.size()),
+          dsink(dev, q, sink.size());
+      dq.Upload(query);
+      dc.Upload(cache);
+      dout.Upload(out_seed);
+      dlse.Upload(lse_seed);
+      dsink.Upload(sink);
+      void* dbt = dev.Alloc(block_table.size() * sizeof(int32_t));
+      void* dsl = dev.Alloc(seq_lens.size() * sizeof(int32_t));
+      void* dsel = dev.Alloc(sel.size() * sizeof(int32_t));
+      void* dcnt = dev.Alloc(sel_cnt.size() * sizeof(int32_t));
+      dev.Copy(q, dbt, block_table.data(), block_table.size() * sizeof(int32_t));
+      dev.Copy(q, dsl, seq_lens.data(), seq_lens.size() * sizeof(int32_t));
+      dev.Copy(q, dsel, sel.data(), sel.size() * sizeof(int32_t));
+      dev.Copy(q, dcnt, sel_cnt.data(), sel_cnt.size() * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {kBatch, kHeads, kVDim});
+      Tensor tl = Tensor::Contiguous(dlse.ptr(), DType::kF32, d, {kBatch, kHeads});
+      Tensor tq =
+          Tensor::Contiguous(dq.ptr(), DType::kF32, d, {kBatch, kHeads, kHeadSize});
+      Tensor tc =
+          Tensor::Contiguous(dc.ptr(), DType::kF32, d, {kBlocks, kBlockSize, kHeadSize});
+      Tensor tb = Tensor::Contiguous(dbt, DType::kI32, d, {kBatch, kMaxBlocks});
+      Tensor ts = Tensor::Contiguous(dsl, DType::kI32, d, {kBatch});
+      Tensor ti = Tensor::Contiguous(dsel, DType::kI32, d, {kBatch, kTopk});
+      Tensor tn = Tensor::Contiguous(dcnt, DType::kI32, d, {kBatch});
+      Tensor tk = Tensor::Contiguous(dsink.ptr(), DType::kF32, d, {kHeads});
+      vt::MlaDecodeAttentionArgs dargs = base;
+      if (selected) {
+        dargs.topk_indices = &ti;
+        dargs.valid_counts = &tn;
+      }
+      if (sinked) dargs.attn_sink = &tk;
+
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::MlaDecodeAttention(q, to, &tl, tq, tc, tb, ts, dargs);
+      dev.Synchronize(q);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      CHECK(Nmse(ref_lse, dlse.Download()) <= kNmseTol);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+
+      // THE FULL-SELECTION IDENTITY, on the DENSE arm's own device and asserted
+      // BIT FOR BIT. `ops.h` states it as a contract: "A SELECTION LISTING EVERY
+      // CAUSAL KEY IS BIT-FOR-BIT the unselected call", because the list is
+      // walked in ascending order and the f32 online softmax therefore sees the
+      // identical summation order. An NMSE bound against the CPU oracle cannot
+      // see a reordered reduction, which is the whole thing this identity is
+      // about — so it is a device-against-itself equality and not an oracle
+      // comparison.
+      //
+      // Only REQUEST 1 is compared: its 3 keys fit inside `topk == 4`, so its
+      // list can name every causal key. Request 0 has 7 keys and cannot, and its
+      // rows are EXCLUDED rather than fudged into the bound.
+      if (arm == 0) {
+        const std::vector<float> dense = dout.Download();
+        const std::vector<int32_t> full = {0, 1, 2, 3,   // request 0: truncated, unused
+                                           0, 1, 2, -1};
+        const std::vector<int32_t> full_cnt = {4, 3};
+        dev.Copy(q, dsel, full.data(), full.size() * sizeof(int32_t));
+        dev.Copy(q, dcnt, full_cnt.data(), full_cnt.size() * sizeof(int32_t));
+        dout.Upload(out_seed);
+        dev.Synchronize(q);
+        vt::MlaDecodeAttentionArgs fargs = base;
+        fargs.topk_indices = &ti;
+        fargs.valid_counts = &tn;
+        vt::MlaDecodeAttention(q, to, &tl, tq, tc, tb, ts, fargs);
+        dev.Synchronize(q);
+        const std::vector<float> got_full = dout.Download();
+        for (size_t i = static_cast<size_t>(kHeads * kVDim); i < got_full.size(); ++i) {
+          CHECK(got_full[i] == dense[i]);
+        }
+      }
+
+      dev.Free(dbt);
+      dev.Free(dsl);
+      dev.Free(dsel);
+      dev.Free(dcnt);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("ROCm registers the two attention ops GLM-5.3 non-flash reaches (#2926)") {
+  // The load-bearing assertion of this wave, and the one the numeric cases
+  // above CANNOT make. `OpRegistered` is a native-only probe
+  // (`src/vt/op_provider.cpp:788-806`): on a board where the portable reference
+  // tier is live it is FALSE while the op still computes the right answer on
+  // the host, so an oracle-equality assertion is green with no kernel at all.
+  // That is measured, not argued — four of #2715's RED cases passed on their
+  // `REQUIRE` guards alone.
+  //
+  // On `gfx1151` the tier is withdrawn (`docs/ROCM.md:83-85`), so a false here
+  // is not a slow path: it is GLM-5.3 non-flash unable to emit a token.
+  bool rocm_built = false;
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt == DeviceType::kROCM) rocm_built = true;
+  }
+  if (!rocm_built) return;  // not a ROCm build — nothing to assert about ROCm
+
+  CHECK(vt::OpRegistered(vt::OpId::kMlaPrefillAttention, DeviceType::kROCM));
+  CHECK(vt::OpRegistered(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+
+  // Still owed after this wave (spec § Owed). RECORDED, not asserted: asserting
+  // their absence would be a lock on the next wave. A SPARSE step — a prompt
+  // longer than `index_topk` — still refuses while either is 0.
+  const std::string owed =
+      std::string("still owed on ROCm (#2926) — kDsaIndexerLogits=") +
+      (vt::OpRegistered(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM) ? "1" : "0") +
+      " kDsaTopkSelect=" +
+      (vt::OpRegistered(vt::OpId::kDsaTopkSelect, DeviceType::kROCM) ? "1" : "0") +
+      " kMergeAttnStates=" +
+      (vt::OpRegistered(vt::OpId::kMergeAttnStates, DeviceType::kROCM) ? "1" : "0") +
+      " — a SPARSE GLM-5.3 step still refuses while the indexer pair is 0, and "
+      "the speed axis stays VOID";
+  MESSAGE(owed);
 }

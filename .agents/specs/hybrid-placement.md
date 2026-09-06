@@ -2,8 +2,9 @@
 
 Assign a model's tensor groups to *different devices in one engine* — routed-MoE
 experts on the CPU while attention, dense projections, router and norms stay on
-the GPU. Issue [#149](https://github.com/mudler/vllm.cpp/issues/149), the
-highest-upvoted request from the r/LocalLLaMA launch thread. Design grounded in
+the GPU. Asked for as #149, the highest-upvoted request from the r/LocalLLaMA
+launch thread — that issue has since been DELETED and is kept here as provenance
+rather than as a link, because it is why the row exists. Design grounded in
 a source scan of llama.cpp at the pinned oracle `237ad9b96`
 ([`../oracles/llama-cpp.md`](../oracles/llama-cpp.md), `gateable = yes`) plus
 the pinned vLLM `555967922`.
@@ -32,7 +33,7 @@ device selection*. Three findings decide the shape:
 
 | Field | Content |
 |---|---|
-| Row ID | `ENG-HYBRID-PLACEMENT` (engine-matrix). Issue [#149](https://github.com/mudler/vllm.cpp/issues/149) |
+| Row ID | `ENG-HYBRID-PLACEMENT` (engine-matrix). Issue [#3013](https://github.com/mudler/vllm.cpp/issues/3013) — it replaces **#149**, which was this row's campaign issue and has been DELETED (404 unauthenticated, against a live control returning 200). #147, cited below as the multi-GPU half, is deleted too |
 | In | A per-tensor-group device-placement seam resolved at model build, plus its first and only in-scope client: routed-MoE expert compute on the CPU backend with the rest of the model on GPU. Pattern→device override surface, an auto-fit resolver that places by measured free device memory, honest reporting of the resolved placement, and the activation round-trip at each MoE layer boundary |
 | Out | Dense-layer CPU offload (that is `ENG-WEIGHT-OFFLOAD`, the vLLM `cpu_offload_gb` mirror — INVENTORIED); disk-tier expert paging (`ENG-EXPERT-STREAM`, READY); multi-GPU placement across two devices ([#147](https://github.com/mudler/vllm.cpp/issues/147) / `BACKEND-DISTRIBUTED-TP`, ACTIVE); EPLB; phase-aware placement that splits prefill and decode across devices (recorded as a surpass hypothesis under Surpass hypothesis, not built here) |
 | Supported modes | Absent (default — unchanged single-device engine, byte-identical); `overrides` (the general pattern→device form, our `-ot`); `cpu_moe` (all routed experts on CPU, our `-cmoe`); `n_cpu_moe: N` (first N layers' experts on CPU, our `-ncmoe`); `fit` (resolver places by measured free device memory, our `--fit`). All four live under `--offload-config`'s `vllm_cpp` key — see `## Configuration surface` |
@@ -753,7 +754,7 @@ lands.
 **Still owed, unchanged by this pass:** the SPEED axis. GB10 is unified memory,
 so CPU and GPU memory are the same silicon and a placement's throughput benefit
 cannot be measured there at all. That needs a discrete CPU/GPU rig
-([#149](https://github.com/mudler/vllm.cpp/issues/149)). This gate establishes
+([#3013](https://github.com/mudler/vllm.cpp/issues/3013)). This gate establishes
 CORRECTNESS only.
 
 ### W3g — the seam assumed bf16, and the placed branch is untestable on CPU ([#2383](https://github.com/mudler/vllm.cpp/issues/2383))
@@ -786,9 +787,83 @@ half, in its OWN binary because `VT_PLACEMENT_DUMP_MOE` latches on first use and
 to "unset" and the suite would pass while asserting nothing. Mutation-proven at
 1 case / 4 assertions on a mutant that compiles at rc=0.
 
-**Owed:** the placed branch itself, still untested on CPU. Closing it needs a
-loopback placement target or a GPU-gated test. Named rather than assumed
-covered.
+**Owed — CLOSED by W3i.** This said the placed branch was untested on CPU and
+that closing it needed "a loopback placement target or a GPU-gated test". The
+first half was true; the second was a false dichotomy. The loopback belongs on
+the ENGINE, not on the placement target, and `test_placed_moe_roundtrip.cpp` now
+executes the branch on a CPU-only build. The paragraph above still states the
+reason nothing caught the truncation at the time, which remains accurate history.
+
+### W3i — the placed branch IS reachable on a CPU-only build ([#2714](https://github.com/mudler/vllm.cpp/issues/2714))
+
+Three places in this spec, and issue #2714 itself, record the same conclusion:
+the placed branch needs a GPU or a Vulkan/lavapipe build, because the CPU is the
+only legal placement TARGET and a CPU engine therefore always short-circuits.
+**The conclusion is wrong, and it was wrong when it was written.**
+
+`PlacementQueue` constrains the DESTINATION. It says nothing about the engine,
+and `RunMoePlaced` reads the engine device from `engine.q.device.type` — a field
+on a `vt::Queue` the caller supplies. So the branch fires whenever the engine
+identifies as anything other than the CPU. It does not need the engine to BE a
+GPU; it needs the engine to be a different registered device.
+
+That is a thing this repository already builds, in five files, with a comment in
+`test_device_pool.cpp:476` naming `kXPU` as "the type with no `RegisterPlatform`
+call anywhere in the tree":
+
+    tests/vllm/entrypoints/test_device_selection.cpp:72
+    tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp:150
+    tests/vllm/model_executor/test_expert_stream_device_slot.cpp:141
+    tests/vllm/model_executor/test_resident_weight_f32_copy_retires.cpp:152
+    tests/vllm/model_executor/test_resident_weight_host_addressable.cpp:142
+
+So the engine is a **loopback backend** registered on `kXPU`: a distinct device
+identity whose `Alloc`, `Copy`, `Memset` and `Synchronize` delegate to the real
+CPU backend. Placement stays `kCPU`. `placed_on != engine_device`, and every line
+of the round trip executes — the down copy sized by `dh.dtype`, the block on the
+placement queue, the up copy sized by the OUTPUT dtype, the dump hook, and the
+hand-back into an engine-pool `DBuf`.
+
+**What this proves and what it does not.** Because both sides are host memory,
+the two arms are comparable BYTE-FOR-BYTE rather than within a tolerance, which
+is the right bar: placement is a scheduling decision and must never change a
+value. It does not prove that a real PCIe or NVLink transfer works — the W3h GB10
+run at NMSE 5.239e-06 is that evidence, and the two are complements. What it adds
+is the half W3h cannot give: a gate that runs on every merge, on every CI tier,
+with no GPU and no checkpoint.
+
+**Why it matters more than a restored test.** W3g's f32 truncation shipped, was
+merged, and was reviewed, because no reviewer could execute the branch. The
+mutation `reachability.md` asks for is now runnable here: hardcode `kBF16` back
+into the seam's six sites and this suite reds.
+
+**Mutation evidence.** 5 cases / 28 assertions green on `d023e3357`. Every
+claimed guarantee was mutated in the seam header, and **each mutant compiled at
+`rc=0` before its result was believed** — a mutant that fails to build reads as a
+passing test, and this tree has been fooled by that before.
+
+| Mutation | Result | The assertion that caught it |
+|---|---|---|
+| `dt = kBF16` instead of `dh.dtype` (the #2383 defect verbatim) | 2 cases / 3 assertions RED | `copies[0]`: `32 == 64` — half the bytes |
+| `placed_on = engine_device` (never cross; the pre-#2382 state) | 4 cases / 4 assertions RED | `copies.size()`: `1 == 2`, and the round trip throws |
+| `out_dt = dt` instead of the body's output dtype | 1 case / 2 assertions RED | `copies[1]`: `64 == 32` — twice the bytes out |
+| `if (false && ... !placeable)` (drop the fp4 refusal) | 1 case / 2 assertions RED | `CHECK_THROWS_AS ... did NOT throw at all` |
+
+The header was restored byte-for-byte after each (`git status` clean, sha256
+`bee99638a9c6`), rebuilt, and re-run green.
+
+**The second mutation exposed a structural property worth keeping.** With the
+crossing removed, the round-trip case does not merely disagree — it THROWS, with
+`no kernel for op Matmul on device xpu`. The loopback backend deliberately
+carries transfers and allocation but no kernels, so a version of this test that
+silently fell back into the short circuit cannot quietly pass. The failure mode
+this file exists to prevent is structurally unavailable to it.
+
+`tests/vllm/model_executor/test_placed_moe_roundtrip.cpp` restores the name
+`6416aab85` deleted, on the mechanism the old one lacked. The old file forced the
+round trip by passing `kCPU` as an explicit placement argument to
+`RunMoeBlockPlaced`, a parameter the shared seam does not have; this one crosses
+a real device boundary instead of asking for one.
 
 ## Risks and decisions
 
@@ -832,8 +907,9 @@ renumbers `## Work breakdown` so the hardware-independent waves come first. The
 pull request shape for this row is **separate spec and implementation**
 (developer, 2026-08-26, recorded at row claim).
 
-Next action is W1, the `placement` config surface under `vllm_cpp`. It needs no
-GPU and no checkpoint.
+Next action was W1 when this was written; W1 through W4 have since landed, and
+W3i closed the last gate that did not need hardware. What remains needs a
+discrete GPU, as the paragraph below says.
 
 **Two waves are hard-blocked and neither is waived.** W5 (the speed floor against
 `-ncmoe`) and W0 (the bandwidth and round-trip measurements) both need a
@@ -843,11 +919,25 @@ community test rigs offered, and [#147](https://github.com/mudler/vllm.cpp/issue
 records the same offer; that is the path to unblocking, and until it opens the
 bandwidth table stays an assumption that no gate may cite.
 
-Issue [#149](https://github.com/mudler/vllm.cpp/issues/149) is the campaign issue
-and stays OPEN — this row covers only its CPU-MoE half. The dense layer-offload
-half belongs to `ENG-WEIGHT-OFFLOAD` (`ACTIVE`, config-only, refuses at startup)
-and the multi-GPU half to #147 / `BACKEND-DISTRIBUTED-TP` (`ACTIVE`); #149 closes
-when all three have landed, not when this one does.
+**The campaign issue this paragraph described is gone.** It said #149 "stays
+OPEN" and closes when three halves land — the CPU-MoE half here, the dense
+layer-offload half under `ENG-WEIGHT-OFFLOAD`, and the multi-GPU half under #147 /
+`BACKEND-DISTRIBUTED-TP`. #149 and #147 both now return 404 to an unauthenticated
+reader, against a live control that returns 200, so neither is a tracker any more
+and the three-way close condition has no owner.
+
+The split itself is still the right description of the work, and the two sibling
+rows are unaffected — only the issue that joined them is missing.
+[#3013](https://github.com/mudler/vllm.cpp/issues/3013) replaces #149 for THIS
+row's blocked waves and claims nothing about the other two; whoever owns
+`ENG-WEIGHT-OFFLOAD` and `BACKEND-DISTRIBUTED-TP` decides whether their halves
+need a tracker of their own.
+
+Five other files still cite #149 — `weight-offload-uva.md`, `engine-matrix.md`,
+`roadmap_v1.md`, `docs/ENVIRONMENT.md` and the archived
+`completed/issue-index.md`. They are deliberately NOT swept here: three are keyed
+record surfaces or other rows' specs, and one is an archive that must keep its
+provenance. Repointing them belongs to their owners.
 
 ## W4/W3 outcome — the device gate RAN, and both arms are within the bar
 
@@ -911,7 +1001,7 @@ nothing moved. The gate now refuses that case by name.
 
 
 - W5, the speed floor against llama.cpp `-ncmoe` at `b10451`. Blocked on a
-  discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
+  discrete-GPU rig, tracked by [#3013](https://github.com/mudler/vllm.cpp/issues/3013).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
   bandwidth table currently assumes. Same blocker, same issue.
 - **Placement reaches FIVE architectures, and the earlier entry here undercounted
@@ -939,20 +1029,20 @@ nothing moved. The gate now refuses that case by name.
   which was calling a symbol that no longer existed and had stopped `main`
   building.
 
-  **So there is no byte-for-byte gate on the placement round trip at all**, and
-  the reason it cannot simply be rewritten is structural rather than
-  circumstantial. `RunMoePlaced` short-circuits when the placement device equals
-  the engine device -- `if (placed_on == engine_device) return body(engine, dh);`,
-  no copy and no allocation -- so the transfer is reachable ONLY cross-device.
-  The deleted test had reached it by passing `kCPU` as the placement device
-  explicitly, which the seam no longer accepts. The gate is recorded under
-  `## Owed` in [expert-stream-device-slots.md](expert-stream-device-slots.md).
+  **CLOSED by W3i (#2714).** Both halves above are history and stay as written.
+  What followed them was an error worth keeping visible: this bullet concluded
+  the gate "cannot simply be rewritten" for a "structural" reason, and the
+  structure it named is real but does not have that consequence. The seam does
+  short-circuit when the placement device equals the engine device, and the
+  transfer IS reachable only cross-device -- so the fix is to move the ENGINE,
+  which needs no GPU. `test_placed_moe_roundtrip.cpp` does that with a loopback
+  backend on `kXPU`, and the round trip is byte-for-byte gated again on every CI
+  tier.
 
-  The `RunMoeLayer` branch that SELECTS the placement cannot be entered by any
-  test here either, for the same reason: it needs the engine device and the
-  placement device to differ. That is the Vulkan gate this row owes -- a Vulkan
-  engine with the routed experts on the CPU, token-exact against the same model
-  run wholly on the CPU -- and it now covers the transfer as well as the branch.
+  The selection branch is entered by the same test, for the same reason: it
+  needed the engine device and the placement device to differ, and a loopback
+  engine makes them differ. The Vulkan gate this row used to owe was never the
+  only way to get there.
 - ~~**W3a's `MoePlacementPlan` lands UNREACHED**~~ — CLOSED by W3b, which reads
   the plan in `RunMoeLayer`.
 - **W3a's `MoePlacementPlan` lands UNREACHED**, declared here as

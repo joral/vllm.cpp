@@ -25,6 +25,18 @@ void GatherMlaCacheKernelRocm(Queue& q, Tensor& dst, const Tensor& src_cache,
                               const Tensor& block_table, const Tensor& cu_seq_lens,
                               const Tensor& token_to_seq, const Tensor* seq_starts,
                               int64_t num_tokens);
+// The two attention ops GLM-5.3 non-flash reaches and, before rocm_mla_attn.hip,
+// REFUSED on gfx1151 (#2926): the reference tier is withdrawn on a part that
+// reports PageableMemoryAccess = 0 (docs/ROCM.md:83-85), so an unregistered op
+// is a refusal and not a slow path.
+void MlaPrefillAttentionKernelRocm(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
+                                   const Tensor& key, const Tensor& value,
+                                   const Tensor& cu_seqlens_q, const Tensor& cu_seqlens_k,
+                                   const MlaPrefillAttentionArgs& args);
+void MlaDecodeAttentionKernelRocm(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
+                                  const Tensor& kv_cache, const Tensor& block_table,
+                                  const Tensor& seq_lens,
+                                  const MlaDecodeAttentionArgs& args);
 void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
                                const RopeArgs& args);
 void GreedyArgmaxKernelRocm(Queue& q, Tensor& out, const Tensor& logits);
@@ -84,6 +96,12 @@ void MoeCombineGateKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
 void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
                                     const Tensor& weight, const Tensor& expert_ids);
+// The fused MoE gate+up+clamped-SwiGLU grouped GEMM (rocm_moe_gate_up_swiglu.hip).
+// GLM-5.3-Flash reads this and kMatmulBTQuantGrouped through `vt::OpRegistered`
+// before it takes a device queue (glm5_next_forward.cpp:307-311, #2942).
+void MoeGateUpSwiGLUGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& gate_w, const Tensor& up_w,
+                                      const Tensor& expert_ids, float limit);
 // BACKEND-ROCM-GDN-KERNELS family 1 (rocm_gdn_state.hip): the indexed state I/O
 // pair `IndexedGdnOpsNative()` requires (issue #41, spec rocm-gdn-kernels.md).
 void GdnStateGatherKernelRocm(Queue& q, Tensor& working, const Tensor& cache,
@@ -243,6 +261,9 @@ struct Registrar {
     RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<MatmulBTQuantGroupedFn>(&MatmulBTQuantGroupedKernelRocm)));
+    RegisterOp(OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGateUpSwiGLUGroupedFn>(
+                   &MoeGateUpSwiGLUGroupedKernelRocm)));
     RegisterOp(OpId::kGdnStateGather, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<GdnStateGatherFn>(&GdnStateGatherKernelRocm)));
@@ -280,9 +301,8 @@ struct Registrar {
     // resolved to NO native ROCm kernel: the portable CPU reference tier where
     // it is eligible (which docs/ROCM.md:60-61 disqualifies a performance result
     // on) and a REFUSAL where #2511 withdrew it — see rocm_mla_ops.hip's header.
-    // The remaining three gating ops (kDsaIndexerLogits, kDsaTopkSelect,
-    // kMlaDecodeAttention) are still absent, so the GLM-5.3 speed axis stays
-    // VOID after this wave.
+    // The DSA indexer pair (kDsaIndexerLogits, kDsaTopkSelect) is still absent,
+    // so the GLM-5.3 speed axis stays VOID and a SPARSE step still refuses.
     RegisterOp(OpId::kBatchedMatmul, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<BatchedMatmulFn>(&BatchedMatmulKernelRocm)));
@@ -295,6 +315,17 @@ struct Registrar {
     RegisterOp(OpId::kGatherMlaCache, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<GatherMlaCacheFn>(&GatherMlaCacheKernelRocm)));
+    // #2926. Before these two lines GLM-5.3 non-flash could not emit a token on
+    // gfx1151 at all: `GetOp` refused `kMlaPrefillAttention` on the first
+    // (prefill) forward and `kMlaDecodeAttention` on every step after it, and
+    // the portable reference tier that used to absorb them is withdrawn on this
+    // part. Spec `.agents/specs/rocm-mla-attention-nonflash.md`.
+    RegisterOp(OpId::kMlaPrefillAttention, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<MlaPrefillAttentionFn>(&MlaPrefillAttentionKernelRocm)));
+    RegisterOp(OpId::kMlaDecodeAttention, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<MlaDecodeAttentionFn>(&MlaDecodeAttentionKernelRocm)));
   }
 } registrar;
 

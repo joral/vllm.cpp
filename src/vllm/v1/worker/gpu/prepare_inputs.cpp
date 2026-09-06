@@ -408,6 +408,183 @@ std::vector<int32_t> combine_sampled_and_draft_tokens(
   return logits_indices;
 }
 
+// SPEC-DFLASH2 A2-3 (#2911). The async placeholder fill's per-request rule; see
+// prepare_inputs.h for what it reads, why the count comes from the placeholders
+// rather than from the stride, and why each refusal is a refusal.
+//
+// The row arithmetic is `combine_sampled_and_draft_tokens`' own, deliberately:
+// both read the same buffer for the same request, and the whole point of A2-3 is
+// that the fill and the scatter can no longer disagree about what was drafted.
+std::vector<int32_t> FillDraftsForRow(const std::vector<int32_t>& draft_tokens,
+                                      int draft_tokens_stride, int req_state_idx,
+                                      int num_valid, int num_placeholders,
+                                      const std::string& req_id) {
+  // The non-speculative path and every plain decode row on a mixed step. Nothing
+  // to fill, nothing to substantiate, and no refusal to make.
+  if (num_placeholders <= 0) return {};
+
+  VT_CHECK(req_state_idx >= 0,
+           "async draft fill: request '" + req_id +
+               "' has no req_state slot, so its drafts cannot be located");
+  VT_CHECK(draft_tokens_stride > 0,
+           "async draft fill: request '" + req_id + "' was scheduled " +
+               std::to_string(num_placeholders) +
+               " draft placeholders on a runner with no draft buffer "
+               "(num_speculative_steps == 0)");
+  // THE COUNT half, and only that half. The pre-A2-3 fill made ONE refusal that
+  // did two jobs, because it read `pending_drafts_`: it asked whether a propose
+  // had run for this request at all (freshness, since `take_draft_token_ids`
+  // moves that object out) and, implicitly, what it wrote. This function can only
+  // answer the second: `draft_tokens` and `num_valid_draft_tokens` survive the
+  // out-of-band pull by design, so a stale row and a fresh one are indistinguishable
+  // here. FRESHNESS IS THE CALLER'S, asserted in `GPUModelRunner::execute_model`
+  // against `ProposedDraftLedger` BEFORE this is called, and it keeps the pre-A2-3
+  // wording. Do not read the check below as covering it.
+  VT_CHECK(num_valid >= num_placeholders,
+           "async draft fill: request '" + req_id + "' proposed " +
+               std::to_string(num_valid) +
+               " drafts but the scheduler placed " +
+               std::to_string(num_placeholders) + " placeholders");
+  // THE BOUND THE CUDA SCATTER DOES NOT HAVE. See the header: the buffer is
+  // sized by the req_state POOL so this cannot fire, and it fires loudly rather
+  // than reading past the allocation if it ever is not.
+  const size_t row = static_cast<size_t>(req_state_idx) *
+                     static_cast<size_t>(draft_tokens_stride);
+  VT_CHECK(row + static_cast<size_t>(num_placeholders) <= draft_tokens.size(),
+           "async draft fill: the draft buffer holds no row for request '" +
+               req_id + "' at req_state slot " + std::to_string(req_state_idx) +
+               " (buffer is sized by the req_state pool, so a miss here means it "
+               "was sized by num_reqs instead)");
+
+  // The count is the PLACEHOLDER count, never the stride: the stride is the
+  // speculator's max draft length and pads every shorter row, so filling from it
+  // would write the pad over a position the scheduler never reserved.
+  return std::vector<int32_t>(
+      draft_tokens.begin() + static_cast<std::ptrdiff_t>(row),
+      draft_tokens.begin() + static_cast<std::ptrdiff_t>(row) +
+          static_cast<std::ptrdiff_t>(num_placeholders));
+}
+
+// SPEC-DFLASH2 A2-3 REPAIR (#2911): the producer's row rule. See the header for
+// why the payload and the count are one function — deleting the payload write
+// from the runner's own loop left every target in this row green, because verify
+// is lossless and a zeroed draft costs acceptance and nothing else.
+void WriteDraftRow(std::vector<int32_t>& draft_tokens,
+                   std::vector<int32_t>& num_valid_draft_tokens,
+                   int draft_tokens_stride, int req_state_idx,
+                   const std::vector<int32_t>& row, const std::string& req_id) {
+  VT_CHECK(draft_tokens_stride > 0,
+           "set_draft_tokens: request '" + req_id +
+               "' has drafts to store on a runner with no draft buffer "
+               "(num_speculative_steps == 0)");
+  VT_CHECK(req_state_idx >= 0,
+           "set_draft_tokens: request '" + req_id +
+               "' has no req_state slot, so its drafts cannot be stored");
+  // A row longer than the stride is the speculator contradicting the k the
+  // buffer was sized from, which would silently truncate a draft here and
+  // silently truncate a different number of them in the combine. Refuse.
+  VT_CHECK(static_cast<int>(row.size()) <= draft_tokens_stride,
+           "set_draft_tokens: request '" + req_id + "' proposed " +
+               std::to_string(row.size()) +
+               " drafts but the draft buffer's row holds " +
+               std::to_string(draft_tokens_stride) +
+               " (num_speculative_steps disagrees with the speculator)");
+  const std::size_t base = static_cast<std::size_t>(req_state_idx) *
+                           static_cast<std::size_t>(draft_tokens_stride);
+  VT_CHECK(base + static_cast<std::size_t>(draft_tokens_stride) <=
+               draft_tokens.size(),
+           "set_draft_tokens: the draft buffer holds no row for req_state slot " +
+               std::to_string(req_state_idx) + " (request '" + req_id +
+               "'); it must be sized by the req_state pool, not by num_reqs");
+  VT_CHECK(static_cast<std::size_t>(req_state_idx) <
+               num_valid_draft_tokens.size(),
+           "set_draft_tokens: no valid-count entry for req_state slot " +
+               std::to_string(req_state_idx) + " (request '" + req_id +
+               "'); the count array must cover the req_state pool too");
+  // THE PAYLOAD. Padded to the stride, not left short: the pad is never read
+  // (both readers take their count from num_valid_draft_tokens or from the
+  // scheduler's placeholder count), and zeroing it keeps a previous occupant's
+  // tail out of a dump or a debugger.
+  for (int c = 0; c < draft_tokens_stride; ++c) {
+    draft_tokens[base + static_cast<std::size_t>(c)] =
+        c < static_cast<int>(row.size()) ? row[static_cast<std::size_t>(c)] : 0;
+  }
+  // THE COUNT, which decides how much of the row above is real. Neither reader
+  // is correct without both writes, which is why one function makes them.
+  num_valid_draft_tokens[static_cast<std::size_t>(req_state_idx)] =
+      static_cast<int32_t>(row.size());
+}
+
+// SPEC-DFLASH2 A2-3 REPAIR (#2911): the fill's freshness rule. See the header
+// for what it restores and why `FillDraftsForRow` cannot answer it.
+void ProposedDraftLedger::Record(const std::vector<std::string>& req_ids) {
+  // ASSIGN, never merge: an earlier propose's requests are no longer fresh, and
+  // merging would let a request that stopped being proposed for keep passing.
+  req_ids_.clear();
+  for (const std::string& rid : req_ids) req_ids_.insert(rid);
+}
+
+void ProposedDraftLedger::Clear() { req_ids_.clear(); }
+
+bool ProposedDraftLedger::IsFresh(const std::string& req_id) const {
+  return req_ids_.count(req_id) != 0;
+}
+
+void ProposedDraftLedger::Consume() { req_ids_.clear(); }
+
+// SPEC-DFLASH2 A2-3 REPAIR ROUND 3 (#2911): the whole STEP, so the consume
+// cannot be conditional on the fill. See the header for the two-steps-old state
+// the per-fill placement left representable and for why no suite could tell the
+// placements apart while the consume lived at the call site.
+std::map<std::string, std::vector<int32_t>> FillDraftsForStep(
+    ProposedDraftLedger& ledger,
+    const std::map<std::string, std::vector<int32_t>>& scheduled_spec_tokens,
+    const std::vector<int32_t>& draft_tokens, int draft_tokens_stride,
+    const std::unordered_map<std::string, int>& req_id_to_index,
+    const std::vector<int32_t>& num_valid_draft_tokens) {
+  std::map<std::string, std::vector<int32_t>> filled;
+  for (const auto& [req_id, placeholders] : scheduled_spec_tokens) {
+    // FRESHNESS FIRST. Placeholders are only ever assigned to requests this
+    // runner sampled AND proposed for on the previous step. This is the
+    // pre-A2-3 refusal, message and all: before A2-3 it asked `pending_drafts_`,
+    // which `take_draft_token_ids` MOVES OUT, so it meant "a propose ran for
+    // this request since the last fill". Neither `draft_tokens` nor
+    // `num_valid_draft_tokens` can answer it — both are persistent and survive
+    // the pull by design — so a step that skipped its propose would otherwise
+    // splice the PREVIOUS verify step's drafts into this step's placeholders,
+    // silently, because verify is lossless.
+    VT_CHECK(ledger.IsFresh(req_id),
+             "async draft fill: no drafts proposed for request '" + req_id +
+                 "' (placeholders scheduled without a matching propose)");
+    // Separately: a request the fill cannot locate has no req_state row to read,
+    // and embedding a -1 is not an option.
+    const auto slot_it = req_id_to_index.find(req_id);
+    VT_CHECK(slot_it != req_id_to_index.end(),
+             "async draft fill: request '" + req_id +
+                 "' has drafts but no row in the persistent batch, so they "
+                 "cannot be located");
+    const int slot = slot_it->second;
+    VT_CHECK(slot >= 0 &&
+                 static_cast<std::size_t>(slot) < num_valid_draft_tokens.size(),
+             "async draft fill: request '" + req_id + "' maps to req_state slot " +
+                 std::to_string(slot) +
+                 ", which has no valid-count entry (the count array must cover "
+                 "the req_state pool)");
+    filled[req_id] = FillDraftsForRow(
+        draft_tokens, draft_tokens_stride, slot,
+        num_valid_draft_tokens[static_cast<std::size_t>(slot)],
+        static_cast<int>(placeholders.size()), req_id);
+  }
+  // CONSUMED ON THE STEP, exactly as `take_draft_token_ids` consumes
+  // `pending_drafts_` on every deferred-batch step (core_proc.cpp:234) rather
+  // than only on the steps that had placeholders. Outside the loop AND outside
+  // any emptiness test: a step that filled nothing has still used up the last
+  // propose, and leaving it recorded is how a propose two steps old reaches a
+  // later fill. This is what makes the refusal above a freshness test.
+  ledger.Consume();
+  return filled;
+}
+
 // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710). The OR over the batch of the row
 // predicate the combine applies, and nothing else: see the header for why this
 // may not become a per-request answer.
@@ -438,6 +615,52 @@ bool AnyRowSplicedByCombine(const std::vector<int32_t>& seq_lens,
     }
   }
   return false;
+}
+
+// SPEC-DFLASH2 A2-4 (#3004). See the header for what this replaces and why the
+// rule is stated once over arrays instead of looped at the call site.
+void ApplyCommittedIdsForPropose(const int64_t* committed_ids, int num_reqs,
+                                 const std::vector<uint8_t>& discard,
+                                 const std::vector<int32_t>& num_tokens_no_spec,
+                                 int max_model_len,
+                                 std::vector<int32_t>* last_sampled_tokens,
+                                 std::vector<int32_t>* token_ids_cpu) {
+  if (num_reqs <= 0) return;
+  VT_CHECK(committed_ids != nullptr,
+           "ApplyCommittedIdsForPropose: the propose was handed no committed "
+           "ids — the write-back branch did not materialize them (row "
+           "SPEC-DFLASH2, #3004)");
+  VT_CHECK(last_sampled_tokens != nullptr && token_ids_cpu != nullptr,
+           "ApplyCommittedIdsForPropose: null destination array");
+  VT_CHECK(max_model_len > 0,
+           "ApplyCommittedIdsForPropose: max_model_len must be positive");
+  const size_t nr = static_cast<size_t>(num_reqs);
+  VT_CHECK(last_sampled_tokens->size() >= nr && num_tokens_no_spec.size() >= nr,
+           "ApplyCommittedIdsForPropose: a per-slot array is shorter than the "
+           "step's request count");
+  for (int i = 0; i < num_reqs; ++i) {
+    const size_t s = static_cast<size_t>(i);
+    // A still-prefilling row produced no output token this step: its write-back
+    // was skipped and its counter was not advanced. Leave BOTH arrays alone.
+    if (s < discard.size() && discard[s] != 0) continue;
+    const int n = num_tokens_no_spec[s];
+    VT_CHECK(n > 0,
+             "ApplyCommittedIdsForPropose: request row " + std::to_string(i) +
+                 " committed a token this step but its num_tokens_no_spec is " +
+                 std::to_string(n) +
+                 " — the write-back and the counter disagree about what this "
+                 "step committed");
+    const size_t idx = s * static_cast<size_t>(max_model_len) +
+                       static_cast<size_t>(n - 1);
+    VT_CHECK(n <= max_model_len && idx < token_ids_cpu->size(),
+             "ApplyCommittedIdsForPropose: request row " + std::to_string(i) +
+                 " writes its committed token at column " +
+                 std::to_string(n - 1) + " of a row " +
+                 std::to_string(max_model_len) + " wide — out of range");
+    const int32_t id = static_cast<int32_t>(committed_ids[s]);
+    (*last_sampled_tokens)[s] = id;
+    (*token_ids_cpu)[idx] = id;
+  }
 }
 
 }  // namespace vllm::v1

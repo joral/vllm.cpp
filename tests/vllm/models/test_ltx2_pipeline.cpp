@@ -46,12 +46,16 @@
 // scripts/gen-ltx2-pipeline-goldens.py and edited by several concurrent rows of
 // this campaign, and a per-row file is the shape `AGENTS.md ## Records` asks for.
 #include "ltx2_res2s_goldens.inc"
+// Row LTX25-DURATION-HEAD-WIRE (#2900), in its own file for the same reason:
+// one file per row is the shape `AGENTS.md ## Records` asks for.
+#include "ltx2_duration_wire_goldens.inc"
 
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_samplers.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_duration_head.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
+#include "vt/dtype.h"
 
 namespace {
 
@@ -5495,4 +5499,517 @@ TEST_CASE("ltx2 checkpoint class: the refusal accepts exactly the upstream combi
     // The adapter is what flips it, and nothing else: same recipe, same class.
     CHECK(vllm::Ltx2CheckpointClassRefusal(either, "retake", "full", true).empty());
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 10 — THE DURATION HEAD'S DRIVER (row LTX25-DURATION-HEAD-WIRE, #2900)
+//
+// Section 9 above gates the head's forward. This section gates everything
+// upstream wraps around it to turn a predicted duration into the frame count a
+// render uses: `snap_frames_to_grid`, `seconds_to_clamped_num_frames` and
+// `DurationPredictor.__call__`. Every value comes from
+// `ltx2_duration_wire_goldens.inc`, which EXECUTES those three at the pin.
+//
+// EACH CASE CARRIES THE REJECTED RULE BESIDE UPSTREAM'S ANSWER, and the
+// separating counters are asserted non-zero. A single-hypothesis check cannot
+// see an error that lands equidistant from the right rule and a wrong one, and
+// a fixture that quietly stopped discriminating would read as a pass.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("ltx2 duration driver: the frame grid, the clamp order and the head, vs upstream") {
+  SUBCASE("snap_frames_to_grid floors to 8k + 1") {
+    // The FLOOR, against a ceiling to the same grid. The two agree on every
+    // input that is already a grid point, so the count of cases where they part
+    // is asserted rather than assumed.
+    int separating = 0;
+    for (const vllm_test::Ltx2SnapCase& c : vllm_test::kLtx2SnapCases) {
+      INFO("frames = " << c.frames);
+      CHECK(vllm::Ltx2SnapFramesToGrid(c.frames, 8) == c.expected);
+      if (c.expected != c.rejected_ceil) ++separating;
+    }
+    CHECK(separating == vllm_test::kLtx2SnapSeparatingCases);
+    CHECK(separating > 0);
+  }
+
+  SUBCASE("snap_frames_to_grid refuses a count below 1") {
+    // Upstream raises (helpers.py:560-561) rather than returning a degenerate
+    // count, and that guard is also what keeps C++'s truncating division
+    // agreeing with Python's flooring `//`.
+    CHECK_THROWS_AS(vllm::Ltx2SnapFramesToGrid(0, 8), std::runtime_error);
+    CHECK_THROWS_AS(vllm::Ltx2SnapFramesToGrid(-7, 8), std::runtime_error);
+  }
+
+  SUBCASE("seconds_to_clamped_num_frames, against its four nearest wrong rules") {
+    int sep_snap_first = 0, sep_no_repair = 0, sep_truncate = 0, sep_half_away = 0;
+    for (const vllm_test::Ltx2ClampCase& c : vllm_test::kLtx2ClampCases) {
+      INFO("seconds = " << c.seconds << " fps = " << c.frame_rate << " window = [" << c.min_frames
+                        << ", " << c.max_frames << "]");
+      const int64_t got = vllm::Ltx2SecondsToClampedNumFrames(c.seconds, c.frame_rate,
+                                                              c.min_frames, c.max_frames, 8);
+      CHECK(got == c.expected);
+      if (c.expected != c.rejected_snap_first) ++sep_snap_first;
+      if (c.expected != c.rejected_no_repair) ++sep_no_repair;
+      if (c.expected != c.rejected_truncate) ++sep_truncate;
+      if (c.expected != c.rejected_half_away) ++sep_half_away;
+    }
+    // THE DISCRIMINATION, asserted rather than hoped for. Each counter is what
+    // the generator measured against upstream; a table that stopped separating a
+    // rule fails here instead of passing quietly.
+    CHECK(sep_snap_first == vllm_test::kLtx2ClampSeparatingSnapFirst);
+    CHECK(sep_no_repair == vllm_test::kLtx2ClampSeparatingNoRepair);
+    CHECK(sep_truncate == vllm_test::kLtx2ClampSeparatingTruncate);
+    CHECK(sep_half_away == vllm_test::kLtx2ClampSeparatingHalfAway);
+    CHECK(sep_snap_first > 0);
+    CHECK(sep_no_repair > 0);
+    CHECK(sep_truncate > 0);
+    // The one a port reaching for `std::llround` gets wrong. 0.34 s at 25 fps is
+    // exactly 8.5: upstream takes the even 8 and returns frame 1, `llround`
+    // takes 9 and returns frame 9.
+    CHECK(sep_half_away > 0);
+  }
+
+  SUBCASE("a min_frames below 1 is upstream's to serve, and its zero is upstream's to RAISE") {
+    // EXECUTED AT THE PIN, not read off `helpers.py`. `AutoDurationAction`
+    // (utils/args.py:117-122) refuses `min > max` and NOTHING else, so
+    // `AutoDuration(min_seconds=0.0, max_seconds=20.0)` constructs, and
+    //
+    //   seconds_to_clamped_num_frames(3.0, frame_rate=25.0,
+    //                                 min_frames=0, max_frames=500) == 73
+    //
+    // is what upstream returns for it. This port refused that request by name,
+    // which made `--auto-duration 0 20` -- a working upstream invocation -- an
+    // error here.
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(3.0, 25.0, 0, 500, 8) == 73);
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(1.0, 25.0, 0, 500, 8) == 25);
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(30.0, 25.0, 0, 500, 8) == 497);
+    // And the raise is upstream's too, from `snap_frames_to_grid` rather than
+    // from a bound check: at the pin,
+    //
+    //   seconds_to_clamped_num_frames(0.005, frame_rate=25.0,
+    //                                 min_frames=0, max_frames=500)
+    //     -> ValueError: frames must be >= 1, got 0
+    //
+    // A port that floors `min_frames` to 1 returns 1 instead, which is a
+    // one-frame render where upstream refuses. THAT is the direction this pair
+    // gates: the acceptance above and the refusal below have to move together,
+    // because accepting the bound without honouring the raise is the silent half.
+    CHECK_THROWS(
+        (void)vllm::Ltx2SecondsToClampedNumFrames(0.005, 25.0, 0, 500, 8));
+    // The same seconds WITH upstream's default bound is 1 rather than a raise,
+    // so the case above cannot pass by refusing everything.
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(0.005, 25.0, 1, 500, 8) == 1);
+  }
+
+  SUBCASE("the window is honoured over the grid when both cannot hold") {
+    // min == max == 5 returns 5, which is NOT on the 8k+1 grid. That is upstream
+    // (helpers.py:581-584 takes `min` with `max_frames` after ceiling back onto
+    // the grid), and it is the case an implementation that trusted the grid
+    // unconditionally gets wrong.
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(0.01, 25.0, 5, 5, 8) == 5);
+  }
+
+  SUBCASE("DurationPredictor.__call__ end to end") {
+    // The SAME synthetic head the generator built, from the same closed form, so
+    // a disagreement here is the driver rather than the weights.
+    vllm::Ltx2DurationHeadConfig cfg;
+    cfg.prefix = "";
+    vllm::Ltx2VaeWeights weights;
+    int slot = 0;
+    for (const vllm::Ltx2DurationHeadTensorSpec& spec :
+         vllm::EnumerateLtx2DurationHeadTensors(cfg)) {
+      int64_t numel = 1;
+      for (const int64_t d : spec.shape) numel *= d;
+      std::vector<float> values(static_cast<size_t>(numel));
+      for (int64_t i = 0; i < numel; ++i) {
+        values[static_cast<size_t>(i)] = static_cast<float>(
+            std::sin(static_cast<double>(i) * 0.7391 + static_cast<double>(slot) * 1.13) * 0.2);
+      }
+      weights.tensors[spec.name] = std::move(values);
+      ++slot;
+    }
+    for (const vllm_test::Ltx2PredictCase& c : vllm_test::kLtx2PredictCases) {
+      INFO("video_tokens = " << c.video_tokens << " audio_tokens = " << c.audio_tokens
+                             << " fps = " << c.frame_rate);
+      std::vector<float> video(static_cast<size_t>(c.video_tokens * cfg.video_cross_attention_dim));
+      for (size_t i = 0; i < video.size(); ++i) {
+        video[i] = static_cast<float>(std::sin(static_cast<double>(i) * 0.013) * 0.5);
+      }
+      std::vector<float> audio(static_cast<size_t>(c.audio_tokens * cfg.audio_cross_attention_dim));
+      for (size_t i = 0; i < audio.size(); ++i) {
+        audio[i] = static_cast<float>(std::sin(static_cast<double>(i) * 0.013 + 1.7) * 0.5);
+      }
+      float seconds = 0.0F;
+      const int64_t frames = vllm::Ltx2DurationPredictFrames(
+          cfg, weights, c.video_tokens != 0 ? video.data() : nullptr, c.video_tokens,
+          c.audio_tokens != 0 ? audio.data() : nullptr, c.audio_tokens, c.frame_rate,
+          c.min_seconds, c.max_seconds, 8, &seconds);
+      // THE FRAME COUNT IS THE CONTRACT AND IT IS EXACT. It is an integer, it is
+      // what the render uses, and every case here matches upstream's to the unit
+      // -- including the clamped one, which is where the two implementations
+      // could most easily have parted.
+      CHECK(frames == c.frames);
+      // The RAW prediction rides beside it as a LOCALIZER, so a frame-count
+      // mismatch says whether the forward or the snapping moved rather than
+      // arriving as one wrong integer. Its tolerance is looser than the goldens
+      // elsewhere in this file and the reason is measured, not assumed: the
+      // default config projects from 4096 and 2048 channels, so the two
+      // implementations accumulate a 4096-long f32 dot product in different
+      // orders, and the head then EXPONENTIATES the result -- which turns an
+      // absolute error in the log-duration into a relative one in seconds. The
+      // observed spread is 3.6e-5 relative, consistently signed because it is the
+      // same computation on every case. 1e-4 admits that and nothing larger: a
+      // real defect in this chain moves the value by percent, not by parts per
+      // ten thousand, and it would have to move the frame count above to hide.
+      CHECK(seconds == doctest::Approx(c.seconds).epsilon(1e-4));
+    }
+    // The table has to be able to SEE the head. Four distinct frame counts over
+    // five cases; a fixture whose head went input-insensitive would collapse
+    // these and the generator refuses to emit it, but the constant travels here
+    // so the C++ side states the same requirement.
+    CHECK(vllm_test::kLtx2PredictDistinctFrameCounts >= 3);
+  }
+
+  SUBCASE("require_num_frames_source mirrors upstream in BOTH directions") {
+    // A guard that always raised would pass a one-sided check, so both polarities
+    // are asserted -- and both were executed against upstream at generation time.
+    CHECK_THROWS_AS(vllm::Ltx2RequireNumFramesSource(true, false), std::runtime_error);
+    CHECK_NOTHROW(vllm::Ltx2RequireNumFramesSource(true, true));
+    CHECK_NOTHROW(vllm::Ltx2RequireNumFramesSource(false, false));
+    CHECK(vllm_test::kLtx2RequireNumFramesAllowsAutoWithHead);
+    CHECK(vllm_test::kLtx2RequireNumFramesAllowsExplicitWithoutHead);
+    try {
+      vllm::Ltx2RequireNumFramesSource(true, false);
+    } catch (const std::exception& e) {
+      // UPSTREAM'S OWN MESSAGE, byte for byte, so the port's refusal says what
+      // the reference's says rather than something equivalent.
+      CHECK(std::string(e.what()) == std::string(vllm_test::kLtx2RequireNumFramesMessage));
+    }
+  }
+}
+
+// ===========================================================================
+// Section 12 — THE DURATION HEAD'S bfloat16 ARM (A24 wave 6, #2955)
+// ===========================================================================
+//
+// Upstream resolves ONE pipeline dtype and it is bfloat16 (distilled.py:109),
+// handed to `DurationPredictor.from_checkpoint` at :163-165. This is gap A24's
+// eighth and last component.
+//
+// WHY THIS SECTION SWEEPS NINE FIXTURES INSTEAD OF NAMING ONE. The head returns
+// ONE bf16 scalar per batch row, through `exp`. Eight mantissa bits applied once
+// to a single number absorb almost every intermediate difference: on the shipped
+// widths at a quiet amplitude the correct chain reproduces upstream bit-exactly
+// and SO DOES EVERY WRONG RULE BUT THE LAST. Case 4 of the table is exactly that
+// fixture, kept deliberately, and it separates one rule of seven. A gate built on
+// it alone would be green under six of the seven defects it claims to detect and
+// would look exactly like a passing test.
+//
+// So coverage is counted PER RULE ACROSS FIXTURES, never per fixture, and the
+// generator refuses to emit a table where any rule reaches zero. The assertions
+// below hold that: `kLtx2DurBf16RuleCoverage` is the blast radius each mutation
+// must produce, and it was named BEFORE any mutation was run.
+
+namespace {
+
+// The generator's own closed form (`bf16_fill` / `bf16_tokens`), rebuilt here.
+// The digests asserted below are what say the two sides hold the same weights.
+float DurBf16Fill(int64_t slot, int64_t index, double amplitude) {
+  return static_cast<float>(
+      std::sin(static_cast<double>(index) * 0.7391 + static_cast<double>(slot) * 1.13) *
+      amplitude);
+}
+float DurBf16Token(int64_t index, double phase, double scale) {
+  return static_cast<float>(std::sin(static_cast<double>(index) * 0.013 + phase) * scale);
+}
+// THE FNV-1a OFFSET BASIS, spelled in hex on purpose. `DigestF32` in
+// ltx2_video.cpp seeds with 1469598103934665603, which is a digit SHORT of the
+// published basis and so is not this constant; that digest is self-consistent
+// and is left alone, but copying its literal here silently disagreed with the
+// generator and is what the first run of this case caught.
+inline constexpr uint64_t kDurBf16FnvBasis = 0xCBF29CE484222325ULL;
+uint64_t DurBf16Fnv1a(const std::vector<uint16_t>& words, uint64_t h) {
+  for (const uint16_t w : words) {
+    for (int b = 0; b < 2; ++b) {  // little-endian, matching torch's `view(uint16)`
+      h ^= static_cast<uint64_t>((w >> (8 * b)) & 0xFFu);
+      h *= 1099511628211ULL;
+    }
+  }
+  return h;
+}
+
+vllm::Ltx2DurationHeadConfig DurBf16Config(const vllm_test::Ltx2DurBf16Case& k) {
+  vllm::Ltx2DurationHeadConfig config;
+  config.video_cross_attention_dim = k.video_dim;
+  config.audio_cross_attention_dim = k.audio_dim;
+  config.pooler_hidden_dim = k.hidden;
+  config.num_queries = k.queries;
+  config.num_pooler_heads = k.heads;
+  config.mlp_hidden = k.mlp_hidden;
+  config.prefix = "";  // upstream's own bare `named_parameters()` names
+  return config;
+}
+
+// BOTH BAGS FROM THE SAME TENSOR SET, which is what makes the storage ratio a
+// measurement rather than a quoted number.
+struct DurBf16Bags {
+  vllm::Ltx2VaeWeights bf16;
+  vllm::Ltx2VaeWeights f32;
+  uint64_t weight_digest = kDurBf16FnvBasis;
+  int64_t elements = 0;
+};
+
+DurBf16Bags BuildDurBf16Bags(const vllm::Ltx2DurationHeadConfig& config, double amplitude) {
+  DurBf16Bags bags;
+  bags.bf16.dtype = vt::DType::kBF16;
+  bags.f32.dtype = vt::DType::kF32;
+  int64_t slot = 0;
+  for (const vllm::Ltx2DurationHeadTensorSpec& spec :
+       vllm::EnumerateLtx2DurationHeadTensors(config)) {
+    int64_t numel = 1;
+    for (const int64_t d : spec.shape) numel *= d;
+    std::vector<uint16_t> words(static_cast<size_t>(numel));
+    std::vector<float> wide(static_cast<size_t>(numel));
+    for (int64_t i = 0; i < numel; ++i) {
+      const float v = DurBf16Fill(slot, i, amplitude);
+      words[static_cast<size_t>(i)] = vt::F32ToBF16(v);
+      wide[static_cast<size_t>(i)] = v;
+    }
+    bags.weight_digest = DurBf16Fnv1a(words, bags.weight_digest);
+    bags.elements += numel;
+    bags.bf16.bf16[spec.name] = std::move(words);
+    bags.f32.tensors[spec.name] = std::move(wide);
+    ++slot;
+  }
+  return bags;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 duration head bf16: upstream's answer, rule by rule, across fixtures") {
+  REQUIRE(vllm_test::kLtx2DurBf16CaseCount == 9);
+  REQUIRE(std::size(vllm_test::kLtx2DurBf16Cases) ==
+          static_cast<size_t>(vllm_test::kLtx2DurBf16CaseCount));
+
+  // EVERY RULE IS SEPARATED BY AT LEAST ONE FIXTURE. Without this the seven
+  // `rejected` columns could each equal upstream's answer at every row and the
+  // whole table would pass while measuring one rounding.
+  for (int r = 0; r < 7; ++r) {
+    INFO("rule = " << vllm_test::kLtx2DurBf16RuleNames[r]);
+    CHECK(vllm_test::kLtx2DurBf16RuleCoverage[r] > 0);
+  }
+
+  // ...AND THE RECORDED COVERAGE IS THE TABLE'S OWN. Recomputing it here rather
+  // than trusting the generator's line is what stops a hand-edited coverage row
+  // from making a dead column look alive.
+  int recomputed[7] = {0, 0, 0, 0, 0, 0, 0};
+  for (const vllm_test::Ltx2DurBf16Case& k : vllm_test::kLtx2DurBf16Cases) {
+    for (int r = 0; r < 7; ++r) {
+      if (k.rejected[r] != k.upstream) ++recomputed[r];
+    }
+  }
+  for (int r = 0; r < 7; ++r) {
+    INFO("rule = " << vllm_test::kLtx2DurBf16RuleNames[r]);
+    CHECK(recomputed[r] == vllm_test::kLtx2DurBf16RuleCoverage[r]);
+  }
+
+  int bit_exact = 0;
+  for (int c = 0; c < vllm_test::kLtx2DurBf16CaseCount; ++c) {
+    const vllm_test::Ltx2DurBf16Case& k = vllm_test::kLtx2DurBf16Cases[c];
+    const vllm::Ltx2DurationHeadConfig config = DurBf16Config(k);
+    const DurBf16Bags bags = BuildDurBf16Bags(config, k.amplitude);
+    INFO("case " << c << " widths " << k.video_dim << "/" << k.audio_dim << "/" << k.hidden
+                 << " tokens " << k.video_tokens << "/" << k.audio_tokens << " amp "
+                 << k.amplitude);
+
+    // THE WEIGHTS FIRST. glibc's `sin` and torch's float64 `sin` are not
+    // bit-equal, so this separates "we disagree about the arithmetic" from "we
+    // are holding different numbers" -- which is the diagnosis a bare value
+    // mismatch cannot give.
+    CHECK(bags.weight_digest == k.weight_digest);
+
+    uint64_t token_digest = kDurBf16FnvBasis;
+    std::vector<float> video(static_cast<size_t>(k.video_tokens * k.video_dim));
+    std::vector<float> audio(static_cast<size_t>(k.audio_tokens * k.audio_dim));
+    {
+      std::vector<uint16_t> words;
+      for (size_t i = 0; i < video.size(); ++i) {
+        video[i] = DurBf16Token(static_cast<int64_t>(i), 0.0, k.token_scale);
+        words.push_back(vt::F32ToBF16(video[i]));
+      }
+      if (!words.empty()) token_digest = DurBf16Fnv1a(words, token_digest);
+      words.clear();
+      for (size_t i = 0; i < audio.size(); ++i) {
+        audio[i] = DurBf16Token(static_cast<int64_t>(i), 1.7, k.token_scale);
+        words.push_back(vt::F32ToBF16(audio[i]));
+      }
+      if (!words.empty()) token_digest = DurBf16Fnv1a(words, token_digest);
+    }
+    CHECK(token_digest == k.token_digest);
+
+    vllm::Ltx2DurationWidthCounts widths;
+    const std::vector<float> got = vllm::Ltx2DurationPredict(
+        config, bags.bf16, video.empty() ? nullptr : video.data(), k.video_tokens,
+        audio.empty() ? nullptr : audio.data(), k.audio_tokens, 1, &widths);
+    REQUIRE(got.size() == 1);
+    INFO("ours = " << got[0] << " upstream = " << k.upstream);
+    // BIT-EXACT, not a band. A bf16 value is either upstream's word or a
+    // different one; there is no round-off to allow for, and §3.2's whole point
+    // is that a band here would swallow six of the seven rules.
+    CHECK(got[0] == k.upstream);
+    if (got[0] == k.upstream) ++bit_exact;
+
+    // THE ARITHMETIC WIDTH on this arm: every store point rounded, so nothing
+    // the head produced is wider than bf16. `values` is the control that the
+    // counter looked at anything -- a counter over nothing also reports zero.
+    INFO("bf16 arm produced " << widths.values << " values, " << widths.not_bf16 << " wide");
+    CHECK(widths.values > 0);
+    CHECK(widths.not_bf16 == 0);
+
+    // AND THE f32 ARM IS LIVE ON THE SAME FIXTURE, which is what stops the zero
+    // above from being true for an uninteresting reason. The two arms are the
+    // same tensor set and the same tokens; only the bag's width differs.
+    vllm::Ltx2DurationWidthCounts wide_widths;
+    const std::vector<float> wide = vllm::Ltx2DurationPredict(
+        config, bags.f32, video.empty() ? nullptr : video.data(), k.video_tokens,
+        audio.empty() ? nullptr : audio.data(), k.audio_tokens, 1, &wide_widths);
+    INFO("f32 arm produced " << wide_widths.values << " values, " << wide_widths.not_bf16
+                             << " wide; seconds = " << wide[0]);
+    CHECK(wide_widths.values == widths.values);
+    CHECK(wide_widths.not_bf16 > 0);
+
+    // ── STORAGE, and it is a RATIO rather than a number ────────────────────
+    // Two bags built from the same fifteen tensors. `Bytes()` is the tree's own
+    // measurement and this is the claim: the bf16 bag is EXACTLY half.
+    REQUIRE(bags.elements > 0);
+    INFO("bag bytes bf16 = " << bags.bf16.Bytes() << " f32 = " << bags.f32.Bytes()
+                             << " over " << bags.elements << " parameters");
+    CHECK(bags.f32.Bytes() == 2 * bags.bf16.Bytes());
+    CHECK(bags.bf16.Bytes() ==
+          static_cast<size_t>(bags.elements) * vt::SizeOf(vt::DType::kBF16));
+  }
+  CHECK(bit_exact == vllm_test::kLtx2DurBf16CaseCount);
+}
+
+// THE POOLER, at the fixtures where the correct chain is bit-exact -- which is
+// every emitted one, because that is the generator's emission condition. It is
+// asserted through the head rather than on its own values because upstream's own
+// bf16 `MultiheadAttention` does not reproduce from an f32-accumulate reference
+// (oneDNN routes the bf16 kernel differently: 18 of 32 elements), so there is no
+// bit-exact pooler oracle to compare against. §3.2 N2 of the row's spec bounds
+// that rather than hiding it. What IS gated here is that the pooler runs on the
+// bf16 bag at all -- before this row it refused by name inside
+// `Ltx2VaeWeights::Get` -- and that its own store point is reached.
+TEST_CASE("ltx2 duration head bf16: the pooler reads the bf16 arm and rounds its own store") {
+  const vllm_test::Ltx2DurBf16Case& k = vllm_test::kLtx2DurBf16Cases[0];
+  const vllm::Ltx2DurationHeadConfig config = DurBf16Config(k);
+  const DurBf16Bags bags = BuildDurBf16Bags(config, k.amplitude);
+
+  // THE TOKENS ARE FED UN-NARROWED ON PURPOSE, and that is the pooler's entry
+  // contract being exercised rather than broken. The contract says a bf16-arm
+  // caller hands it values it already stored; `Ltx2DurationPredict` is the only
+  // caller that does. Handing this case narrowed tokens would make its central
+  // assertion unfalsifiable — every returned value would sit on the bf16 grid
+  // even with the pooler's OWN store point deleted, which is the one thing this
+  // case exists to see. Off-grid input is well defined here; it is simply not
+  // the composition upstream builds.
+  const int64_t tokens = k.video_tokens + k.audio_tokens;
+  std::vector<float> stream(static_cast<size_t>(tokens * k.hidden));
+  for (size_t i = 0; i < stream.size(); ++i) {
+    stream[i] = DurBf16Token(static_cast<int64_t>(i), 0.31, 0.7);
+  }
+  vllm::Ltx2DurationWidthCounts widths;
+  const std::vector<float> pooled =
+      vllm::Ltx2DurationAttentionPool(config, bags.bf16, stream.data(), 1, tokens, &widths);
+  REQUIRE(pooled.size() == static_cast<size_t>(k.queries * k.hidden));
+  CHECK(widths.values > 0);
+  CHECK(widths.not_bf16 == 0);
+  // Every value the pooler returned survives a bf16 round trip, which is the
+  // arithmetic claim at this seam...
+  for (const float v : pooled) CHECK(v == vt::BF16ToF32(vt::F32ToBF16(v)));
+
+  // ...and the f32 arm on the same tokens does NOT, so the loop above is not
+  // passing because the fixture happens to sit on bf16 grid points.
+  vllm::Ltx2DurationWidthCounts wide_widths;
+  const std::vector<float> wide =
+      vllm::Ltx2DurationAttentionPool(config, bags.f32, stream.data(), 1, tokens, &wide_widths);
+  int wider = 0;
+  for (const float v : wide) {
+    if (v != vt::BF16ToF32(vt::F32ToBF16(v))) ++wider;
+  }
+  INFO("f32 pooler values wider than bf16: " << wider << " of " << wide.size());
+  CHECK(wider > 0);
+  CHECK(wide_widths.not_bf16 > 0);
+}
+
+// `query_tokens` NARROWS, AND NO VALUE GATE HERE CAN SEE IT (§3.2 N3). Holding
+// it at f32 instead separates in 0 of 93 bit-exact pooler fixtures: the
+// difference is absorbed by the rounding of its own projection. It is gated by a
+// COUNT, and the count carries its own control -- a probe that reported zero
+// entries moved would be blind rather than reassuring, which is the trap that
+// caught four sessions in this family (reading a parameter AFTER `.to(bfloat16)`
+// narrows it in place and yields a false 0/0). The parameters here are built at
+// f32 and narrowed into a SEPARATE buffer, so the count cannot be an artefact.
+TEST_CASE("ltx2 duration head bf16: query_tokens narrows, and the count says so") {
+  const vllm_test::Ltx2DurBf16Case& k = vllm_test::kLtx2DurBf16Cases[0];
+  const vllm::Ltx2DurationHeadConfig config = DurBf16Config(k);
+  int64_t slot = 0;
+  int64_t moved = 0;
+  int64_t entries = 0;
+  for (const vllm::Ltx2DurationHeadTensorSpec& spec :
+       vllm::EnumerateLtx2DurationHeadTensors(config)) {
+    if (spec.name == "attention_pooler.query_tokens") {
+      int64_t numel = 1;
+      for (const int64_t d : spec.shape) numel *= d;
+      for (int64_t i = 0; i < numel; ++i) {
+        const float before = DurBf16Fill(slot, i, k.amplitude);
+        const float after = vt::BF16ToF32(vt::F32ToBF16(before));
+        if (before != after) ++moved;
+        ++entries;
+      }
+    }
+    ++slot;
+  }
+  INFO("query_tokens narrowed " << moved << " of " << entries << " entries");
+  CHECK(entries == vllm_test::kLtx2DurBf16QueryTokensCount);
+  CHECK(moved == vllm_test::kLtx2DurBf16QueryTokensNarrowedEntries);
+  CHECK(moved > 0);
+}
+
+// A THIRD WIDTH REFUSES BY NAME, on a token no other site in this tree emits.
+// Wave 4 of this gap established that asserting a SHARED refusal string gates a
+// different site than the one under test, so the compute path's refusal and the
+// LOADER's are checked separately and neither stands in for the other.
+TEST_CASE("ltx2 duration head bf16: a third width refuses by name on its own token") {
+  const vllm_test::Ltx2DurBf16Case& k = vllm_test::kLtx2DurBf16Cases[4];
+  const vllm::Ltx2DurationHeadConfig config = DurBf16Config(k);
+  DurBf16Bags bags = BuildDurBf16Bags(config, k.amplitude);
+  bags.bf16.dtype = vt::DType::kF16;  // neither arm
+
+  std::vector<float> video(static_cast<size_t>(k.video_tokens * k.video_dim), 0.25f);
+  const std::string message = RefusalMessage([&] {
+    (void)vllm::Ltx2DurationPredict(config, bags.bf16, video.data(), k.video_tokens, nullptr, 0,
+                                    1);
+  });
+  INFO("refusal = ", message);
+  CHECK(Mentions(message, "LTX2_DURATION_HEAD_ARM_UNIMPLEMENTED"));
+  // NAMES WHAT IS MISSING, as AGENTS.md requires of an unimplemented arm.
+  CHECK(Mentions(message, "NVFP4"));
+
+  // The POOLER refuses on the same token, because it is a public entry point of
+  // its own and a caller can reach it without going through the forward.
+  std::vector<float> stream(static_cast<size_t>(4 * k.hidden), 0.5f);
+  const std::string pooler_message = RefusalMessage([&] {
+    (void)vllm::Ltx2DurationAttentionPool(config, bags.bf16, stream.data(), 1, 4);
+  });
+  INFO("pooler refusal = ", pooler_message);
+  CHECK(Mentions(pooler_message, "LTX2_DURATION_HEAD_ARM_UNIMPLEMENTED"));
+
+  // AND BOTH IMPLEMENTED ARMS STILL RUN, so the refusal above is not a guard
+  // that fires on everything.
+  CHECK_NOTHROW((void)vllm::Ltx2DurationPredict(config, bags.f32, video.data(), k.video_tokens,
+                                                nullptr, 0, 1));
+  vllm::Ltx2VaeWeights narrow = bags.bf16;
+  narrow.dtype = vt::DType::kBF16;
+  CHECK_NOTHROW((void)vllm::Ltx2DurationPredict(config, narrow, video.data(), k.video_tokens,
+                                                nullptr, 0, 1));
 }
