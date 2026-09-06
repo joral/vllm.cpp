@@ -258,15 +258,32 @@ scale layout through the tile op.
   this row gates against (`Q4_K_M`) never invokes Q5_K at all — it is a
   `Q5_K_M`/`Q5_K_S`-only format — so porting it would not move this row's own
   gate (c) measurement, only a differently-quantized checkpoint's.
-- Cross-warp data reuse in the WMMA kernel body (issue #3032, after the
-  wider-block axis below was measured and rejected). llama.cpp's `mul_mat_q`
-  still beats this kernel 4.9x-10.6x per-kernel on the exact same tensor-core
-  mechanism at matching shapes; widening the block did not close it, and each
-  warp here shares no loaded/dequantized data with any other warp in its
-  block, unlike (by inference, not yet read) whatever lets llama.cpp's fewer,
-  bigger blocks finish so much faster. Reading `ggml/src/ggml-cuda/mma.cuh`'s
-  actual tile-load structure to confirm or refute cross-tile reuse there is
-  the next traceable step, not assumed here.
+- Cross-warp data reuse in the WMMA kernel body (issue #3032). **CONFIRMED
+  by reading the actual source**, not inferred: llama.cpp's Q4_K config at
+  this row's shapes (`ggml/src/ggml-cuda/mmq-config-rdna4.cuh:127`,
+  `GGML_TYPE_Q4_K, 256, ..., 128, 128, ...`) gives ONE BLOCK an I=128 (weight
+  rows) x J=128 (activation columns) output tile — 8-64x the area our
+  4-8-warp block covers, since each of OUR warps independently owns only a
+  16x16 tile. That whole I x J tile is loaded ONCE per block, not once per
+  warp: `ggml_cuda_mmq_load_tiles_q4_K`
+  (`ggml/src/ggml-cuda/mmq-load-tiles.cuh:703-741`) stripes the I=128 rows
+  across every warp's threads (`i0 += nrows*nwarps`, each warp taking a
+  DIFFERENT row range), dequantizing each row exactly once into one shared
+  `x_tile`; `mmq_get_nbytes_shared` (`mmq.cuh:1379-1383`) sizes the
+  activation-tile allocation by `J` alone, not `J*nwarps`, confirming one
+  shared activation copy too. The compute phase
+  (`ggml_cuda_mmq_write_back_mma`, `mmq.cuh:476-500`) then splits the I
+  dimension across warps (`rows_per_warp = I/nwarps`), each warp looping the
+  FULL J range doing 16x16 MMA ops against that one shared load. This
+  kernel's per-warp-independent design (own `w_stage`/`raw_tile` slice, own
+  `load_matrix_sync` call, zero sharing even when two warps in one block
+  share the same M-tile) is the actual mechanism gap the wider-block
+  experiment above could not touch, because widening never introduced
+  sharing — it only added more independent warps to the same per-warp-load
+  pattern. Matching this (cooperative tile load + row-split compute over a
+  much larger shared tile) is a real kernel redesign, materially bigger than
+  the block-width experiment, and is the next traceable step — not attempted
+  in this row.
 
 ## Stop conditions
 
