@@ -14,7 +14,7 @@ measurement evidence remains in [the benchmark record](../.agents/benchmark-reco
 | `dwarfstar-gguf` | GGUF comparison with DwarfStar | Measured | [Details](benchmarks/dwarfstar-gguf.md) |
 | `speculative-decoding` | Speculative decoding measurements | Mixed | [Details](benchmarks/speculative-decoding.md) |
 | `qwen38-27b-exl3-gb10` | Qwen3.8-27B EXL3 3.5bpw with its DFlash2 draft, on GB10 | Measured | [Details](benchmarks/qwen38-27b-exl3-gb10.md) |
-| `qwen38-27b-q4km-gfx1151` | Qwen3.8-27B Q4_K_M on Strix Halo: llama.cpp, vLLM, and our own arm which faulted | Mixed | [Details](benchmarks/qwen38-27b-q4km-gfx1151.md) |
+| `qwen38-27b-q4km-gfx1151` | Qwen3.8-27B Q4_K_M on Strix Halo: llama.cpp, vLLM and vllm.cpp, under a failing token gate | Mixed | [Details](benchmarks/qwen38-27b-q4km-gfx1151.md) |
 | `how-we-measure` | Benchmark method and acceptance rules | Method | [Details](benchmarks/how-we-measure.md) |
 | `open-gaps` | Pending, failed, void, and superseded measurements | Open | [Details](benchmarks/open-gaps.md) |
 | `reproduce` | Reproduction commands and artifacts | Method | [Details](benchmarks/reproduce.md) |
