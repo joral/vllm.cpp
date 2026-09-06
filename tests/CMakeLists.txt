@@ -2005,6 +2005,10 @@ vllm_cpp_add_test(test_verify_route_predicate vllm/v1/worker/test_verify_route_p
 # off the same per-req_state draft buffer the combine's scatter reads. Same shape
 # and same reason as the two predicates above -- one rule, one expression.
 vllm_cpp_add_test(test_draft_fill vllm/v1/worker/test_draft_fill.cpp)
+# SPEC-DFLASH2 A2-4 (#3004): the async decode arm's propose reads this step's
+# committed ids where they live, on every write-back branch, instead of refusing
+# by name when the branch that ran left them unreadable on the host.
+vllm_cpp_add_test(test_committed_ids vllm/v1/worker/test_committed_ids.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
 vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
 # ENG-POOL-BEST-FIT (#1922): the shared scratch pool must reach a steady state
@@ -2650,6 +2654,11 @@ if(VLLM_CPP_HIP)
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
 vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
+# BACKEND-ROCM silu-gate dtype rounding repair (#2889 silu item, #1954): the
+# ROCm SiluAndMul/MoeSiluMul kernels narrow silu(gate) to the gate dtype before
+# the multiply, matching the CPU oracle RoundThrough and upstream vLLM silu_kernel.
+# Self-skipping without a ROCm device, mirroring test_rocm_backend.cpp guard.
+vllm_cpp_add_test(test_ops_rocm_silu_rounding vt/test_ops_rocm_silu_rounding.cpp)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
