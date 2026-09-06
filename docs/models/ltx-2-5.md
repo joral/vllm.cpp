@@ -117,6 +117,59 @@ ltx2-gen \
   --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
 ```
 
+## Condition a render on a reference clip (IC-LoRA)
+
+```sh
+ltx2-gen \
+  --dit "$LTX_ROOT/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors" \
+  --model-version 2.5 --checkpoint-class distilled \
+  --video-vae "$LTX_ROOT/vae/ltx-2.5-video-vae-conv-bf16.safetensors" \
+  --audio-vae "$LTX_ROOT/vae/ltx-2.5-audio-vae-bf16.safetensors" \
+  --upsampler "$LTX_ROOT/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors" \
+  --pipeline-kind ic_lora \
+  --lora "$LTX_ROOT/loras/ltx-2.5-ic-lora-depth.safetensors" \
+  --ref-video /tmp/depth_frames --ref-video-strength 1.0 \
+  --prompt-embeds "$LTX_VIDEO_EMBEDS" --audio-prompt-embeds "$LTX_AUDIO_EMBEDS" \
+  --frames 25 --width 320 --height 192 --seed 20260812 \
+  --workdir /tmp/ltx25ic --out /tmp/ltx25ic/video.mp4
+```
+
+`--ref-video` is a directory of `frame_%06d.ppm`, not a container: upstream opens
+one with PyAV and no demuxer is vendored here. The clip is read at
+`height // reference_downscale_factor` by `width // reference_downscale_factor`,
+and both factors come from the adapter's own metadata rather than from a flag. A
+load with no adapter reads both as 1, which is upstream's default. A target
+either axis of which the factor does not divide is refused by name, with
+upstream's own sentence.
+
+The adapter rides **stage 1 only** and stage 2 runs bare. That is the mirror
+image of `ti2vid_two_stage`, `a2vid_two_stage` and `keyframe_interpolation`,
+where the adapter rides stage 2, and it is why IC-LoRA has its own pipeline kind
+rather than being a mode of `distilled_two_stage`. A reference clip supplied to
+any other kind is refused, and the message names this one.
+
+`--conditioning-attention-mask` takes a directory of grayscale
+`frame_%06d.ppm` whose pixels attenuate the reference per region: black ignores
+the conditioning there, white takes it in full. The frames are read at the
+stage's own resolution and downsampled to the reference latent's grid, so a mask
+must describe the same moments as the clip. `--conditioning-attention-strength`
+scales the whole mask and must be in `[0, 1]`; above 1 it would amplify
+attention rather than attenuate it, and is refused.
+
+A strength below 1 with **no** mask is refused rather than served. Upstream has
+that branch and its own CLI cannot reach it either: the strength is assigned only
+alongside a mask, so a sub-1.0 value always arrives with one.
+
+Through the C ABI and the server these are per-generation extras rather than
+flags: `ref_video_strength`, `conditioning_attention_mask_dir` and
+`conditioning_attention_strength`, beside the existing `ref_video` field.
+
+Not served, and refused by name: the EXR/HDR reference arm, which needs an
+OpenEXR reader and a declared colour space; a tiled reference encode; and
+reference IMAGES, which are not an IC-LoRA shape at all — upstream's flag takes a
+video or an EXR directory and `ltx-pipelines` has no reference-image
+conditioning.
+
 `--lora` is repeatable, and each repetition takes an adapter path with an
 optional strength, exactly as upstream's own flag does: `--lora
 first.safetensors 0.8 --lora second.safetensors`. An omitted strength is
