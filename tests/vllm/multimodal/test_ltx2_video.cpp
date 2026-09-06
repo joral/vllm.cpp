@@ -14270,6 +14270,32 @@ TEST_CASE("ltx2 ic-lora: every refusal names what is wrong and where the feature
     }
   }
 
+  SUBCASE("a strength outside [0, 1] with NO mask, which upstream refuses just the same") {
+    // `ic_lora.py:230-233` is UNCONDITIONAL: it is in the method body, not
+    // inside `if args.conditioning_attention_mask is not None`. Guarding this
+    // engine's copy on a mask directory made an out-of-range strength with no
+    // mask pass the range check AND pass the sub-1.0 scalar-arm refusal below
+    // it, leaving a value that is accepted, never read (its only reader is
+    // inside the mask branch) and silently ignored on every pipeline.
+    const std::string ups = WriteIcLoraUpsampler(ws.root + "/nomask_range_ups.safetensors");
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true));
+    vllm::multimodal::VideoGenParams gen = IcLoraGen(ws.root + "/nomask_range", clip);
+    // NO kLtx2CondAttentionMaskDirExtra. That is the whole point of the case.
+    gen.extras[vllm::multimodal::kLtx2CondAttentionStrengthExtra] = "1.5";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("an out-of-range strength must be refused whether or not a mask was supplied; "
+           "upstream's check does not consult the mask");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("[0.0, 1.0]") != std::string::npos);
+      CHECK(msg.find("AMPLIFY") != std::string::npos);
+      CHECK(msg.find("ic_lora.py:230-233") != std::string::npos);
+    }
+  }
+
   SUBCASE("a reference IMAGE, which is not what an IC-LoRA reference is") {
     const std::string ups = WriteIcLoraUpsampler(ws.root + "/img_ups.safetensors");
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =

@@ -3238,15 +3238,6 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const bool wants_first_frame = !gen.first_frame_path.empty() || !gen.first_frame_ppm.empty();
   const bool wants_last_frame = !gen.last_frame_path.empty();
   const bool wants_image = wants_first_frame || wants_last_frame;
-  // `!wants_retake` IS LOAD-BEARING, and it narrows this refusal rather than
-  // weakening it. Retake and IC-LoRA reference conditioning both arrive as
-  // `ref_video_dir`, and they consume it in completely different ways: retake
-  // encodes the clip at its OWN resolution and seeds the video stream's initial
-  // latent with it (retake.py:238-247, :273), while the reference item is
-  // downscaled by the adapter's factor, temporally subsampled, and APPENDED as
-  // extra tokens to a stage-1-only adapter (iclora_utils.py:112-117, :87-89,
-  // :144-148). Serving the first says nothing about the second, so the second
-  // stays refused and #975 stays open.
   // ── IC-LoRA REFERENCE CONDITIONING (row LTX25-IC-LORA-REF-VIDEO, #3020) ──
   //
   // ONE PREDICATE, READ ONCE, and it is what makes this block correct rather
@@ -3336,7 +3327,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
          "two-stage pipeline. Set `ref_video_dir` to a directory of frame_%06d.ppm, or load with "
          "'pipeline_kind' 'distilled_two_stage' for an unconditioned render.");
   }
-  if (!cond_mask_dir.empty() && (cond_attention_strength < 0.0 || cond_attention_strength > 1.0)) {
+  // UNCONDITIONAL, exactly as upstream's is. `ic_lora.py:230-233` sits in the
+  // method body, before anything about the mask and outside every `if
+  // args.conditioning_attention_mask is not None`. Guarding it on a mask made
+  // this engine ACCEPT an out-of-range strength whenever none was supplied and
+  // then never read it, because its only reader is inside the mask branch: a
+  // knob that takes a value, refuses nothing, and does nothing.
+  if (cond_attention_strength < 0.0 || cond_attention_strength > 1.0) {
     Fail("'" + std::string(kLtx2CondAttentionStrengthExtra) + "' must be in [0.0, 1.0], got " +
          std::to_string(cond_attention_strength) +
          ". This is upstream's own refusal (ic_lora.py:230-233): the value multiplies a mask in "

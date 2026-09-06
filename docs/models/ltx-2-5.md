@@ -127,12 +127,24 @@ ltx2-gen \
   --audio-vae "$LTX_ROOT/vae/ltx-2.5-audio-vae-bf16.safetensors" \
   --upsampler "$LTX_ROOT/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors" \
   --pipeline-kind ic_lora \
-  --lora "$LTX_ROOT/loras/ltx-2.5-ic-lora-depth.safetensors" \
+  --lora "$LTX_ROOT/loras/<YOUR-IC-LORA>.safetensors" \
   --ref-video /tmp/depth_frames --ref-video-strength 1.0 \
   --prompt-embeds "$LTX_VIDEO_EMBEDS" --audio-prompt-embeds "$LTX_AUDIO_EMBEDS" \
   --frames 25 --width 320 --height 192 --seed 20260812 \
   --workdir /tmp/ltx25ic --out /tmp/ltx25ic/video.mp4
 ```
+
+`--lora` is a PLACEHOLDER above, and deliberately so. The pinned upstream
+checkout names no reference-conditioning IC-LoRA for 2.5: its only 2.5 IC-LoRA is
+[`ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors`](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler),
+which is `DFRPipeline`'s detailing adapter and rides stage 2 (`README.md:95-96`).
+The published control adapters that DO condition on a reference clip are 2.3-era
+and 19b — `LTX-2.3-22b-IC-LoRA-Union-Control`,
+`LTX-2.3-22b-IC-LoRA-Motion-Track-Control` and
+`LTX-2-19b-IC-LoRA-Pose-Control` (`MODELS-LTX-2.3.md:32-35`) — so none of them
+pairs with the 2.5 22b transformer this recipe loads. No adapter is named here
+because naming one would claim a pairing nothing has run. The mechanism below is
+what this row gated; the weights are not.
 
 `--ref-video` is a directory of `frame_%06d.ppm`, not a container: upstream opens
 one with PyAV and no demuxer is vendored here. The clip is read at
