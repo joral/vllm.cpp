@@ -2816,6 +2816,12 @@ vllm_cpp_add_test(test_qwen35_exl3 vllm/models/test_qwen35_exl3.cpp)
 # and forward, gated through LoadQwen3DFlash over a real safetensors file and
 # then through Qwen3DFlashModel::ForwardBlockLogits.
 vllm_cpp_add_test(test_qwen3_dflash2_exl3 vllm/models/test_qwen3_dflash2_exl3.cpp)
+# MODEL-DFLASH2-NVFP4 (#2758): the ModelOpt NVFP4 arm of the same DRAFT loader,
+# gated through MakeQwen3DFlashDraftConfig + LoadQwen3DFlash over a real
+# safetensors file — the exact pair LoadDflashDraft calls. A load gate and not a
+# forward twin: vt::MatmulNvfp4 is registered for CUDA only, so there is no host
+# path to decode a packed weight against.
+vllm_cpp_add_test(test_qwen3_dflash2_nvfp4 vllm/models/test_qwen3_dflash2_nvfp4.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
