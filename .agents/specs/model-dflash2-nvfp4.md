@@ -15,8 +15,10 @@ behaviour, so nothing here is a product decision and nothing was asked.
 
 ## Now
 
-`ACTIVE`. The loader-side arm is written and gated hermetically:
-`test_qwen3_dflash2_nvfp4` 14/14 test cases, 317/317 assertions, with the four
+`ACTIVE`. The loader-side arm is written and gated hermetically ON THE MERGED
+TREE -- `origin/main` moved 42 commits under this branch and the numbers below
+are from after the merge, not carried forward from the tree the branch was cut
+from: `test_qwen3_dflash2_nvfp4` 15/15 test cases, 334/334 assertions, with the four
 neighbouring draft suites (`test_qwen3_dflash2_exl3` 5/5,
 `test_qwen3_dflash2_draft` 44/44, `test_dflash_causality` 13/13,
 `test_dflash2_draft_routing` 12/12) and the six dense NVFP4 suites the exported
@@ -289,12 +291,17 @@ what NVFP4 group-16 requires.
   delete the `cfg.raw["quantization_config"]` carry in
   `MakeQwen3DFlashDraftConfig` and confirm the arm cases red. A gate that stays
   green without that line is measuring a class, not a capability.
-  **RUN: 10 of the 14 cases red under it**, including the published-shape load,
-  every refusal that names a module, and both cross-check directions; the four
-  that survive are the ones whose subject is the tensors rather than the
-  declaration. `src/vllm/model_executor/models/qwen3_dflash_weights.cpp` hashed
-  `093fa70722f56d8f30744d051235178b77cff2de937b2b9262e897e63c5cba4c` before the
-  mutation and the same value after the restore.
+  **RUN ON THE MERGED TREE: 11 of the 15 cases red under it**, including the
+  published-shape load, every refusal that names a module, and both cross-check
+  directions; the four that survive are the ones whose subject is the tensors
+  rather than the declaration.
+  `src/vllm/model_executor/models/qwen3_dflash_weights.cpp` hashed
+  `1b5ecb7c6ea1604386caec7442c82f6a4b7b6eb96bd09a6fee069fcb6200e2ec` before the
+  mutation and the same value after the restore, and the suite returned to
+  15/15 on the restored file. (The pre-merge run of the same mutation read 10 of
+  14 at hash `093fa70722f56d8f30744d051235178b77cff2de937b2b9262e897e63c5cba4c`;
+  the merge added no case and moved no line in this file, so the two differ only
+  by the lane case added after that run.)
 
 ## Risks and decisions
 
