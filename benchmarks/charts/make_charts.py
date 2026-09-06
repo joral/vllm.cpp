@@ -149,10 +149,14 @@ def line_chart(cs: list[int], ours: list[float], theirs: list[float], th: dict,
         for x, v in zip(px, series):
             o.append(f'<circle cx="{x:.1f}" cy="{py(v):.1f}" r="5" fill="{colour}"/>')
         # Label only the endpoints, so the middle of the plot stays readable.
+        # The first label is anchored to the RIGHT of its marker rather than
+        # centred on it: centred, it runs into the y-axis tick labels, which sit
+        # just left of the plot area.
         for idx in (0, len(series) - 1):
             dy = -12 if colour == th["ours"] else 20
-            o.append(text(px[idx], py(series[idx]) + dy, fmt.format(series[idx]),
-                          colour, 11.5, "middle", "600"))
+            anchor, dx = ("start", 11) if idx == 0 else ("middle", 0)
+            o.append(text(px[idx] + dx, py(series[idx]) + dy, fmt.format(series[idx]),
+                          colour, 11.5, anchor, "600"))
         o.append(text(px[-1], py(series[-1]) + (-26 if colour == th["ours"] else 34),
                       label, colour, 11, "middle", "600"))
 
