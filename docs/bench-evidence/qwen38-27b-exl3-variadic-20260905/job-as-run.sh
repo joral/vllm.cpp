@@ -146,7 +146,6 @@ python3 "$HARNESS/build_corpus.py" \
 RCX=$?; res "CORPUS rc=$RCX"
 if [ $RCX -ne 0 ]; then tail -20 /tmp/corpus.log; exit 47; fi
 res "CORPUS sha256 $(sha256sum "$CORPUS" | cut -d' ' -f1)"
-grep -A2 '"sources"' /tmp/corpus.log | head -1 > /dev/null
 python3 -c "
 import json; m=json.load(open('$MANIFEST'))
 for k,v in m['sources'].items(): print('RESULT CORPUS_SOURCE %-10s %s' % (k, v['sha256']))
@@ -223,7 +222,9 @@ else
     mkdir -p "$W/bin/$PIN"
     cp -L "$BIN" "$CACHED_BIN" 2>/dev/null
     cp -L "$SCRATCH"/bin/*.so* "$W/bin/$PIN/" 2>/dev/null
-    done_mark "ourbuild-$PIN"
+    # No marker here on purpose. The guard for this phase is the cached binary
+    # itself (`[ -x "$CACHED_BIN" ]` above), which is the thing a resume needs;
+    # a marker beside it would be a second source of truth that can disagree.
 fi
 
 say "E. INSTALL THEIR ENGINE (MiaAI-Lab/exllamav3 @ 63b32f00, OUR pin -- their card pins none)"
@@ -397,6 +398,7 @@ run_leg(){  # run_leg <arm> <round> <c> <port> <modelname> <serverlog>
         res "$label G-RESOLVED FAIL: server resolved max_num_seqs=$rs below rung c=$c -- leg NOT run"
         return 1
     fi
+    res "$label CONFIG num_blocks=$NUM_BLOCKS max_model_len=$MAX_MODEL_LEN max_num_seqs=$MAX_NUM_SEQS max_num_batched_tokens=$MAX_BATCHED paged='${PAGED_ENV:-shipped default}'"
     python3 "$HARNESS/client.py" --url "http://127.0.0.1:$port" --model "$name" \
         --dataset "$CORPUS" --num-prompts "$NPROMPTS" --concurrency "$c" \
         --max-tokens "$OUTLEN" --temperature "$TEMP" --top-p "$TOPP" \
@@ -408,6 +410,14 @@ run_leg(){  # run_leg <arm> <round> <c> <port> <modelname> <serverlog>
 
 say "G. SMOKE PROBE -- does the SHIPPED paged draft route survive the top rung?"
 TOP_RUNG=$(for c in $RUNGS; do echo "$c"; done | sort -n | tail -1)
+# G-RESOLVED reads back a CLAMP MESSAGE, and model_loader.cpp prints none when
+# the configured value is the binding one. So a rung above --max-num-seqs would
+# run against a server capped below it and read back an empty string, which
+# G-RESOLVED treats as "no clamp". Assert the one case the read-back cannot see.
+if [ "$MAX_NUM_SEQS" -lt "$TOP_RUNG" ]; then
+    res "ABORT: --max-num-seqs $MAX_NUM_SEQS is below the top rung $TOP_RUNG. The loader prints no clamp line when the flag is the binding value, so G-RESOLVED could not detect this leg running capped."
+    exit 62
+fi
 if is_done pagedprobe && [ -f "$STATE/paged_env" ]; then
     PAGED_ENV=$(cat "$STATE/paged_env")
     res "PAGED PROBE resumed: PAGED_ENV='${PAGED_ENV:-shipped default}'"

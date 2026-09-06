@@ -16,17 +16,17 @@
  },
  "sources": {
   "gsm8k": {
-   "path": "/tmp/claude-1000/-home-mudler--git-vllm-cpp/ce09c3da-6e33-498e-a611-1b5cf3a0cb54/scratchpad/gsm8k-test.jsonl",
+   "path": "/workspace/exl3-variadic/corpora/gsm8k-test.jsonl",
    "sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
    "rows": 1319
   },
   "humaneval": {
-   "path": "/tmp/claude-1000/-home-mudler--git-vllm-cpp/ce09c3da-6e33-498e-a611-1b5cf3a0cb54/scratchpad/HumanEval.jsonl",
+   "path": "/workspace/exl3-variadic/corpora/HumanEval.jsonl",
    "sha256": "1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2",
    "rows": 164
   },
   "sonnet": {
-   "path": "/home/mudler/_git/vllm/benchmarks/sonnet.txt",
+   "path": "/workspace/exl3-variadic/corpora/sonnet.txt",
    "sha256": "d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4",
    "lines": 518
   }

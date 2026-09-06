@@ -246,36 +246,52 @@ per-leg summaries, and `results.txt`. Per-request records stay on the share.
 
 ## Now
 
-`ACTIVE`. The spec, the harness, its controls and the method page are committed.
-The results page carries the percentile method applied to the predecessor's own
-records, which reverses that page's mean time-to-first-token conclusion above
-p90. The sweep itself is queued.
+`DONE`, with three legs owed. The run completed nine of twelve legs on
+5-6 September 2026 before `dgx:gpu0` was lost 2h33m in; the resume is `rc` job
+`493d6c72-1ff0-4362-bde4-1a1887edaf9a`, queued. Results are published on
+[`qwen38-27b-exl3-variadic-gb10`](../../docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md).
 
-**The queued job, and how to finish the page from it.** `rc` job
-`7b5084ab-f214-4d8d-b1fe-1eca86efb1e8` on `dgx:gpu0`, submitted with
-`--max-runtime 6h` and `RUNGS="1 4 8" ROUNDS=2 NPROMPTS=128 OUTLEN=192
-CORPUS_COUNT=144`, running `/workspace/exl3-variadic/harness/job.sh`. It is
-resumable: resubmit the same command after a crash and it skips what is already
-recorded.
+## Outcome
 
-When it finishes:
+**What was measured.** `rc` job `7b5084ab-f214-4d8d-b1fe-1eca86efb1e8`, tree
+`3351ec54f`, binary md5 `23be01c338457038fe8354b01d92c7aa`. `G-BYTES` and
+`G-RESOLVED` both passed; every leg reported `publishable = yes` under `G-USAGE`;
+every cell of ours carries two rounds agreeing to 0.4% or better.
 
-1. `rc logs 7b5084ab-f214-4d8d-b1fe-1eca86efb1e8` — read `results.txt` for
-   `G-BYTES`, the resolved server configuration, the paged-route decision, and
-   each leg's return code.
-2. The report is at `/mnt/nas_share/rc/exl3-variadic/out/report.md`, and
-   `benchmarks/variadic/report.py --dir <that out/> --glob '*-r*-c*.json'`
-   regenerates it from the per-request records at any time, with no GPU.
-3. Copy `results.txt`, `report.md`, the `*.clientlog` files and
-   `corpus-manifest.json` into
-   `docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/`, fill the results
-   page's empty sections from the report, and move its index row from `Partial`
-   to `Measured`.
-4. Check `G-RESOLVED` in `results.txt` before publishing any `c = 8` number: a
-   leg whose server resolved `max_num_seqs` below its rung measured a different
-   configuration than it claims.
-5. Check the round-to-round spread table before quoting any cell as a value.
-   Above 10%, quote the spread.
+**The paged draft route ran at its shipped default**, which the smoke probe
+cleared on the first attempt at the top rung. Every previously published number
+on this pair ran `VT_DFLASH_PAGED=0`, so this is the first measurement of the
+default configuration and no number here is comparable to one on the predecessor
+page.
+
+**Three results.** Their aggregate throughput does not move with concurrency
+(33.10, 33.33, 33.52 output tok/s at c = 1, 4, 8) and ours does (35.81, 53.17,
+53.93), which is their `gen_lock` measured rather than argued. We prefill long
+prompts about half as fast as they do, and the gap widens with prompt length —
+298 against 585 tok/s implied on the `XL` band — which the predecessor's
+93-to-457-token workload could not have produced. And both engines now report
+acceptance, 0.796-0.799 against 0.774-0.778 per output token.
+
+**What was rejected.** An open-loop arrival process, because a fixed rate above a
+serialized server's service rate makes the measured latency a function of how
+long the leg ran. A shared-prefix long band, because that measures a prefix cache
+rather than a length distribution. A `p99` computed from a single leg, because
+128 requests make it the second-worst request.
+
+**One design assumption was falsified by the run and is worth recording.** The
+predecessor inferred that our first streamed chunk carries a whole accepted
+speculative block, and this row built a correction for it. Measured, our first
+content chunk is exactly two characters on all 768 requests, so the estimated
+first-chunk token count is 0.58 and the correction is nil on both engines. The
+correction stays in the harness because the property is real on other
+configurations; it did nothing here, and the page says so rather than quoting a
+corrected column that equals the raw one without explanation.
+
+**Why `--num-blocks` is pinned rather than left to auto-fit.** The loader clamps
+`max_num_seqs` against the pool on this hybrid, and the draft speculative context
+adds 160.312 MiB per concurrent request that `gpu_memory_utilization` does not
+bound ([#2993](https://github.com/mudler/vllm.cpp/issues/2993)). An auto-fitted
+pool would have made the concurrency ladder measure its own configuration.
 
 ## Owed
 
@@ -287,7 +303,11 @@ When it finishes:
   `max_model_len`, so an operator raising either exceeds the fraction they set.
   This row does not fix it; it pinned `--num-blocks` explicitly so the ladder
   would not measure it as noise. The issue carries a `-` row and is owned here.
-- A third round, if any cell's two rounds disagree by more than 10%.
+- **`THEIRS` round 2 at every rung**, lost with the box 2h33m into the run.
+  Their column is one sample per rung. Resume: `rc` job
+  `493d6c72-1ff0-4362-bde4-1a1887edaf9a`.
+- A third round, if any cell's two rounds disagree by more than 10%. None does:
+  the widest is 0.4%.
 - A matched-configuration leg. Each engine still runs its own published recipe,
   and this engine still refuses an NVFP4 KV cache by name
   ([#2620](https://github.com/mudler/vllm.cpp/issues/2620)).

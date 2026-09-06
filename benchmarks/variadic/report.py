@@ -169,8 +169,15 @@ def acceptance(leg):
                 # the delta is not a measurement of it.
                 return {"source": "counter reset inside the leg"}
             if draft > 0:
+                # ACCEPTED PER OUTPUT TOKEN as well as accepted/proposed. The
+                # other engine here exports only the first of those, and two
+                # acceptance numbers on different denominators printed in one
+                # column is an invitation to divide one by the other.
+                out = sum(int((r.get("usage") or {}).get("completion_tokens") or 0)
+                          for r in ok_records(leg, "measured"))
                 return {"source": "/metrics", "draft": draft,
-                        "accepted": accepted, "rate": accepted / draft}
+                        "accepted": accepted, "rate": accepted / draft,
+                        "per_output_token": (accepted / out) if out else None}
     acc = [r["accepted_draft_tokens"] for r in ok_records(leg, "measured")
            if r.get("accepted_draft_tokens") is not None]
     if acc:
@@ -314,11 +321,13 @@ def print_cells(legs, args):
                              key=lambda pl: pl[1]["summary"]["round"]):
             acc = acceptance(leg)
             if acc["source"] == "/metrics":
-                val = (f"accepted/draft = {acc['accepted']:.0f}/{acc['draft']:.0f}"
-                       f" = {acc['rate']:.3f}")
+                val = (f"accepted/proposed = {acc['accepted']:.0f}/{acc['draft']:.0f}"
+                       f" = {acc['rate']:.3f}, "
+                       f"{fmt(acc['per_output_token'], 3)} per output token")
             elif acc["source"] == "usage":
                 val = (f"accepted {acc['accepted']:.0f}, "
-                       f"{fmt(acc['per_output_token'], 3)} per output token")
+                       f"{fmt(acc['per_output_token'], 3)} per output token "
+                       f"(this engine exports no proposed count)")
             elif acc["source"] == "absent":
                 val = "NOT EXPOSED BY THIS ENGINE"
             else:
