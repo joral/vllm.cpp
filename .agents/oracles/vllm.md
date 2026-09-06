@@ -131,7 +131,8 @@ half [`../sync/2026-09-02-e126687.md`](../sync/2026-09-02-e126687.md)
    ([`../sync/2026-09-05-e126687-pingate.md`](../sync/2026-09-05-e126687-pingate.md)
    §2 item 3). **Not job `8c4f639c`, which this item credited until now**: that
    job's own read returned `VERSION_READ_RC=1` with
-   `ModuleNotFoundError: No module named 'vllm'`, and its `succeeded`/`exit 0`
+   `ModuleNotFoundError: No module named 'vllm'` — its wheel install had already
+   failed, `INSTALL_VLLM_RC=1` at `stepA.log:912` — and its `succeeded`/`exit 0`
    attests the job and not the step inside it.
    [`../sync/2026-09-05-e126687-step6-c1a.md`](../sync/2026-09-05-e126687-step6-c1a.md)
    still names the wrong job; it belongs to another wave and

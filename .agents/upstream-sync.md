@@ -145,7 +145,9 @@ credited until now.** That job attempted the same read and it FAILED:
 `VERSION_READ_RC=1` at `stepA.log:1119`, its `cat` of `versions.txt` produced
 nothing, and `versions.err` is
 `ModuleNotFoundError: No module named 'vllm'` — its venv `/tmp/oracle-e126687`
-never got the wheel installed. The job nevertheless finished `succeeded` with
+never got the wheel installed, and the job records that too:
+`INSTALL_VLLM_RC=1` at `stepA.log:912`, after `Failed to build installable
+wheels for some pyproject.toml based projects` / `instanttensor` at `:909-910`. The job nevertheless finished `succeeded` with
 `exit_code 0`, because `stepA.sh` echoes `VERSION_READ_RC=$?` instead of
 propagating it. **An exit code attests the job, never a step inside it**, and
 that exit 0 was the whole of the corroboration this attribution rested on. Three
