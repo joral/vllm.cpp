@@ -11,9 +11,9 @@ report runs on a container with no numpy.
 
 METRIC DEFINITIONS, mirrored from vllm/benchmarks/serve.py:321 BenchmarkMetrics:
 
-    ttft  time to the first content-carrying chunk
+    ttft  time to the first content-carrying chunk        serve.py:615
     tpot  (latency - ttft) / (output_tokens - 1)          serve.py:610
-    itl   gap between consecutive streamed chunks         serve.py:615
+    itl   gap between consecutive streamed chunks         serve.py:614
     e2el  client-side request latency                     serve.py:616
 
 `tpot` is the primary inter-token axis and `itl` is secondary, because `tpot`
@@ -74,14 +74,17 @@ def axes(recs):
     """The four vLLM axes plus the chunking observables, in milliseconds."""
     ttft, tpot, itl, e2el = [], [], [], []
     ttft_corrected = []
+    over_corrected = 0
     toks_per_chunk, first_chunk_tokens, chars_per_token = [], [], []
     out_tokens, in_tokens = [], []
     counted_by = set()
+    dropped_no_usage = 0
     for r in recs:
         usage = r.get("usage") or {}
         n_out = usage.get("completion_tokens")
         if not n_out:
             counted_by.add("chunks")
+            dropped_no_usage += 1
             continue
         counted_by.add("usage")
         n_out = int(n_out)
@@ -105,8 +108,17 @@ def axes(recs):
             fct = r.get("first_chunk_chars", 0) / cpt if cpt > 0 else 0.0
             first_chunk_tokens.append(fct)
             if this_tpot is not None:
-                ttft_corrected.append(
-                    max(0.0, r["ttft"] - max(0.0, fct - 1.0) * this_tpot) * 1000.0)
+                # REFUSE an over-correction, never floor it. `fct` is an
+                # estimate, so `(fct - 1) * tpot` can exceed the measured ttft
+                # on a coarse chunker -- at 8 tokens per chunk and a 30 ms tpot
+                # that is 210 ms against a 200 ms ttft. Flooring publishes 0.0
+                # as if it were a measurement; dropping the record makes the
+                # correction absent for it, which is what it is.
+                corrected = r["ttft"] - max(0.0, fct - 1.0) * this_tpot
+                if corrected > 0.0:
+                    ttft_corrected.append(corrected * 1000.0)
+                else:
+                    over_corrected += 1
     return {
         "n": len(out_tokens), "ttft": ttft, "tpot": tpot, "itl": itl,
         "e2el": e2el, "ttft_corrected": ttft_corrected,
@@ -115,6 +127,14 @@ def axes(recs):
         "first_chunk_tokens": first_chunk_tokens,
         "chars_per_token": chars_per_token,
         "counted_by": "+".join(sorted(counted_by)) or "none",
+        "dropped_no_usage": dropped_no_usage,
+        "over_corrected": over_corrected,
+        # G-USAGE. A leg is publishable only when EVERY successful request
+        # carried a server-side token count. One that did not is refused, not
+        # footnoted: its throughput divides the tokens it could count by a wall
+        # clock that also contains the requests it could not, which understates
+        # the rate with no signal beyond a string in the last column.
+        "publishable": dropped_no_usage == 0 and bool(out_tokens),
     }
 
 
@@ -126,18 +146,31 @@ def cell_key(leg):
 def acceptance(leg):
     """Ours from the /metrics delta, theirs from the usage field. Never zero
     for an engine that exports nothing: absent stays absent."""
-    before = (leg.get("metrics_before") or {}).get("counters") or {}
-    after = (leg.get("metrics_after") or {}).get("counters") or {}
-    draft = accepted = None
-    for name, val in after.items():
-        base = name.split("{")[0]
-        if base.endswith("spec_decode_num_draft_tokens_total"):
-            draft = val - before.get(name, 0.0)
-        elif base.endswith("spec_decode_num_accepted_tokens_total"):
-            accepted = val - before.get(name, 0.0)
-    if draft is not None and accepted is not None and draft > 0:
-        return {"source": "/metrics", "draft": draft, "accepted": accepted,
-                "rate": accepted / draft}
+    mb = leg.get("metrics_before") or {}
+    ma = leg.get("metrics_after") or {}
+    # A scrape that FAILED is not a scrape that returned nothing. Ignoring the
+    # flag makes a dropped request on a crashy box read as "this engine exports
+    # no acceptance", which is a claim about the engine.
+    if mb.get("available") and ma.get("available"):
+        before = mb.get("counters") or {}
+        after = ma.get("counters") or {}
+        draft = accepted = None
+        for name, val in after.items():
+            base = name.split("{")[0]
+            # SUM every label series, never keep the last one: one series per
+            # model is what this engine emits today and that is not a contract.
+            if base.endswith("spec_decode_num_draft_tokens_total"):
+                draft = (draft or 0.0) + val - before.get(name, 0.0)
+            elif base.endswith("spec_decode_num_accepted_tokens_total"):
+                accepted = (accepted or 0.0) + val - before.get(name, 0.0)
+        if draft is not None and accepted is not None:
+            if draft < 0 or accepted < 0:
+                # A counter cannot fall. The server restarted inside the leg, so
+                # the delta is not a measurement of it.
+                return {"source": "counter reset inside the leg"}
+            if draft > 0:
+                return {"source": "/metrics", "draft": draft,
+                        "accepted": accepted, "rate": accepted / draft}
     acc = [r["accepted_draft_tokens"] for r in ok_records(leg, "measured")
            if r.get("accepted_draft_tokens") is not None]
     if acc:
@@ -193,8 +226,8 @@ def print_cells(legs, args):
 
     print("\n## Per leg: throughput and the spread between rounds\n")
     print("| arm | c | round | ok/n | out tok/s | decode-only tok/s "
-          "| mean TTFT ms | p95 TTFT ms | wall s | counted by |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+          "| mean TTFT ms | p95 TTFT ms | wall s | counted by | publishable |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
     for key in sorted(cells):
         for path, leg in sorted(cells[key],
                                 key=lambda pl: pl[1]["summary"]["round"]):
@@ -209,7 +242,8 @@ def print_cells(legs, args):
                   f"| {fmt(dec, 2)} "
                   f"| {fmt(statistics.mean(a['ttft']) if a['ttft'] else None)} "
                   f"| {fmt(percentile(a['ttft'], 95))} | {fmt(wall)} "
-                  f"| {a['counted_by']} |")
+                  f"| {a['counted_by']} "
+                  f"| {'yes' if a['publishable'] else 'NO (G-USAGE)'} |")
 
     print("\n## Round-to-round spread per cell\n")
     print("| arm | c | out tok/s per round | spread | p95 TTFT ms per round "
@@ -235,8 +269,9 @@ def print_cells(legs, args):
         print(f"\n## Percentiles, pooled over both rounds ({title})\n")
         print("Pooled n per cell is both rounds together, so p99 and max are "
               "read off that pool and not off a single leg.\n")
-        print("| arm | c | n | axis | p50 | p90 | p95 | p99 | max | mean |")
-        print("|---|---|---|---|---|---|---|---|---|---|")
+        cols = " | ".join(f"p{p:g}" for p in PCTS)
+        print(f"| arm | c | n | axis | {cols} | max | mean |")
+        print("|---|---|---|" + "---|" * (len(PCTS) + 3))
         for key in sorted(cells):
             pooled = []
             for _, leg in cells[key]:
@@ -256,8 +291,8 @@ def print_cells(legs, args):
           "token count, so it is the first chunk's characters divided by that "
           "request's own characters-per-token.\n")
     print("| arm | c | tokens per chunk | chars per token | first chunk tokens "
-          "(est) | p50 TTFT raw ms | p50 TTFT corrected ms (est) |")
-    print("|---|---|---|---|---|---|---|")
+          "(est) | p50 TTFT raw ms | p50 TTFT corrected ms (est) | corrections refused |")
+    print("|---|---|---|---|---|---|---|---|")
     for key in sorted(cells):
         pooled = []
         for _, leg in cells[key]:
@@ -268,7 +303,8 @@ def print_cells(legs, args):
               f"| {fmt(mean(a['chars_per_token']), 2)} "
               f"| {fmt(mean(a['first_chunk_tokens']), 2)} "
               f"| {fmt(percentile(a['ttft'], 50))} "
-              f"| {fmt(percentile(a['ttft_corrected'], 50))} |")
+              f"| {fmt(percentile(a['ttft_corrected'], 50))} "
+              f"| {a['over_corrected']}/{a['n']} |")
 
     print("\n## Acceptance\n")
     print("| arm | c | round | source | value |")
@@ -283,8 +319,10 @@ def print_cells(legs, args):
             elif acc["source"] == "usage":
                 val = (f"accepted {acc['accepted']:.0f}, "
                        f"{fmt(acc['per_output_token'], 3)} per output token")
-            else:
+            elif acc["source"] == "absent":
                 val = "NOT EXPOSED BY THIS ENGINE"
+            else:
+                val = acc["source"]
             print(f"| {key[0]} | {key[1]} | {leg['summary']['round']} "
                   f"| {acc['source']} | {val} |")
 
@@ -296,7 +334,13 @@ def print_cells(legs, args):
         for _, leg in sorted(cells[key],
                              key=lambda pl: pl[1]["summary"]["round"]):
             warm = ok_records(leg, "warmup")
-            first = min((r["ttft"] for r in warm), default=None)
+            # THE FIRST warmup request, by dispatch order, not the cheapest one.
+            # `min` over the ttft values returns whichever warmup request paid
+            # the LEAST, which at c > 1 is precisely the one that did not pay the
+            # cold start. This column exists to publish that cost.
+            first_rec = min(warm, key=lambda r: (r.get("t_dispatch", 0.0),
+                                                 r.get("i", 0)), default=None)
+            first = first_rec["ttft"] if first_rec is not None else None
             aw = axes(ok_records(leg, "measured"))
             aa = axes(ok_records(leg, None))
             print(f"| {key[0]} | {key[1]} | {leg['summary']['round']} "

@@ -27,6 +27,20 @@ the statistics can be recomputed without rerunning the GPU.
 ignore_eos is deliberately NOT sent. Both published protocols let the model
 stop, and forcing a fixed length is one of the differences that made earlier
 numbers non-comparable.
+
+TWO DELIBERATE DIVERGENCES FROM vLLM's OWN CLIENT, declared here because
+`report.py` says its metric definitions are mirrored from `serve.py`:
+
+  * `latency` stops after the response stream is fully read, where vLLM stops at
+    the last data frame (`vllm/benchmarks/lib/endpoint_request_func.py:541`).
+    `[DONE]` and the connection close are therefore inside `e2el`, and so inside
+    `tpot`. Over loopback this is small, and it is the same code on both
+    engines, but it is not upstream's definition.
+  * `ttft` requires a chunk that carries CONTENT, where vLLM takes the first
+    chunk with `choices` at all
+    (`endpoint_request_func.py:520-524`). One of the two engines here opens with
+    a role-only delta and the other does not, so upstream's rule would have
+    measured a protocol difference.
 """
 import argparse
 import json
@@ -110,7 +124,7 @@ def stream_one(url, model, messages, args):
         "n_chunks": len(chunk_times),
         "first_chunk_chars": first_chunk_chars,
         "total_chars": text_len,
-        # Chunk arrival gaps. This is vLLM's `itl` (serve.py:615): a gap between
+        # Chunk arrival gaps. This is vLLM's `itl` (serve.py:614): a gap between
         # STREAMED CHUNKS, which is a per-token gap only on an engine that
         # streams one token per chunk.
         "itls": [chunk_times[i] - chunk_times[i - 1]

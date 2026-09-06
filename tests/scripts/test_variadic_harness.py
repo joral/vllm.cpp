@@ -346,6 +346,171 @@ class AcceptanceFromMetrics(unittest.TestCase):
         self.assertNotIn("rate", acc)
 
 
+class ThroughputDenominatorExcludesWarmup(unittest.TestCase):
+    """The number the phase labels exist to protect.
+
+    A fresh review broke `measured_wall_s` to `warm_wall + measured_wall` and the
+    whole suite stayed green: the records, their phase labels and every
+    percentile were still right, and only the headline throughput halved. The
+    old bound (`measured < 0.75 * total`) did not bite because warmup and
+    measured cost the same. Here the warmup phase is deliberately EXPENSIVE, so
+    a denominator that absorbs it cannot pass.
+    """
+
+    def test_the_measured_wall_clock_is_the_measured_phase_and_nothing_else(self):
+        srv, url = start_mock(tokens=4, per_token_s=0.05, prefill_s=0.02)
+        with tempfile.TemporaryDirectory() as tmp:
+            # 8 warmup requests against 2 measured, at c=1: the warmup phase is
+            # four times the measured one.
+            rc, leg = run_leg(url, tmp, "denom", 1, 2, 8)
+        _stop(srv)
+        self.assertEqual(rc.returncode, 0, rc.stderr)
+        s = leg["summary"]
+        measured = report.ok_records(leg, "measured")
+        # Every measured request is sequential at c=1, so the phase's wall clock
+        # is the sum of their latencies plus the client's own per-request gap.
+        span = sum(r["latency"] for r in measured)
+        self.assertGreaterEqual(s["measured_wall_s"], span)
+        self.assertLess(s["measured_wall_s"], span * 1.5,
+                        "the measured wall clock absorbed time no measured "
+                        "request spent")
+        self.assertGreater(s["warm_wall_s"], 3 * s["measured_wall_s"],
+                           "the warmup phase should dominate this fixture")
+
+    def test_throughput_uses_the_measured_denominator(self):
+        srv, url = start_mock(tokens=4, per_token_s=0.05, prefill_s=0.02)
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, leg = run_leg(url, tmp, "denom2", 1, 2, 8)
+        _stop(srv)
+        a = report.axes(report.ok_records(leg, "measured"))
+        rate = sum(a["out_tokens"]) / leg["summary"]["measured_wall_s"]
+        both = sum(a["out_tokens"]) / (leg["summary"]["measured_wall_s"]
+                                       + leg["summary"]["warm_wall_s"])
+        self.assertGreater(rate, 3 * both,
+                           "a denominator that included warmup would be "
+                           "indistinguishable here")
+
+
+class TpotMatchesUpstream(unittest.TestCase):
+    """`tpot` is the declared primary inter-token axis and had no value control.
+
+    vllm/benchmarks/serve.py:610 divides by `output_tokens - 1`, not by
+    `output_tokens`. The mock's per-token cost is known, so the arithmetic is
+    checkable exactly rather than by inspection.
+    """
+
+    def test_tpot_divides_by_output_tokens_minus_one(self):
+        per_tok = 0.02
+        srv, url = start_mock(tokens=11, tokens_per_chunk=1,
+                              per_token_s=per_tok, prefill_s=0.10)
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, leg = run_leg(url, tmp, "tpot", 1, 6, 2)
+        _stop(srv)
+        a = report.axes(report.ok_records(leg, "measured"))
+        mean_tpot = sum(a["tpot"]) / len(a["tpot"]) / 1000.0
+        # 11 tokens: ttft covers the prefill and token 1, then 10 more gaps of
+        # `per_tok`. (latency - ttft) / (11 - 1) == per_tok.
+        self.assertAlmostEqual(mean_tpot, per_tok, delta=0.5 * per_tok)
+        # Dividing by n instead of n-1 gives 10/11 of this, which is inside that
+        # delta, so pin the ratio against the wrong divisor directly.
+        wrong = mean_tpot * 11 / 10
+        self.assertLess(abs(mean_tpot - per_tok), abs(wrong - per_tok),
+                        "n-1 must fit the mock better than n")
+
+    def test_e2el_and_ttft_bracket_tpot(self):
+        srv, url = start_mock(tokens=11, tokens_per_chunk=1, per_token_s=0.02,
+                              prefill_s=0.10)
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, leg = run_leg(url, tmp, "brk", 1, 6, 2)
+        _stop(srv)
+        a = report.axes(report.ok_records(leg, "measured"))
+        for ttft, e2el, tpot in zip(a["ttft"], a["e2el"], a["tpot"]):
+            self.assertAlmostEqual(e2el - ttft, tpot * 10, delta=0.2 * tpot * 10)
+
+
+class ColdStartNamesTheFirstRequest(unittest.TestCase):
+    """The cold-start column printed `min(ttft)` under a "first request" heading.
+
+    At c > 1 the warmup phase is concurrent, and the cheapest warmup request is
+    exactly the one that did NOT pay the cold start. The published claim this
+    column carries is "request i=0 cost us 27.5 s", so printing the minimum
+    understates it in the direction that flatters.
+    """
+
+    def _leg_with_a_slow_first_request(self, tmp):
+        # One record with a large ttft and three cheap ones, in dispatch order.
+        recs = []
+        for i, ttft in enumerate([2.75, 0.09, 0.08, 0.085]):
+            recs.append({
+                "i": i, "id": f"X-{i:04d}", "band": "S", "phase": "warmup",
+                "ok": True, "ttft": ttft, "latency": ttft + 0.2,
+                "n_chunks": 4, "itls": [0.05, 0.05, 0.05],
+                "t_dispatch": i * 0.001,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                "accepted_draft_tokens": None,
+                "first_chunk_chars": 4, "total_chars": 20,
+            })
+        for i in range(4, 8):
+            recs.append({
+                "i": i, "id": f"X-{i:04d}", "band": "S", "phase": "measured",
+                "ok": True, "ttft": 0.09, "latency": 0.29, "n_chunks": 4,
+                "itls": [0.05, 0.05, 0.05], "t_dispatch": i * 0.001,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                "accepted_draft_tokens": None,
+                "first_chunk_chars": 4, "total_chars": 20,
+            })
+        leg = {"summary": {"leg": "OURS-r1-c1", "arm": "OURS", "round": 1,
+                           "concurrency": 1, "warmup_requests": 4,
+                           "measured_requests": 4, "warm_wall_s": 3.5,
+                           "measured_wall_s": 1.2},
+               "config": {}, "metrics_before": {"available": False},
+               "metrics_after": {"available": False}, "records": recs}
+        path = Path(tmp) / "OURS-r1-c1.json"
+        path.write_text(json.dumps(leg))
+        return path
+
+    def test_the_column_prints_the_first_request_not_the_cheapest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._leg_with_a_slow_first_request(tmp)
+            rc = subprocess.run(
+                [sys.executable, str(HARNESS / "report.py"), "--dir", tmp,
+                 "--glob", "*-r*-c*.json"],
+                capture_output=True, text=True, timeout=120)
+        self.assertEqual(rc.returncode, 0, rc.stderr)
+        row = next(ln for ln in rc.stdout.splitlines()
+                   if ln.startswith("| OURS | 1 | 1 | 2750.0"))
+        self.assertIn("2750.0", row)
+        self.assertNotIn("| 80.0 |", row.split("2750.0")[0] + "|",
+                         "the cheapest warmup request must not be published "
+                         "as the first one")
+
+
+class PercentileHeaderMatchesWhatIsComputed(unittest.TestCase):
+    """The header was hardcoded while the values came from PCTS.
+
+    Setting `PCTS = (50, 50, 50, 50)` left the whole suite green, including the
+    header check, so a reader could take p99 off a column holding p50.
+    """
+
+    def test_the_header_is_derived_from_pcts(self):
+        srv, url = start_mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus = make_corpus(tmp, 20)
+            run_leg(url, tmp, "OURS-r1-c1", 1, 6, 2, arm="OURS", corpus=corpus)
+            _stop(srv)
+            rc = subprocess.run(
+                [sys.executable, str(HARNESS / "report.py"), "--dir", tmp,
+                 "--glob", "*-r*-c*.json"],
+                capture_output=True, text=True, timeout=120)
+        self.assertEqual(rc.returncode, 0, rc.stderr)
+        header = next(ln for ln in rc.stdout.splitlines()
+                      if ln.startswith("| arm | c | n | axis |"))
+        cells = [c.strip() for c in header.split("|")[5:-3]]
+        self.assertEqual(cells, [f"p{p:g}" for p in report.PCTS], header)
+        self.assertEqual(len(set(report.PCTS)), len(report.PCTS),
+                         "PCTS must not repeat a percentile")
+
+
 class ReportTablesAreWellFormed(unittest.TestCase):
     """Every markdown row carries exactly as many cells as its header.
 
