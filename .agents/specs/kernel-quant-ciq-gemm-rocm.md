@@ -151,6 +151,59 @@ accumulation, following the same shape as the existing scalar path
 because the risk below is that no library path carries the per-superblock
 scale layout through the tile op.
 
+## Design: cooperative activation share (issue #3034)
+
+A follow-on wave, after the wider-block A/B (#3032/#3033, measured and
+rejected, geomean -4.3%) and reading llama.cpp's actual `mul_mat_q` source
+(confirmed, not inferred: `ggml-cuda/mmq.cuh`, `mmq-config-rdna4.cuh`,
+`mmq-load-tiles.cuh`) to find out why widening alone did not help.
+
+**The precise redundancy, traced through this kernel's own index math.**
+`tile = blockIdx.x * WarpsPerBlock + threadIdx.y`, `it = tile / n_tiles`,
+`jt = tile % n_tiles`. Because `n_tiles` (weight-row tile count, e.g. 192 at
+N=3072) is always far larger than `WarpsPerBlock`, every warp in one block
+shares the SAME `it` (activation rows) and gets a DIFFERENT, consecutive
+`jt` (weight rows). So within one block, every warp already reads the
+identical 16 activation rows — and does so independently, via its own
+`load_matrix_sync` call straight to global memory, every superblock. The
+rejected wide-block experiment widened this same redundancy (more warps
+sharing one `it`) without adding any sharing to fix it, which is exactly
+why it did not help: it made the redundant pattern wider, not cheaper.
+
+**The design**, scoped deliberately smaller than matching llama.cpp's full
+128x128 cooperative tile (that would also share the WEIGHT tile across a
+wider `jt` range per warp, which our current per-warp weight assignment
+does not need — weight rows are already disjoint across warps in one
+block, so there is no analogous weight-side redundancy to remove):
+
+1. Reuse `kQuantWmmaWideWarpsPerBlock == 8` (already in the tree from
+   #3033, currently unused/rejected on its own). At 8 warps, one block
+   already spans a 128 weight-row range, matching llama.cpp's `I=128` on
+   that one axis, for free.
+2. Add cooperative activation staging: once per superblock, before any
+   warp's WMMA calls for that superblock, ALL 8 warps' threads together
+   copy the shared `it`'s `BlockQ8_K` bytes (`qs`, `bsums`, `d`) for this
+   one superblock into ONE shared buffer, `__syncthreads()`, then every
+   warp's `load_matrix_sync` (and the Q4_K min-correction's `bsums` read)
+   reads from that shared copy instead of calling global memory
+   independently 8 times.
+3. LDS budget check: the existing 8-warp arm already uses ~50 KiB
+   (`w_stage` 32 KiB + `row_scales`/`row_mins` 2 KiB + `raw_tile` 16 KiB
+   for Q4_K, the larger of the two formats). One superblock's worth of
+   shared `BlockQ8_K` bytes for 16 rows is `qs` (256 B) + `bsums` (32 B) +
+   `d` (4 B) per row x 16 rows ~= 4.7 KiB. Total ~55 KiB, under the 64 KiB
+   limit — no redesign of the existing weight-side staging is needed to
+   fit this.
+
+**What this measurement isolates.** If this wins, sharing was the lever
+the wider-block-alone experiment could not reach, and it is worth checking
+whether widening `J` (the activation range one warp loops over, still 16
+today) compounds it further. If it does not win, the redundant reads were
+likely already served by cache rather than costing real bandwidth, and the
+remaining gap points somewhere else — raw WMMA instruction throughput or
+shared-memory bank-conflict patterns, not data reuse. Either result is
+recorded, not assumed.
+
 ## Port map
 
 | Upstream | Local |
