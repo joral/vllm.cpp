@@ -22,7 +22,7 @@ queue by this model.
 
 ## The reached set, established against the tree and not taken from the issue
 
-`src/vllm/model_executor/models/glm5_next_forward.cpp:307-311`, on any non-CPU
+`src/vllm/model_executor/models/glm5_next_forward.cpp:307-310`, on any non-CPU
 queue and before a single operand is built:
 
 ```cpp
@@ -32,13 +32,13 @@ queue and before a single operand is built:
         vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, queue.device.type);
 ```
 
-`src/vt/rocm/rocm_ops.hip:255` registers `kMatmulBTQuantGrouped` on
+`src/vt/rocm/rocm_ops.hip:261` registers `kMatmulBTQuantGrouped` on
 `DeviceType::kROCM`. Nothing under `src/vt/rocm/` registers
 `kMoeGateUpSwiGLUGrouped`; the only registrations are
 `src/vt/cuda/cuda_quant_dot.cu:2867` (`kCUDA`) and
-`src/vt/cpu/cpu_quant_gemm.cpp:308` (`kCPU`). `gate_up_here` is therefore the
+`src/vt/cpu/cpu_quant_gemm.cpp:310` (`kCPU`). `gate_up_here` is therefore the
 one half of that pair that is false on ROCm, and the forward throws at
-`:315-328` naming exactly it.
+`:315-327` naming exactly it.
 
 The other three are **not** reached on a device queue:
 
@@ -60,9 +60,9 @@ is smaller than the missing set.
 
 | Role | Path |
 |---|---|
-| Numerics donor (the golden) | `src/vt/cpu/cpu_quant_gemm.cpp:274-298`, `MoeGateUpSwiGLUGroupedKernel` |
-| Seam contract | `src/vt/ops.cpp:255-285` (`vt::MoeGateUpSwiGLUGrouped`), `include/vt/ops.h:2192-2194` (`MoeGateUpSwiGLUGroupedFn`) |
-| Epilogue definition | `src/vt/cuda/cuda_quant_dot.cu:1090-1143`, `QuantDotGemmGroupedFusedSwiGLUKernel` — read for the epilogue formula only |
+| Numerics donor (the golden) | `src/vt/cpu/cpu_quant_gemm.cpp:282-299`, `MoeGateUpSwiGLUGroupedKernel` |
+| Seam contract | `src/vt/ops.cpp:256-285` (`vt::MoeGateUpSwiGLUGrouped`), `include/vt/ops.h:2192-2194` (`MoeGateUpSwiGLUGroupedFn`) |
+| Epilogue definition | `src/vt/cuda/cuda_quant_dot.cu:1090-1142`, `QuantDotGemmGroupedFusedSwiGLUKernel` — read for the epilogue formula only |
 | Reused ROCm GEMM | `src/vt/rocm/rocm_grouped_gemm.hip:896`, `MatmulBTQuantGroupedKernelRocm` |
 | HIP idiom, TU shape | `src/vt/rocm/rocm_moe_chain.hip` |
 | Wavefront width, and why no warp primitive | `src/vt/rocm/rocm_rmsnorm.hip:39-44` |
@@ -118,11 +118,11 @@ The two GEMM calls each re-quantize the same activation into that shared block.
 That is redundant work, not a defect — the calls are stream-ordered, so the
 second sees a correctly rewritten buffer. It is priced under `## Owed`.
 
-**Dtype refusals.** The seam (`ops.cpp:257-283`) already validates rank, shapes,
+**Dtype refusals.** The seam (`ops.cpp:256-285`) already validates rank, shapes,
 same-block-quant dtype for both towers, f32 output, `K % BlockElems == 0`,
 packed activation rows, contiguity and device match. The kernel re-asserts the
 f32 output and the equal gate/up dtype, because `Tensor::Ptr<T>()` is an
-unchecked cast — the hazard `rocm_moe_chain.hip:107-110` names from the #509
+unchecked cast — the hazard `rocm_moe_chain.hip:141-146` names from the #509
 review sweep.
 
 ## Risks
@@ -147,11 +147,11 @@ fixture shape, block builders and tolerance — `kNmseTol = 5e-4` (`:58`). No
 wider tolerance is invented.
 
 **Three assertions per device, and the middle one is the load-bearing one.**
-The file's own header note at `:3676-3689` says why:
+The file's own header note at `:3845-3858` says why:
 
 1. the device result matches the CPU oracle at `Nmse <= kNmseTol`;
 2. `vt::OpRegistered(op, DeviceType::kROCM)` is true — the native-only probe
-   (`src/vt/op_provider.cpp:788-806`), the **only** one of the three that can
+   (`src/vt/op_provider.cpp:799-823`), the **only** one of the three that can
    tell a native kernel from the reference tier, because the tier computes the
    same answer and an oracle-equality assertion is green with no kernel at all;
 3. `vt::GetReferenceTierHits()` does not increase across the call.

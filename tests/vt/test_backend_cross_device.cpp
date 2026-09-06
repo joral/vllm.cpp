@@ -3398,18 +3398,18 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
 // oracle, running on the host against device memory the backend reports
 // host-addressable. So assertion (1) alone is GREEN on a backend with no kernel
 // at all. Assertion (2) is `vt::OpRegistered`, a NATIVE-ONLY probe by design
-// (src/vt/op_provider.cpp:788-806), and it is the only one of the three that can
+// (src/vt/op_provider.cpp:799-823), and it is the only one of the three that can
 // tell a native kernel from the tier. Assertion (3) catches the same thing from
 // the other side, by counting.
 //
-// `glm5_next_forward.cpp:307-311` reads BOTH kMoeGateUpSwiGLUGrouped and
+// `glm5_next_forward.cpp:307-310` reads BOTH kMoeGateUpSwiGLUGrouped and
 // kMatmulBTQuantGrouped through `vt::OpRegistered` before it builds an operand,
 // and refuses the device when either is false. ROCm has had the second since
-// `rocm_ops.hip:255`; this case covers the first.
+// `rocm_ops.hip:261`; this case covers the first.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is NATIVE on ROCm") {
-  // The CPU golden (cpu_quant_gemm.cpp:274-298) is the composite this op is
+  // The CPU golden (cpu_quant_gemm.cpp:282-299) is the composite this op is
   // DEFINED against: two grouped keep-quant GEMMs into f32 temporaries, then
   //   gate = min(g, limit); up = clamp(u, ±limit); out = gate·sigmoid(gate)·up
   // with no extra scale, because the grouped GEMM already folded the weight
@@ -3436,7 +3436,7 @@ TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is N
   // says a device that has not registered an op is SKIPPED rather than failed,
   // and that is right for a partial backend in general — but here the missing
   // registration IS the defect under test: it is what makes
-  // `glm5_next_forward.cpp:315-328` refuse a ROCm queue by name.
+  // `glm5_next_forward.cpp:315-327` refuse a ROCm queue by name.
   if (rocm_built) {
     CHECK(vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kROCM));
     // Its partner, already landed. Asserted beside it because the forward reads

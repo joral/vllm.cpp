@@ -2,17 +2,17 @@
 // keep-quant grouped GEMM (BACKEND-ROCM, #2942,
 // `.agents/specs/rocm-moe-gateup-swiglu-grouped.md`).
 //
-// WHY THIS OP. `glm5_next_forward.cpp:307-311` asks the op table for exactly two
+// WHY THIS OP. `glm5_next_forward.cpp:307-310` asks the op table for exactly two
 // ops on any non-CPU queue, before it builds a single operand:
 // `kMoeGateUpSwiGLUGrouped` and `kMatmulBTQuantGrouped`. ROCm has had the second
-// since `rocm_ops.hip:255`. It did not have the first, so `:315-328` refused
+// since `rocm_ops.hip:261`. It did not have the first, so `:315-327` refused
 // every ROCm queue by name and GLM-5.3-Flash could only run `--device cpu`.
 //
-// DONOR: `src/vt/cpu/cpu_quant_gemm.cpp:274-298`, `MoeGateUpSwiGLUGroupedKernel`
+// DONOR: `src/vt/cpu/cpu_quant_gemm.cpp:282-299`, `MoeGateUpSwiGLUGroupedKernel`
 // — the CPU GOLDEN, and NOT `src/vt/cuda/cuda_quant_dot.cu`'s 2923 lines. That
 // is #2942's own load-bearing instruction, and the reason is visible in the two
 // donors side by side. The CUDA kernel
-// (`cuda_quant_dot.cu:1104-1143`) fuses both dot products into one warp and
+// (`cuda_quant_dot.cu:1104-1142`) fuses both dot products into one warp and
 // reduces them with
 //
 //     for (int off = 16; off > 0; off >>= 1) pg += __shfl_down_sync(0xffffffffu, pg, off);
@@ -99,8 +99,8 @@ void* EnsureGateUpScratch(size_t need, hipStream_t s) {
   });
 }
 
-// The clamped-SwiGLU epilogue — `cpu_quant_gemm.cpp:293-297` transcribed, and
-// bit-for-bit the same expression as `cuda_quant_dot.cu:1139-1141`
+// The clamped-SwiGLU epilogue — `cpu_quant_gemm.cpp:294-298` transcribed, and
+// bit-for-bit the same expression as `cuda_quant_dot.cu:1138-1141`
 // (alpha=1, beta=0). `limit = +inf` collapses both clamps to no-ops and leaves
 // plain silu(g)*u, which is the standard SwiGLU MLP.
 //
@@ -127,11 +127,11 @@ void MoeGateUpSwiGLUGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
                                       const Tensor& gate_w, const Tensor& up_w,
                                       const Tensor& expert_ids, float limit) {
   EnsureQueueDevice(q);
-  // The seam (`ops.cpp:257-283`) has already validated rank, shapes, the
+  // The seam (`ops.cpp:256-285`) has already validated rank, shapes, the
   // same-block-quant dtype across both towers, `K % BlockElems == 0`, packed
   // activation rows, contiguity and device match. These two are re-asserted here
   // anyway because `Tensor::Ptr<T>()` is an UNCHECKED cast — the hazard the #509
-  // review sweep found in `rocm_moe_chain.hip:107-110` — and because the
+  // review sweep found in `rocm_moe_chain.hip:141-146` — and because the
   // grouped-GEMM call below would otherwise write bf16 into an f32 read.
   VT_CHECK(out.dtype == DType::kF32,
            "rocm moe_gate_up_swiglu: f32 output required");
