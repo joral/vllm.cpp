@@ -212,6 +212,12 @@ template adds about 50 tokens to every prompt, which is why the served minimum i
 
 Warm only. Aggregate output tokens divided by the measured wall clock.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/variadic-concurrency-dark.svg">
+  <img alt="Aggregate output throughput against concurrency. vllm.cpp rises from 35.8 tok/s at one concurrent request to 53.9 at eight. exllamav3 stays flat at 33.1 to 33.5." src="assets/variadic-concurrency-light.svg" width="640">
+</picture>
+
+
 | c | ours, round 1 / round 2 | spread | theirs | ours / theirs |
 |---|---|---|---|---|
 | 1 | 35.85 / 35.77 | 0.2% | 33.10 | **1.082x** |
@@ -234,6 +240,12 @@ and theirs 128. Percentiles interpolate linearly between order statistics, as
 `numpy.percentile` and `vllm/benchmarks/serve.py:739` do.
 
 ### Time to first token, ms
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/variadic-ttft-p95-dark.svg">
+  <img alt="p95 time to first token against concurrency. exllamav3 rises from 4641 ms at one concurrent request to 45418 ms at eight, while vllm.cpp goes from 9472 ms to 10838 ms." src="assets/variadic-ttft-p95-light.svg" width="640">
+</picture>
+
 
 | c | ours p50 | ours p95 | ours p99 | theirs p50 | theirs p95 | theirs p99 |
 |---|---|---|---|---|---|---|
