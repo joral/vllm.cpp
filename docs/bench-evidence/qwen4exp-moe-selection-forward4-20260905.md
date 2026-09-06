@@ -48,12 +48,16 @@ The two instruments count different things.
 `:746`. `qwen4_exp` has 48 layers and no dense layer, so one forward is 48 MoE
 calls.
 
-### #2877 states its own refutation two sentences before its conclusion
+### The 2026-09-04 annotation states its own refutation two sentences before its conclusion
 
 This is worth pointing at, because the arithmetic that overturns the claim was
-already on the page when the claim was written. #2877's headline paragraph, quoted
-verbatim in
-[the ARMTOKENS evidence file](qwen4exp-gdn-chunked-token-ids-20260904.md), reads:
+already on the page when the claim was written. The paragraph is **this
+repository's prose, not #2877's**. It was written under
+[#2877](https://github.com/mudler/vllm.cpp/issues/2877) in commit `60821f26c`,
+whose commit date is 2026-09-04 07:21:26 UTC, two hours after the issue was filed
+at 05:21:23 UTC, and it lives in
+[the ARMTOKENS evidence file](qwen4exp-gdn-chunked-token-ids-20260904.md). #2877's
+own body carries no such paragraph. The annotation reads:
 
 > MOEDIV's committed digests count **48** MoE calls at `T=5` and **336** at
 > `T=1` — 8 forwards for 8 tokens — so this window is tokens `11751 13 15767`,
@@ -68,8 +72,18 @@ window belongs to `VT_Q4EXP_LAYER_FP`, whose budget is counted in forwards. The
 eight-forward count belongs to `VT_MOE_SEL_FP`, whose budget is counted in MoE
 block invocations, and it is stated correctly.
 
-The quoted paragraph is left byte-for-byte where it appears, because it is a
-quotation of an issue body. An editorial note beside it carries this reading.
+**#2877 itself scoped the claim, and this document does not overturn that.** The
+issue body closes the same argument with "No tap in this evidence was taken at a
+step where the arms disagree", which is true of the evidence it discusses. The
+UNSCOPED sentence is the annotation's, and the unscoped sentence is what this
+document corrects. Charging the issue with the overreach would be the same defect
+this row is repairing.
+
+The annotation is left standing where it appears, because a later reader needs the
+shape of the error. It carries the same overreach in **three** sentences — its
+intro ("no tap was taken at a step where the two arms disagree"), point (0) quoted
+above, and point (3) ("no tap was taken at a step where the ids disagree") — and
+editorial notes beside all three carry this reading.
 
 ## 2. The mapping, derived from committed data
 
