@@ -378,6 +378,54 @@ def main() -> int:
     E("// The two rejected answers, emitted so the suite asserts it is NOT them.")
     E(carray("kLtx2MaskLatentBilinear", bil_flat.flatten().tolist()))
     E(carray("kLtx2MaskLatentUniformPool", unif.flatten().tolist()))
+
+    # A SECOND fixture whose spatial output does NOT divide its input. `area`
+    # pools output index i over `[floor(i*I/O), ceil((i+1)*I/O))`, which is only
+    # the integer-stride window `[i*(I//O), (i+1)*(I//O))` when O divides I. The
+    # 8 -> 2 case above is divisible, so it is elementwise equal to the stride
+    # reading and cannot see the difference; 9 -> 2 can.
+    nd_f_pix, nd_h_pix, nd_w_pix = 9, 9, 9
+    nd_f_lat, nd_h_lat, nd_w_lat = 3, 2, 2
+    nd_vals = deterministic(nd_f_pix * nd_h_pix * nd_w_pix, 0x9D19151B)
+    nd_mask = torch.tensor(nd_vals, dtype=torch.float32).reshape(
+        1, 1, nd_f_pix, nd_h_pix, nd_w_pix)
+    nd_shape = VideoLatentShape.from_torch_shape((1, 1, nd_f_lat, nd_h_lat, nd_w_lat))
+    nd_got = downsample(nd_mask, nd_shape)
+
+    def stride_box_spatial(volume, h_out, w_out):
+        """The plausible wrong reading: an integer-stride box filter."""
+        frames, h_in, w_in = volume.shape[2], volume.shape[3], volume.shape[4]
+        sh, sw = h_in // h_out, w_in // w_out
+        out_v = torch.empty(1, 1, frames, h_out, w_out, dtype=torch.float32)
+        for fi in range(frames):
+            for oh in range(h_out):
+                for ow in range(w_out):
+                    out_v[0, 0, fi, oh, ow] = volume[
+                        0, 0, fi, oh * sh:(oh + 1) * sh, ow * sw:(ow + 1) * sw].mean()
+        return out_v
+
+    nd_t = (nd_f_pix - 1) // (nd_f_lat - 1)
+    box = stride_box_spatial(nd_mask, nd_h_lat, nd_w_lat)
+    box_rest = rearrange(box[:, :, 1:], "b 1 (f t) h w -> b 1 f t h w", t=nd_t).mean(3)
+    box_flat = rearrange(torch.cat([box[:, :, :1], box_rest], 2), "b 1 f h w -> b (f h w)")
+    require_separation("downsample_mask_video_to_latent at a NON-DIVIDING spatial pair (9 -> 2)",
+                       "an integer-stride box filter, which `area` equals only when O divides I",
+                       float((nd_got - box_flat).abs().max()))
+    E("// A NON-DIVIDING spatial pair, 9 -> 2. `area` pools output index i over")
+    E("// `[floor(i*I/O), ceil((i+1)*I/O))`; the integer-stride window")
+    E("// `[i*(I//O), (i+1)*(I//O))` agrees with it on every divisible shape and")
+    E("// only there, so the 8 -> 2 case above cannot see the difference and this")
+    E("// one can.")
+    E(f"inline constexpr int64_t kLtx2MaskNdPixFrames = {nd_f_pix};")
+    E(f"inline constexpr int64_t kLtx2MaskNdPixHeight = {nd_h_pix};")
+    E(f"inline constexpr int64_t kLtx2MaskNdPixWidth = {nd_w_pix};")
+    E(f"inline constexpr int64_t kLtx2MaskNdLatFrames = {nd_f_lat};")
+    E(f"inline constexpr int64_t kLtx2MaskNdLatHeight = {nd_h_lat};")
+    E(f"inline constexpr int64_t kLtx2MaskNdLatWidth = {nd_w_lat};")
+    E(carray("kLtx2MaskNdPixels", nd_vals))
+    E(carray("kLtx2MaskNdLatentWeights", nd_got.flatten().tolist()))
+    E("// The rejected answer, emitted so the suite asserts it is NOT this one.")
+    E(carray("kLtx2MaskNdLatentStrideBox", box_flat.flatten().tolist()))
     E("")
 
     # ── 4. resolve_cross_mask + build_attention_mask (mask_utils.py) ──────────

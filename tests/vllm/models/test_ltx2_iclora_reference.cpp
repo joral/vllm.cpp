@@ -173,6 +173,44 @@ TEST_CASE("ltx2 ic-lora: the mask downsample carves out the first latent frame")
                 "carve-out (iclora_utils.py:70, :80) is not happening");
 }
 
+TEST_CASE("ltx2 ic-lora: the area window is the general form, not an integer stride") {
+  // `mode="area"` dispatches to `adaptive_avg_pool2d`, whose window for output
+  // index `i` is `[floor(i*I/O), ceil((i+1)*I/O))`. An integer-stride box filter
+  // `[i*(I//O), (i+1)*(I//O))` is elementwise EQUAL to it on every divisible
+  // shape, so the 8 -> 2 fixture above cannot see the difference and neither can
+  // the e2e case, which reads a 64x64 mask and pools to 2x2. This fixture is
+  // 9 -> 2, where the two readings separate.
+  const int64_t f_pix = vllm_test::kLtx2MaskNdPixFrames;
+  const int64_t h_pix = vllm_test::kLtx2MaskNdPixHeight;
+  const int64_t w_pix = vllm_test::kLtx2MaskNdPixWidth;
+  const int64_t f_lat = vllm_test::kLtx2MaskNdLatFrames;
+  const int64_t h_lat = vllm_test::kLtx2MaskNdLatHeight;
+  const int64_t w_lat = vllm_test::kLtx2MaskNdLatWidth;
+  REQUIRE(h_pix % h_lat != 0);  // the fixture is only a gate while it stays indivisible
+  REQUIRE(w_pix % w_lat != 0);
+  const std::vector<float> mask(
+      vllm_test::kLtx2MaskNdPixels,
+      vllm_test::kLtx2MaskNdPixels + static_cast<size_t>(f_pix * h_pix * w_pix));
+
+  const std::vector<float> got =
+      vllm::Ltx2DownsampleMaskVideoToLatent(mask, f_pix, h_pix, w_pix, f_lat, h_lat, w_lat);
+  REQUIRE(got.size() == static_cast<size_t>(f_lat * h_lat * w_lat));
+
+  double max_diff = 0.0, stride_diff = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    max_diff = std::max(max_diff, std::fabs(static_cast<double>(
+                                      got[i] - vllm_test::kLtx2MaskNdLatentWeights[i])));
+    stride_diff = std::max(stride_diff,
+                           std::fabs(static_cast<double>(
+                               got[i] - vllm_test::kLtx2MaskNdLatentStrideBox[i])));
+  }
+  CHECK_MESSAGE(max_diff < 1e-6, "max |diff| against the executed oracle is " << max_diff);
+  CHECK_MESSAGE(stride_diff > 1e-3,
+                "the port agrees with an integer-stride box filter, so the `area` window is "
+                "the divisible special case rather than the general form "
+                "(iclora_utils.py:63-67, ltx2_iclora_reference.cpp PoolStart/PoolEnd)");
+}
+
 TEST_CASE("ltx2 ic-lora: the mask downsample refuses an incompatible frame pair") {
   // Upstream's own assertion (`:74-77`). A truncating group size would silently
   // drop the tail of the mask and still produce the right number of weights.
