@@ -1076,6 +1076,23 @@ class GPUModelRunner final : public ModelRunnerBase {
   // derive the same two vectors differently. Inert unless spec_on().
   void propose_after_verify(int num_reqs);
 
+  // The PROPOSE that follows a PLAIN DECODE step (SPEC-MTP I5d), lifted out of
+  // `sample_tokens` by SPEC-DFLASH2 A2-4 (#2920) for exactly the reason A2-2
+  // lifted `propose_after_verify` out: `sample_tokens_async` needs the SAME
+  // derivation, and a second hand-written copy of "every generating row sampled
+  // one token, rejected none" is a rule with two expressions.
+  //
+  // Upstream has ONE propose tail for both routes — `sample()` picks the
+  // sampler on `input_batch.num_draft_tokens == 0`
+  // (gpu/model_runner.py:1129 @ pin 5559679229) and returns that sampler's own
+  // `num_sampled` / `num_rejected`, which the single
+  // `if self.speculator is not None:` tail at :1524-1547 then proposes from.
+  // We have two entry points and two arms, so the pair of derivations is named
+  // once each and APPLIED four times rather than written four times.
+  //
+  // Inert unless spec_on().
+  void propose_after_decode(int num_reqs);
+
   // Lazily create the two persistent events the kCopyQueueEvent route records
   // (fork: copy-queue-waits-main; ready: D2H completion). Created ONCE and
   // re-recorded each step — never a per-step CreateEvent, which on CUDA
