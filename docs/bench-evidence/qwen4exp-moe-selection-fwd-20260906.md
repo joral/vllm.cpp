@@ -129,12 +129,22 @@ request has already returned `http=200`. Read the empty error field, not the
 `Killed`.
 
 **The budget was not the limiter; the request length was.** `VT_MOE_SEL_FP=512`
-allows 512 MoE calls, and 384 were taken. Each arm's server log carries 11
-`core-step end` lines of which **8 read `model_executed=1`**: one prefill and seven
-decodes, which is 8 model forwards. The other three executed no model forward. 8
-forwards x 48 layers = 384 MoE calls, so **the tap covered every forward this
-request ran** and stopped because the request finished. It did not stop on its
-budget.
+allows 512 MoE calls, and 384 were taken. The capture carries the forward count
+directly, on two independent lines: `RESULT IDS` lists **eight** sampled token ids
+per arm, and the comparator asserts the structure it derived from the data as
+`STRUCTURE forwards=8 moe_blocks_per_forward=48` beside
+`contiguous_and_uniform=True`. 8 forwards x 48 blocks = **384** MoE calls against a
+512 budget, so **the tap covered every forward this request ran** and stopped
+because the request finished. It did not stop on its budget.
+
+**The arms' `steps completed: 11` is a scheduler count, not a forward count**, and
+the split between the two is not quoted here. `job.sh:168` derives that field as
+`grep -c 'core-step end'` over each arm's `server.log`, which lives on the fleet
+share that §10 declares scratch; the strings `core-step` and `model_executed`
+appear **zero** times in this capture (positive controls in the same command
+shape over the same file: `steps completed` 6, `RESULT` 243). The 384-call
+conclusion above does not need that split, because `RESULT IDS` and `STRUCTURE`
+are both in the capture and already over-determine it.
 
 ## 3. The negative control: A against C flips nothing
 
@@ -220,6 +230,17 @@ with divergence accumulating in the recurrent and KV state, but it is an
 monotone (forward 3 is the lowest at 35.4%), and nothing here isolates depth from
 anything else that changes with it.
 
+**The agreeing group is the log's own `GROUP AGREEING forwards=[1, 2, 3, 5]`, and
+it excludes prefill forward 0.** Forward 0 is not comparable with a decode
+forward: it carries 240 slots for five tokens against every decode forward's 48
+for one, and its per-token flip count is the one figure §9 cannot reproduce from
+committed data. State the direction plainly, because a chosen grouping invites the
+question. Including forward 0 would make the agreeing group 169 of 432, or 39.1%,
+against the disagreeing group's 88.2% -- it **widens** the gap between the two
+populations and makes the causal reading look *stronger* than the log's own
+grouping does. The exclusion therefore costs this document's conclusion rather
+than buying it.
+
 ## 5. Layer 0 on the bracketed pair: no flip, and the bracket narrows
 
 `x` at call 0 is the layer-0 MoE input, and the job asserts it against the pair
@@ -264,6 +285,13 @@ expert-flip threshold now sits between `4.324e-05` (no flip) and `4.999e-04`
 bracket, and it reproduces the bracketing pair's own tensor values at call 0
 before it reports anything.
 
+**The bracket's two endpoints use CPU-CTRL as their base and this row uses
+CPU-chunked**, so placing `4.324e-05` between them presumes the layer-0 flip
+threshold is monotone in this norm across heterogeneous pairs. That presumption is
+inherited from #2552's bracket and is not established by anything here. What this
+reading establishes without it is the unconditional half: **at this pair, at layer
+0, the selection does not flip.**
+
 ### 5.2 The mechanistic separation #2877 recorded as unknown
 
 #2552 decomposed the layer-0 MoE residue onto two terms: the keep-quant grouped
@@ -276,6 +304,15 @@ and a selection is a discrete property with bimodal error.
 residue contains **no selection flip at all**, so the bimodal top-k term is not
 what produces it there. What remains is the keep-quant grouped expert GEMM's
 scale-sum reassociation.
+
+**"What remains" is an elimination inside a two-term decomposition, and it is only
+as exhaustive as that decomposition.** The routing weights are themselves not
+bit-identical at this call -- §7's `AXIS logit first_call_not_bit_identical=0` --
+and a routing-weight difference that changes no selection belongs cleanly to
+neither of #2552's two terms. So read the conclusion as "the top-k term is ruled
+out here", which the flip verdict supports directly, rather than as "the GEMM
+reassociation is the whole residue", which the two-term shape assumes. That limit
+is inherited from #2552's decomposition and is not introduced by this reading.
 
 **Read the scope exactly.** This is a statement about **layer 0**, on **this
 pair**, in the **prefill**. It says nothing about the other 47 layers, where §4's
@@ -360,13 +397,19 @@ The comparator's own output for both comparisons is committed as
 [`cmp-measure.txt`](qwen4exp-moe-selection-fwd-20260906/cmp-measure.txt) and
 [`cmp-control.txt`](qwen4exp-moe-selection-fwd-20260906/cmp-control.txt), which
 carry the same per-forward verdicts the job also wrote as `measure.json` and
-`ctrl.json`. **Those two JSON files are deliberately not committed.**
-`scripts/check-pr-size.py`'s `BENCH_EVIDENCE_RUN` classifies
-`txt|log|gz|sh|cu|py|jsonl|rc` under a per-run evidence directory and
-`classify_path` fails closed, so a `.json` here would go red in CI. Widening a
-checker to carry a file whose content is already committed in a classified
-extension would be the wrong repair; #2629 records what that class of change
-costs.
+`ctrl.json`. **Those two JSON files are deliberately not committed, and the reason
+is duplication rather than any checker.** Every one of `cmp-measure.txt`'s 74 lines
+and `cmp-control.txt`'s 42 lines is present verbatim in the committed log, so the
+two JSONs would restate verdicts this directory already carries twice. No checker
+would have refused them: `scripts/check-pr-size.py`'s `DOC` pattern is
+`docs/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:md|png|svg|json)\Z`, `json` is in
+that allowlist, and `classify_path` returns `public_document` for
+`docs/bench-evidence/qwen4exp-moe-selection-fwd-20260906/measure.json` when it is
+executed. **Do not read `.py`'s behaviour onto `.json` here.** `.py` genuinely is
+absent from `DOC` and does raise `unclassified repository path`, which is #2629's
+gap and this row's near neighbour; `.json` is in the allowlist and does not. The
+two extensions are not the same case, and the fail-closed precedent belongs only
+to the first.
 
 ```sh
 python3 - <<'EOF'
