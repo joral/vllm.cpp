@@ -531,7 +531,22 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   as the `Release` repair: an observable stall instead of an unobservable wrong
   answer. Owner: row `SPEC-DFLASH2`, issue #2911.
 - **`sample_tokens_async`'s DECODE arm never proposes, and A2-5 is blocked on
-  it.** FOUND BY A2-3 (#2911), which is the first wave whose measurement could
+  it. FIXED BY A2-4** ([#2920](https://github.com/mudler/vllm.cpp/issues/2920)).
+  The arm now ends in `propose_after_decode`, the `num_sampled = 1` /
+  `num_rejected = 0` derivation lifted out of `sample_tokens` so the two entry
+  points APPLY one rule instead of writing it twice — the shape A2-2 established
+  for `propose_after_verify`. Upstream needs neither, because `sample()` picks
+  the sampler on `input_batch.num_draft_tokens == 0`
+  (`vllm/v1/worker/gpu/model_runner.py:1129` @ pin 5559679229) and the single
+  `if self.speculator is not None:` tail at `:1524-1547` proposes from whichever
+  sampler ran. The route stays ONE expression: the new branch is the
+  fall-through of the `StepRoutesToVerify(...)` arm, not a second reading of it.
+  Two `test_runner` cases gate it, one of them a MIXED `num_reqs == 2` step with
+  a committed row and a discarded chunked-prefill row, and both are red before
+  the change on `REQUIRE( drafts.has_value() )`. The entry stays because the
+  paragraph below it is the record of what A2-3 could see and A2-4 could not
+  reach; the residency half it did not close is the entry that follows.
+  FOUND BY A2-3 (#2911), which is the first wave whose measurement could
   see it. A2-2 gave the async sampler a verify arm and put
   `propose_after_verify` inside it, so a step that DRAFTS proposes correctly. The
   arm that runs when `StepRoutesToVerify` is false has no `spec_on()` branch at
@@ -549,6 +564,48 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   and the fill. **A2-5 cannot flip the veto until this is closed**, and whichever
   wave closes it owes the mixed-step coverage the fill's own rule now has.
   Owner: row `SPEC-DFLASH2`, issue #2911.
+- **A2-4's decode propose REFUSES on both CUDA write-back branches, and that
+  refusal is A2-5's to remove.** The propose arms read host state — the block
+  drafters take their anchor from `input_batch_.last_sampled_tokens`
+  (`runner.cpp`, `propose_drafts_block`), the n-gram matcher reads
+  `token_ids_cpu` — and only ONE of `sample_tokens_async`'s three write-back
+  branches leaves that state readable when the tail runs. The host branch
+  Synchronizes and writes the array itself. The device-mirror branch leaves the
+  host array's VALUES stale ON PURPOSE, and its own comment says so. The UMA
+  branch writes the host array from a `LaunchScatterLastSampled` queued on the
+  main queue with nothing waiting it, so a host read at the tail races the
+  kernel. Proposing off either would draft from an id this step did not commit,
+  which — verify being lossless — costs acceptance and raises NOTHING, reason
+  A's class exactly (#1366). So the arm sets one `committed_ids_on_host` flag,
+  the tail refuses by name on it, and the refusal names this row.
+
+  **THE REFUSAL IS BUILT AND ITS FALSE LEG IS UNREACHABLE HERE.** The flag is
+  declared and read OUTSIDE `#ifdef VLLM_CPP_CUDA`, so the CPU tier compiles the
+  check; but only the host branch is compiled here, so nothing on this tier can
+  make it false. It was measured by mutation instead — forcing the flag false
+  reds both new `test_runner` cases on the refusal's own message — and that is
+  the whole instrument. A refusal was preferred to a repair because the repair is
+  a device-resident propose, which is the wave A2-4 names and not a line this
+  change could write unbuilt.
+
+  **A2-5 CANNOT FLIP THE VETO BY DELETING ONE CONDITION.** On GB10's integrated
+  default the UMA branch is the one that runs, so the first speculative async
+  step after the flip hits this refusal. Making the propose read the ids where
+  they live is the work; deleting the check is not. Owner: row `SPEC-DFLASH2`,
+  issue #2920.
+- **The async decode arm's TOKEN-ROW restore is a divergence from that arm's own
+  design, and it is scoped to `spec_on()`.** `sample_tokens` appends the sampled
+  id to `token_ids_cpu`; the async arm deletes that append on purpose and
+  advances `num_tokens_no_spec` alone, because the scheduler's
+  `update_from_output` feeds detok and penalties when `get_output()`
+  materializes. `propose_drafts_ngram` matches over
+  `token_ids_cpu[:num_tokens_no_spec]`, so with the counter advanced past a
+  column nobody wrote the matcher drafts off a zero. A2-4 writes that one column
+  back, from the `last_sampled_tokens` the same branch just wrote, under
+  `spec_on()` only, so the production async path is byte-identical. The proper
+  fix is a device-resident token row the propose reads directly, which is
+  upstream's shape (`req_states.token_ids`) and is A2-4's own wave. Owner: row
+  `SPEC-DFLASH2`, issue #2920.
 - **A2-1's draft lane is STILL UNREACHED after A2-3, and A2-5 owns the last
   step.** A2-3 (#2911) made the scatter's `draft_tokens` argument REAL — every
   call site now passes the per-req_state `InputBatch::draft_tokens` and its
@@ -1053,4 +1110,45 @@ Three of the round-3 findings changed the code.
   `dev->cu_num_logits`, which is correct only while its `stage_upload` is present
   and correctly sized.
 
-A2-4 is the next wave, and the decode-arm gap above is what A2-5 is blocked on.
+**A2-4's first piece has landed** (#2920): `sample_tokens_async`'s DECODE arm
+proposes. The arm ends in `propose_after_decode`, the decode derivation lifted
+out of `sample_tokens` so both entry points apply one rule, mirroring upstream's
+single `if self.speculator is not None:` tail (`model_runner.py:1524-1547` @ pin
+5559679229) which runs after BOTH of `sample()`'s routes. The route predicate is
+untouched: the new branch is the fall-through of the same
+`StepRoutesToVerify(...)` arm.
+
+**IT IS STILL UNREACHED, and the mutation says so rather than the prose.** The
+veto stands at both construction sites, so no speculative engine reaches
+`sample_tokens_async` at all. The two `test_runner` cases that gate the arm
+supply `set_async_input_combine(true)` by hand — which is precisely what the
+veto withholds — and say so in the file.
+
+WHAT WAS MUTATED, on the CPU tier
+(`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=ON`, Release), each restored
+byte-for-byte afterwards (`md5sum src/vllm/v1/worker/gpu/runner.cpp` reads
+`d4ff6bbd28e25d74a58ee15295076fe6` before and after every one, and the eleven G1
+targets are green at that md5):
+
+| mutation | result |
+|---|---|
+| delete `propose_after_decode` at the ASYNC call site | `test_runner` 39 of 41, both new cases red on `REQUIRE( drafts.has_value() )`; the other TEN G1 targets green, exit 0 |
+| force `committed_ids_on_host` false | `test_runner` 39 of 41, both new cases THREW the refusal by name at `runner.cpp` |
+| delete the token-row restore | `test_runner` 39 of 41, both new cases red on the `token_ids_cpu` compare, `CHECK( 0 == 14 )`; `test_mtp_depth`, `test_dflash2_runner_reach`, `test_engine_core_proc` and `test_draft_fill` all green |
+| delete `propose_after_decode` at the SYNC call site | `test_mtp_depth` and `test_dflash2_runner_reach` exit 1, throwing `async draft fill: no drafts proposed for request 'req' (placeholders scheduled without a matching propose)` — which is #2920's predicted symptom, produced on the entry point that IS reached |
+
+The first row is the reachability measurement and it is a NEGATIVE one: deleting
+the production call site is invisible to every suite but the two cases written
+for it, because no production step reaches the arm. The last row is the
+counterpart on the entry point that is reached, and it is what the async arm
+would do to a spec engine the moment A2-5 lifts the veto.
+
+**Two gaps the fix did NOT close are `## Owed` entries above**: the propose
+refuses by name on both CUDA write-back branches, whose committed ids are not
+host-readable at the tail, and the token-row restore is a `spec_on()`-scoped
+divergence from the async arm's own design. Both are A2-4's device-resident
+propose to remove, and the first of them means A2-5 cannot flip the veto by
+deleting one condition.
+
+A2-4's remaining pieces are the next wave, and the residency refusal above is
+what A2-5 is now blocked on.
