@@ -440,8 +440,38 @@ consistency. Each is a command, not a description.
 - [#2971](https://github.com/mudler/vllm.cpp/issues/2971) —
   `scripts/check-symbol-anchors.py` keys its report on `(path, symbol)`, so a
   citation repeated at N sites is reported once and its summary count reads as a
-  site count when it is not. This masked a second stale `gritlm.py::GritLM` site
-  in the matrix and two more in `.agents/sync/2026-09-03-e126687-advance.md`,
-  which appeared only once the spec-side copies were repaired — a repair that
-  RAISES the count. Found by wave MATRIX while repairing #2819, not fixed there
-  because it changes a checker's reporting contract. Owned by no row yet.
+  site count when it is not. After the repairs above the tree carries **9 stale
+  sites and reports 8**: the checker's own summary line reads
+  `stale 3, file absent 6` while it prints eight FAILs, because
+  `.agents/specs/fp8-kv-cache.md:127` and `.agents/parity-ledger.md:845` cite the
+  same symbol — `test_reshape_and_cache` in the upstream `test_cache.py`, written
+  there as one citation this entry deliberately does NOT repeat, because a tenth
+  site is the last thing a report about masked sites should add — and only the
+  second of the two is printed. The same masking hid a second stale
+  `gritlm.py::GritLM` site in the matrix, and two more in
+  `.agents/sync/2026-09-03-e126687-advance.md` that appeared only once the
+  spec-side copies were repaired.
+  **The count CAN rise as you fix things, and it can also stay flat while the
+  tree gets worse.** The second is what this change measured, because it is the
+  demonstrable one. Reverting the `moe-semantics.md:29` repair in a scratch copy
+  restores a citation to a file that is absent at the pin, which takes the tree
+  from 9 stale sites to 10 (`stale 3, file absent 6` becomes
+  `stale 3, file absent 7`) — and the reported count stays **8**, with
+  `.agents/sync/2026-09-03-e126687-advance.md:268` dropping out of the report and
+  `moe-semantics.md:29` taking its place. A strictly worse tree reads identically
+  to this one. The file was restored sha256-identical after the mutation.
+  Found by wave MATRIX while repairing #2819, not fixed there because it changes
+  a checker's reporting contract. Owned by no row yet.
+- [#2985](https://github.com/mudler/vllm.cpp/issues/2985) — `check_model_invariants`
+  in `scripts/check-agent-record.py` stores a measurement of
+  `.agents/model-matrix.md`, and its `targets`/`modules` terms are derived from
+  the Upstream cell, so re-anchoring a citation moves them. This change is the
+  proof: it added, removed, merged and re-aliased no row, and still had to edit
+  `scripts/check-agent-record.py` and `tests/scripts/test_agent_record.py` to stay
+  green. That is the coupling AGENTS.md §"Records" forbids
+  (*"Never store a measurement of one file inside another file"*), and the same
+  section names the remedy — *"a gate often creates the lock … the checker is
+  defective. Move the obligation to a per-row surface. Do not delete the
+  obligation."* Left as found by this change, because removing the coupling
+  changes a gate's semantics and needs its own spec and red-before evidence.
+  Owned by no row yet.

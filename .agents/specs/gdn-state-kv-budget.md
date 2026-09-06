@@ -102,16 +102,24 @@ the pinned tip).
 
 3. `vllm/v1/core/kv_cache_utils.py::get_kv_cache_config_from_groups` then sizes
    the whole pool from the memory budget and shares it. At the `e126687a9a`
-   pin the free function `get_num_blocks` this spec used to cite is GONE:
-   the division is inlined into that caller and the override is factored out
-   into `vllm/v1/core/kv_cache_utils.py::may_override_num_blocks`, with the
-   `page_size * group_size` divisor replaced by
-   `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_bytes_per_block`. The three
-   `def get_num_blocks*` symbols that remain elsewhere at the pin
-   (`kv_cache_coordinator.py`, `single_type_kv_cache_manager.py`,
-   `kv_offload/tiering/example/manager.py`) are `get_num_blocks_to_allocate`
-   methods on a different concern and are NOT the successor. The arithmetic
-   below is unchanged in substance, only relocated:
+   pin the free function `get_num_blocks` this spec used to cite is GONE: the
+   division is inlined into that caller, which then calls
+   `vllm/v1/core/kv_cache_utils.py::may_override_num_blocks` directly. That
+   override helper is NOT new and nothing was factored out at this advance —
+   `5559679229:vllm/v1/core/kv_cache_utils.py:962` already defines it and the
+   old `get_num_blocks` already ended by calling it. Five `def get_num_blocks*`
+   symbols remain elsewhere at the pin, across three files: four
+   `get_num_blocks_to_allocate` methods (`kv_cache_coordinator.py:160`,
+   `single_type_kv_cache_manager.py:145,1130,1579`) and one method named
+   `get_num_blocks` verbatim (`kv_offload/tiering/example/manager.py:173`).
+   All five are methods on a different concern, and none is the successor of
+   the free function. The arithmetic below is the same sizing step relocated,
+   with two changes that are not only cosmetic: the old `max(num_blocks, 0)`
+   clamp is dropped, and the `page_size * group_size` divisor (the uniform page
+   size times the largest group's layer count) becomes
+   `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_bytes_per_block`, the largest
+   group's SUMMED per-layer page bytes — equal to the old divisor only under
+   the page-size unification step 2 describes:
 
    ```python
    bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
