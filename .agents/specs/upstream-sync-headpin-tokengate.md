@@ -577,7 +577,10 @@ ANSWERED, because the reasoning is what the observation confirmed.
   issue whose `Row:` line names an owner, or a spec's `## Owed` — and this is the
   second. Whoever takes it files the issue then, against row
   `UPSTREAM-SYNC-HEADPIN`; filing one now would add intake to a row that already
-  carries six open issues and no capacity to work a fifth golden.
+  carries **five** open issues — #2611, #2655, #2794, #2798, #2818, counted with
+  `gh issue list --state open --search 'UPSTREAM-SYNC-HEADPIN in:body'` on
+  2026-09-06 — and no capacity to work a fifth golden. Four of the five survive
+  this change, since it closes #2794. An earlier draft of this bullet said six.
 
   What it costs is one lease per golden on `dgx:gpu0`, on the recipe §2.2 states
   and the harness `.agents/scripts/tokengate-e126687-job.sh` already implements —
