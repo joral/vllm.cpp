@@ -461,6 +461,7 @@ target_compile_definitions(test_ltx2_pipeline PRIVATE
 # CLI-stage validations. Its own target rather than cases inside
 # test_ltx2_pipeline, which several concurrent rows of this campaign edit. The
 # REACHABILITY proof for the same row lives in test_ltx2_video.
+vllm_cpp_add_test(test_ltx2_iclora_reference vllm/models/test_ltx2_iclora_reference.cpp)
 vllm_cpp_add_test(test_ltx2_retake vllm/models/test_ltx2_retake.cpp)
 vllm_cpp_add_test(test_ltx2_lora vllm/models/test_ltx2_lora.cpp)
 vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
