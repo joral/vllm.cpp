@@ -5,7 +5,17 @@ Wave ARMTOKENS of [`KERNEL-GDN-CHUNKED-MIRROR`](../../.agents/specs/gdn-chunked-
 [#2612](https://github.com/mudler/vllm.cpp/issues/2612).
 
 **The one-line result. Neither sequence moved, and they still agree on five of
-eight. No instrument on this row has yet observed a step where they disagree.**
+eight. No `VT_Q4EXP_LAYER_FP` fingerprint has yet observed a step where they
+disagree.**
+
+**CORRECTION 2026-09-05
+([#2969](https://github.com/mudler/vllm.cpp/issues/2969)).** This line said "no
+instrument", and that is wrong for the other tap. `VT_MOE_SEL_FP` counts MoE
+block invocations and not model forwards, so its 384-call window reaches
+forwards 4, 6 and 7. **That does not supply a reading.** The comparison taken in
+that window is VOID, because its CUDA arm answered the degenerate pre-#2550
+sequence `11751 271 271 271 271 271 0 0`. What is missing is a non-degenerate
+arm, not a wider window.
 
 | arm | token ids | agrees with CPU |
 |---|---|---|
@@ -37,9 +47,13 @@ reader sees the shape of the error. Two reasons, in the order that matters.
 (`src/vllm/model_executor/models/qwen4_exp_forward.cpp:118`), so
 `VT_Q4EXP_LAYER_FP=3` fingerprints model forwards **0, 1 and 2** — tokens
 `11751 13 15767`, **which the two arms AGREE on**. The three ids that disagree
-are emitted at forwards **4, 6 and 7**, outside the window. **No instrument on
-this row has yet observed a single disagreeing step.** Every tap in §5 measures
-three forwards on which both arms produce the same token.
+are emitted at forwards **4, 6 and 7**, outside the window. **No
+`VT_Q4EXP_LAYER_FP` fingerprint has yet observed a single disagreeing step.**
+Every tap in §5 measures three forwards on which both arms produce the same
+token. The scope of that sentence is this tap alone. See the correction at the
+top of this file for `VT_MOE_SEL_FP`, whose window is counted in MoE block
+invocations and does reach forwards 4, 6 and 7
+([#2969](https://github.com/mudler/vllm.cpp/issues/2969)).
 
 **Second, that ratio changes algorithm on one side, and the metric behind it
 cannot rank even the pairs it did observe.** `rel(sumabs)` is a difference of
@@ -303,6 +317,12 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 > question**, and that **no tap was taken at a step where the two arms disagree**.
 > Four numbered points, and one correction this annotation owes itself.
 >
+> *(Editorial note, 2026-09-05,
+> [#2969](https://github.com/mudler/vllm.cpp/issues/2969). That last clause is
+> FALSE for `VT_MOE_SEL_FP`, and so are the same claim's other two occurrences in
+> this annotation, at point (0) and at point (3). The full note is under point
+> (0); read it before you read any of the three.)*
+>
 > **0. THE HEADLINE, AND IT IS THE ONE THAT SURVIVES EVERYTHING BELOW.** `LayerFp`
 > returns early on `s.step >= s.budget`
 > (`src/vllm/model_executor/models/qwen4_exp_forward.cpp:118`), so
@@ -313,6 +333,30 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 > and 7**. **No instrument on this row has yet observed a single disagreeing
 > step.** Every number below is a measurement of three forwards on which the two
 > arms produce the same token.
+>
+> *(Editorial note, 2026-09-05,
+> [#2969](https://github.com/mudler/vllm.cpp/issues/2969). Read the attribution
+> first. This annotation is THIS repository's prose. It was written under #2877
+> in commit `60821f26c`, whose commit date is 2026-09-04 07:21:26 UTC, two hours
+> after #2877 was filed at 05:21:23 UTC. **It is not a quotation of the issue
+> body**, which contains no such paragraph. It is kept whole rather than
+> rewritten, because a later reader needs the shape of the error.
+>
+> Three of its sentences carry the same overreach, and all three are wrong for
+> `VT_MOE_SEL_FP`: the intro's "no tap was taken at a step where the two arms
+> disagree", point (0)'s "No instrument on this row has yet observed a single
+> disagreeing step", and point (3)'s "no tap was taken at a step where the ids
+> disagree". `VT_MOE_SEL_FP`'s budget counts `MoeBlock` invocations and not model
+> forwards, so wave MOEDIV's 384 calls is eight forwards, and its window reaches
+> forwards 4, 6 and 7. The annotation had the arithmetic two sentences before its
+> conclusion — it counts 48 MoE calls at `T=5` and 336 at `T=1`, "8 forwards for
+> 8 tokens" — and applied it to the other instrument. The reading in that window
+> is VOID for an unrelated reason, which is that the CUDA arm of that run was
+> degenerate.
+>
+> #2877's own body states the SCOPED version of the same conclusion — "No tap in
+> this evidence was taken at a step where the arms disagree" — and this
+> correction does not overturn it. The unscoped sentences are this file's.)*
 >
 > **1. `rel(sumabs)` is a difference of NORMS, not a norm of DIFFERENCES, and its
 > under-report is a DISTRIBUTION.** `run2-job.sh`'s `rel(a,b)` is evaluated on the
@@ -517,7 +561,11 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 >
 > **3. "This is why the ids did not move" is not supported by anything measured
 > here.** The precise statement is (0)'s: **no tap was taken at a step where the
-> ids disagree**. The earlier annotation said "nothing measured on this row
+> ids disagree**. *(Editorial note, 2026-09-05,
+> [#2969](https://github.com/mudler/vllm.cpp/issues/2969): that sentence is the
+> third occurrence of the claim corrected under point (0), and it is FALSE for
+> `VT_MOE_SEL_FP`, whose window reaches forwards 4, 6 and 7.)* The earlier
+> annotation said "nothing measured on this row
 > explains them", and that overshoots in the other direction — forwards 0, 1 and 2
 > are causally UPSTREAM of forward 4 through the Gated DeltaNet recurrent state,
 > so these taps are not irrelevant to the disagreeing ids. They simply do not

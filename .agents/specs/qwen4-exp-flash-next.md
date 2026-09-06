@@ -4121,17 +4121,18 @@ This is product code, so it needs its own spec, a red-first test, and a fresh
 review. #2877 was diagnosis plus record and instrument repair, and it deliberately
 changed no `src/` file.
 
-### NO INSTRUMENT HAS YET OBSERVED A DISAGREEING STEP ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
+### NO `VT_Q4EXP_LAYER_FP` FINGERPRINT HAS OBSERVED A DISAGREEING STEP ([#2877](https://github.com/mudler/vllm.cpp/issues/2877), [#2969](https://github.com/mudler/vllm.cpp/issues/2969))
 
 `LayerFp` returns early on `s.step >= s.budget`
-(`src/vllm/model_executor/models/qwen4_exp_forward.cpp:118`), so every
-fingerprint this row has taken covers model forwards **0, 1 and 2** — tokens
-`11751 13 15767`, which the two arms **agree** on. The three ids that disagree are
-emitted at forwards **4, 6 and 7**. Every ratio published for this row therefore
-describes three forwards on which nothing disagrees, and no measurement so far
-bears directly on the ids that do.
+(`src/vllm/model_executor/models/qwen4_exp_forward.cpp:118`), and **its budget is
+counted in FORWARDS**, so every `VT_Q4EXP_LAYER_FP` fingerprint this row has taken
+covers model forwards **0, 1 and 2**. Those are the tokens `11751 13 15767`, which
+the two arms **agree** on. The three ids that disagree are emitted at forwards
+**4, 6 and 7**.
+Every ratio published from that tap therefore describes three forwards on which
+nothing disagrees.
 
-**What is owed is a fingerprint budget that reaches forward 7** on both arms,
+**What is owed for that tap is a budget that reaches forward 7** on both arms,
 which is `VT_Q4EXP_LAYER_FP=8` and needs no code change — the budget is already
 read from the environment. It needs the 68 GB released UD-IQ1_S artifact and a GPU
 for the CUDA arm, so it is a lease, not a desk run. The `sumabs` axis it would
@@ -4139,17 +4140,64 @@ print is still the one §"needs a DIFFERENCE-NORM axis" above disqualifies for
 ranking, so the two are best spent together: the projection axis first, the wider
 budget on the same run.
 
-### The ARMTOKENS diffs cannot be re-rendered without a device ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
+**`VT_MOE_SEL_FP` IS ON A DIFFERENT BUDGET AXIS AND ALREADY REACHES FORWARD 7.**
+This is the correction #2969 records, and it changes what one lease buys.
+`MoeSelFpCall()` increments once per `MoeBlock` INVOCATION
+(`src/vllm/model_executor/models/qwen3_5.cpp:7091`, `:7167`), not once per
+forward. `qwen4_exp` runs one MoE block on every one of its 48 layers. The layer
+loop at `qwen4_exp_forward.cpp:491` reaches the call at `:691` with no condition,
+and `qwen4_exp_weights.cpp:760` loads MoE weights for every layer. So the call
+index maps onto the forward index as follows.
 
-`docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904/` committed the two
-rendered diffs and `run2-results.txt`, but **not the raw `fp.txt` of any arm**. The
-repaired differ therefore has nothing to re-run against: correcting the 42-vs-1311
-coverage in those files needs the three arms measured again, which needs the 68 GB
-released UD-IQ1_S artifact and a GPU for the CUDA arm. The committed files are
-annotated in place instead, and the job script is left byte-for-byte as the record
-of what ran. **A wave that holds a lease for another reason on this row should
-capture `fp.txt` per arm as a matter of course** — it is the input every later
-comparison needs, and omitting it is what made this correction un-re-renderable.
+| calls | what they are |
+|---|---|
+| 48 | one model forward |
+| 0..47 | forward 0, the `T=5` prefill; the call index IS the decoder layer index |
+| `48f .. 48f+47` | forward `f`, a `T=1` decode |
+| 192..239 | **forward 4**, the first disagreeing step |
+| 336..383 | **forward 7**, the last one |
+
+So wave MOEDIV's 384 calls were **eight forwards**, not a prefill plus an
+undifferentiated decode tail, and that tap did reach forwards 4, 6 and 7 on 2
+September 2026. Its own committed coverage says so: 384 digests splitting 48
+prefill (`T=5`) and 336 decode (`T=1`)
+([evidence](../../docs/bench-evidence/qwen4exp-moe-selection-20260902.md)). The
+decode columns of that run are VOID for an unrelated and correctly recorded
+reason. The CUDA arm answered the degenerate pre-#2550 sequence
+`11751 271 271 271 271 271 0 0`, so the comparison ran against a different input.
+The instrument did not stop short.
+
+Reaching a disagreeing step with `VT_MOE_SEL_FP` therefore needs no code change
+and no budget larger than MOEDIV already spent. What it needs is a non-degenerate
+CUDA arm, which #2550 and #2612 have since supplied.
+
+### The ARMTOKENS raw fingerprints survive on the fleet share ([#2877](https://github.com/mudler/vllm.cpp/issues/2877), [#2969](https://github.com/mudler/vllm.cpp/issues/2969))
+
+**This section previously stated that the ARMTOKENS diffs cannot be re-rendered
+without a device. That conclusion is withdrawn.** The premise is correct and the
+conclusion does not follow from it.
+
+The premise stands: `docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904/`
+committed the two rendered diffs and `run2-results.txt`, but **not the raw
+`fp.txt` of any arm**. Nothing was mis-committed, because the raw fingerprints are
+job output and not repository content.
+
+The conclusion does not stand, because the job output was never lost. All three
+ARMTOKENS run-2 arms keep their `fp.txt` on the fleet share at
+`/workspace/armtokens-2612/out2/<ARM>/fp.txt`, 1314 lines each. Each file carries
+**1311** unique `(step, L, tag)` taps, which is the coverage the committed diff
+collapsed to 42. **The collapse is a parser defect and not missing data.** The
+differ keys on `f.get('L')`, and the tap prints the layer as `L%+03lld` with no
+`=`, so the field never parses and all 48 layers fold onto one key for each
+`(step, tag)` pair. Correcting the 42-vs-1311 coverage therefore needs the
+repaired differ and the share, and it needs no lease.
+
+Two obligations remain unchanged. A wave that holds a lease on this row must
+still capture `fp.txt` for each arm, because the share is fleet scratch and not a
+record surface. A reading taken from those files must still respect
+§"needs a DIFFERENCE-NORM axis": `rel(sumabs)` cannot rank magnitudes, so a
+re-render may state which taps are bit-identical and in what order they stop
+being so, and it may not publish a ratio.
 
 ### The MoE residue is NOT closed: the layer-0 flip question is unmeasured ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
 
@@ -4166,6 +4214,17 @@ not spent from a contended fleet on a refinement no published headline depends o
 Nothing here treats the residue as diagnosed: #2552 named both floor terms and
 found both to be faithful mirrors, and **the three disagreeing token ids at indices
 4, 6 and 7 remain unexplained by anything measured on this row.**
+
+**Wave MOESEL ([#2969](https://github.com/mudler/vllm.cpp/issues/2969)) narrowed
+what that run costs, and did not take the reading.** The same budget answers both
+open questions at once, because 384 MoE calls is eight forwards and forward 4
+begins at call 192. So one lease returns the layer-0 bracket placement and the
+selection state at forwards 4, 6 and 7 together, rather than the bracket alone.
+The wave qualified the comparator against committed MOEDIV output first, where it
+reproduces both the `L00 mhc.mix` pair 3613.82031 against 3615.62777 and the
+recorded flip at token 2. The run against a non-degenerate CUDA arm is
+[submitted and its state is recorded in the evidence](../../docs/bench-evidence/qwen4exp-moe-selection-forward4-20260905.md).
+**No reading on the matched pair is claimed by that wave.**
 
 **The position.** The standing objective — `qwen4_exp` emits the CPU control
 sequence `11751 13 15767 411 2029 11 1092 369` on a GPU, in the production
@@ -4207,11 +4266,17 @@ POSITION.** `LayerFp` returns early on `s.step >= s.budget`
 (`src/vllm/model_executor/models/qwen4_exp_forward.cpp:118`), so
 `VT_Q4EXP_LAYER_FP=3` covers forwards 0, 1, 2 = tokens `11751 13 15767`, which
 **agree on both arms**, while the three disagreeing ids are emitted at forwards 4,
-6 and 7. **No instrument on this row has yet observed a disagreeing step**, so the
-attribution of "the remaining 3 ids" to the MoE residue is not measured here at
-all. Those forwards are causally upstream of forward 4 through the recurrent
-state, so the taps are not irrelevant to the disagreement; they simply never
-observe it. **(b)** `rel(sumabs)` is a difference of NORMS, not a norm of
+6 and 7. **No `VT_Q4EXP_LAYER_FP` fingerprint has yet observed a disagreeing
+step**, so the attribution of "the remaining 3 ids" to the MoE residue is not
+measured here at all. Those forwards are causally upstream of forward 4 through
+the recurrent state, so the taps are not irrelevant to the disagreement. They
+simply never observe it. **CORRECTION
+([#2969](https://github.com/mudler/vllm.cpp/issues/2969)): this sentence said "no
+instrument", and that is wrong for the other tap.** `VT_MOE_SEL_FP` counts MoE
+block invocations and not forwards, so its 384-call window does reach forwards 4,
+6 and 7. The reading taken there is still VOID, because that run's CUDA arm
+answered the degenerate pre-#2550 sequence `11751 271 271 271 271 271 0 0`.
+**What is missing is a non-degenerate arm, not a wider window.** **(b)** `rel(sumabs)` is a difference of NORMS, not a norm of
 DIFFERENCES, and its under-report is a DISTRIBUTION rather than the `~122x` single
 seed draw this line first quoted: over 400 seeds at `n = 12800` the median is
 75x (sigma 1e-3) to 140x (sigma 1e-4), p05..p95 34..1500, and at a **fixed**

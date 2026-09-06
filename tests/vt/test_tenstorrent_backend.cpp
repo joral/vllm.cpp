@@ -24,12 +24,14 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <random>
 #include <vector>
 
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/quant.h"
 
 using vt::Backend;
 using vt::Device;
@@ -5110,4 +5112,98 @@ TEST_CASE("kTENSTORRENT GDN gather serves a conv_transposed slot across the deco
   tt.Free(ms);
   tt.Free(mg);
   tt.Free(mp);
+}
+
+// kKeepQuantDecode: the Q4_K block-decode device path (BACKEND-TENSTORRENT-
+// KEEPQUANT W1). The numerics bar is the spec's stated one: the decode's f32
+// output is BIT-EXACT against the CPU decoder `vt::cpu::BlockToFloat` — same
+// multiply/subtract order, IEEE f32, no FMA — because the reader side of this
+// encoding is already pinned bit-exact vs llama.cpp and a device decode that
+// "merely" lands inside a band would move the divergence into the dot where
+// nobody can attribute it. bf16 tile storage (the W2 dot's input) applies the
+// device RNE conversion ON TOP of this exact f32 and is W2's seam, not this
+// test's.
+TEST_CASE("kTENSTORRENT kKeepQuantDecode matches vt::cpu::BlockToFloat bit-exactly (Q4_K sweep)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kKeepQuantDecode, vt::DeviceType::kTENSTORRENT));
+
+  // block_q4_K = { f16 d; f16 dmin; u8 scales[12]; u8 qs[128]; } (144 bytes)
+  const int64_t kBlockBytes = vt::BlockBytes(vt::DType::kQ4_K);
+  const int64_t kBlockElems = vt::BlockElems(vt::DType::kQ4_K);
+  REQUIRE(kBlockBytes == 144);
+  REQUIRE(kBlockElems == 256);
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  auto decode = reinterpret_cast<vt::KeepQuantDecodeFn>(
+      vt::GetOp(vt::OpId::kKeepQuantDecode, vt::DeviceType::kTENSTORRENT));
+  Queue q = backend.CreateQueue();
+
+  // Deterministic packed blocks with structural variety: PRNG nibbles and
+  // scale bytes (the j >= 4 scale formulas consume bits 6-7, so the scale
+  // bytes must be full bytes), and d/dmin drawn from finite f16 magnitudes
+  // with both signs — random BYTES would make d/dmin NaN/Inf and the bit
+  // comparison vacuous against a NaN-propagating decode.
+  std::mt19937 rng(20260905u);
+  auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+
+  const int64_t rows_list[] = {1, 3, 17};
+  const int64_t nb_list[] = {1, 2, 16};
+  for (int64_t rows : rows_list) {
+    for (int64_t nb : nb_list) {
+      const int64_t k = nb * kBlockElems;
+      std::vector<uint8_t> packed(rows * nb * kBlockBytes);
+      for (int64_t b = 0; b < rows * nb; ++b) {
+        uint8_t* blk = packed.data() + b * kBlockBytes;
+        const float d = (0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f) *
+                        ((rng() % 2) != 0 ? 1.0f : -1.0f);
+        const float dmin = (0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f) *
+                           ((rng() % 2) != 0 ? 1.0f : -1.0f);
+        const uint16_t d_bits = vt::F32ToF16(d);
+        const uint16_t dmin_bits = vt::F32ToF16(dmin);
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        std::memcpy(blk + 2, &dmin_bits, sizeof(dmin_bits));
+        for (int i = 0; i < 12; ++i) blk[4 + i] = rand_byte();
+        for (int i = 0; i < 128; ++i) blk[16 + i] = rand_byte();
+      }
+
+      std::vector<float> oracle(rows * k);
+      vt::cpu::BlockToFloat(vt::DType::kQ4_K)(packed.data(), oracle.data(), rows * k);
+
+      void* mem_packed = backend.Alloc(packed.size());
+      void* mem_out = backend.Alloc(oracle.size() * sizeof(float));
+      backend.Copy(q, mem_packed, packed.data(), packed.size());
+
+      Tensor packed_t =
+          Tensor::Contiguous(mem_packed, vt::DType::kQ4_K,
+                             Device{vt::DeviceType::kTENSTORRENT, 0}, {rows, nb});
+      Tensor out_t = Tensor::Contiguous(mem_out, vt::DType::kF32,
+                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {rows, k});
+      decode(q, out_t, packed_t);
+
+      std::vector<float> device_out(rows * k, 0.0f);
+      backend.Copy(q, device_out.data(), mem_out, oracle.size() * sizeof(float));
+      backend.Free(mem_packed);
+      backend.Free(mem_out);
+
+      INFO("rows=", rows, " nb=", nb, " K=", k);
+      if (std::memcmp(device_out.data(), oracle.data(),
+                      oracle.size() * sizeof(float)) != 0) {
+        const float* dev = device_out.data();
+        int64_t bad = 0;
+        for (int64_t i = 0; i < static_cast<int64_t>(oracle.size()); ++i) {
+          if (std::memcmp(&dev[i], &oracle[i], sizeof(float)) != 0) {
+            if (bad < 4)
+              MESSAGE("diff i=", i, " (blk=", i / 256, " col=", i % 256,
+                      ") dev=", dev[i], " oracle=", oracle[i]);
+            ++bad;
+          }
+        }
+        MESSAGE("total bad: ", bad, " / ", oracle.size());
+      }
+      CHECK(std::memcmp(device_out.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
+    }
+  }
 }
