@@ -1999,6 +1999,10 @@ vllm_cpp_add_test(test_verify_route_predicate vllm/v1/worker/test_verify_route_p
 # off the same per-req_state draft buffer the combine's scatter reads. Same shape
 # and same reason as the two predicates above -- one rule, one expression.
 vllm_cpp_add_test(test_draft_fill vllm/v1/worker/test_draft_fill.cpp)
+# SPEC-DFLASH2 A2-4 (#3004): the async decode arm's propose reads this step's
+# committed ids where they live, on every write-back branch, instead of refusing
+# by name when the branch that ran left them unreadable on the host.
+vllm_cpp_add_test(test_committed_ids vllm/v1/worker/test_committed_ids.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
 vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
 # ENG-POOL-BEST-FIT (#1922): the shared scratch pool must reach a steady state
