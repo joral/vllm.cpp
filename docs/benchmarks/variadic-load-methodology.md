@@ -128,9 +128,9 @@ Mirrored from `vllm/benchmarks/serve.py:321` `BenchmarkMetrics`:
 
 | Axis | Definition | Upstream |
 |---|---|---|
-| `ttft` | time to the first content-carrying chunk | `serve.py:614` |
+| `ttft` | time to the first content-carrying chunk | `serve.py:615` |
 | `tpot` | `(latency - ttft) / (output_tokens - 1)` | `serve.py:610` |
-| `itl` | gap between consecutive streamed chunks | `serve.py:615` |
+| `itl` | gap between consecutive streamed chunks | `serve.py:614` |
 | `e2el` | client-side request latency | `serve.py:616` |
 
 `ttft` counts the first chunk that carries **content**. A role-only opening
@@ -150,7 +150,9 @@ tokens-per-chunk figure beside it.
 
 p50, p90, p95, p99 and the maximum. A leg's own table stops at p95: p99 over 128
 requests is the second-worst request, which is a maximum wearing a percentile's
-name. p99 and the maximum are published only from the pool of every round of a
+name. The table's column headings are generated from the same
+tuple the values are computed from, so a percentile cannot be printed under
+another one's heading. p99 and the maximum are published only from the pool of every round of a
 cell, and the pooled `n` is printed in the table.
 
 ### Throughput
@@ -188,7 +190,7 @@ in the sweep.
 | Client | One process, one timing path, both engines. It does not know which engine answers. |
 | Chat template | Each engine applies its own, server side, as both published protocols do. |
 | Sampling | Identical on both sides, and stated on the results page. |
-| Token counts | From each engine's `usage`, never from a count of streamed chunks. A leg whose server reported no usage is marked `counted_by = chunks` and yields no axis at all. |
+| Token counts | From each engine's `usage`, never from a count of streamed chunks. A leg is publishable only when EVERY successful request carried a server-side count; one that did not reads `publishable = NO (G-USAGE)` in the per-leg table. A mixed leg is the dangerous case, because its throughput would divide the tokens it could count by a wall clock containing the requests it could not. |
 | `ignore_eos` | Not sent. Both published protocols let the model stop. |
 | Acceptance | From `/metrics` where the engine exports it, from `usage` where it does not, and **absent** where neither. Absent is never rendered as zero, because zero reads as a draft that never fired. |
 | Recipe | Each engine at its own published configuration, with every difference listed on the results page. |
@@ -211,7 +213,14 @@ character length of that chunk, the total character length, the chunk count, and
 | `chars per token` | `total_chars / completion_tokens`. Measured. |
 | `first chunk tokens` | `first_chunk_chars / chars_per_token`. **An estimate.** |
 | `ttft` | time to the first content chunk. Measured. |
-| `ttft_corrected` | `ttft - (first_chunk_tokens - 1) * tpot`. **An estimate**, and derived from one. |
+| `ttft_corrected` | `ttft - (first_chunk_tokens - 1) * tpot`, **refused when it goes to zero or below**. **An estimate**, and derived from one. |
+
+An over-correction is refused rather than floored. `first_chunk_tokens` is an
+estimate, so at 8 tokens per chunk and a 30 ms time per output token the
+subtraction is 210 ms, which exceeds a 200 ms measured figure. A floor would
+publish `0.0` as though it were a measurement of an instant first token. The
+report drops those requests from the corrected column and prints how many it
+dropped beside it.
 
 Both figures are published for both engines and neither is called the correct
 one. The raw figure is what a streaming client observes. The corrected figure is
@@ -219,10 +228,21 @@ closer to what the engine did. The estimate exists because the OpenAI streaming
 protocol carries no per-chunk token count; if you need an exact number, the
 server has to emit one.
 
-Note also that a server which holds back characters before emitting delays its
-own first chunk. One of the two engines here holds back 16 characters
-(`tools/serve_openai.py:74`), which is why the correction is applied to both
-sides rather than only to ours.
+**The correction removes a chunk size. It does not remove a hold-back, and it
+must not be read as doing so.** One of the two engines here buffers 16 characters
+before emitting (`tools/serve_openai.py:74`) and then emits
+`pending[:len(pending) - HOLD_BACK]`, so its first chunk contains the text minus
+the characters that caused the delay. Its `first_chunk_chars` therefore excludes
+exactly the held-back text, its estimated first-chunk token count comes out near
+1, and its correction comes out near zero. The formula is applied to both engines
+because it is one formula, not because it equalises them.
+
+Two smaller asymmetries in the same direction, recorded rather than corrected.
+That engine's wrapper strips `<think>` tags and left-strips the reasoning head,
+so its `total_chars` is short of what its `completion_tokens` counted; its
+characters-per-token is therefore understated, its estimated first-chunk tokens
+overstated, and its corrected figure slightly flattered. Ours leaves the tags
+inline and loses nothing. The effect is about 2%.
 
 ## What the harness cannot see
 

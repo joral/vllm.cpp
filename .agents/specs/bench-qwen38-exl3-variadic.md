@@ -166,8 +166,9 @@ maximum, for `ttft`, `itl`, `tpot` and `e2el`, matching upstream's metric names
 and definitions (`serve.py:321` `BenchmarkMetrics`):
 
 ```text
+ttft = time to the first content-carrying chunk    serve.py:615
 tpot = (latency - ttft) / (output_tokens - 1)      serve.py:610
-itl  = gap between consecutive streamed chunks     serve.py:615
+itl  = gap between consecutive streamed chunks     serve.py:614
 e2el = client-side request latency                 serve.py:616
 ```
 
@@ -278,6 +279,14 @@ When it finishes:
 
 ## Owed
 
+- **[#2993](https://github.com/mudler/vllm.cpp/issues/2993): `gpu_memory_utilization`
+  does not account for the DFlash2 draft speculative context.** Found by this
+  run, which recorded 1282.5 MiB of it at `max_num_seqs 8`
+  (`src/vllm/v1/worker/gpu/runner.cpp:4090-4098` prints the number and says the
+  flag does not bound it). The term scales with concurrency and with
+  `max_model_len`, so an operator raising either exceeds the fraction they set.
+  This row does not fix it; it pinned `--num-blocks` explicitly so the ladder
+  would not measure it as noise. The issue carries a `-` row and is owned here.
 - A third round, if any cell's two rounds disagree by more than 10%.
 - A matched-configuration leg. Each engine still runs its own published recipe,
   and this engine still refuses an NVFP4 KV cache by name
