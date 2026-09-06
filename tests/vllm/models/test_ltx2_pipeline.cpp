@@ -1189,13 +1189,46 @@ TEST_CASE("ltx2 the recipe table mirrors vLLM-Omni's, and refuses everything els
   // `ic_lora_reference` reds HERE, where the reader is told to reconcile the
   // refusal, rather than in a render that silently refuses a supported request.
   {
-    const char* const kAllKinds[] = {"one_stage",   "distilled_two_stage", "dfr",
-                                     "res2s_two_stage", "dmd2",            "retake",
-                                     "a2vid_two_stage", "ti2vid_two_stage",
-                                     "keyframe_interpolation", "t2a_one_stage", "ic_lora"};
+    // THE KIND LIST IS DERIVED, not hand-copied. A hand-copied list is complete
+    // only until the next kind is added, and this tripwire's whole job is to
+    // fire on that day — a list that silently omits the twelfth kind would go on
+    // reporting "exactly one" while the new recipe went unwalked. So the kinds
+    // come out of `ResolveLtx2PipelineRecipe`'s own source: every
+    // `pipeline_kind == "..."` branch in ltx2_pipeline.cpp, which is where a new
+    // kind has to be written down to exist at all.
+    const std::filesystem::path resolver_source =
+        std::filesystem::path(VLLM_CPP_SOURCE_ROOT) /
+        "src/vllm/model_executor/models/ltx2_pipeline.cpp";
+    std::ifstream resolver_in(resolver_source);
+    REQUIRE_MESSAGE(resolver_in.good(),
+                    "cannot read " << resolver_source.string()
+                                   << "; VLLM_CPP_SOURCE_ROOT is wrong");
+    const std::string resolver((std::istreambuf_iterator<char>(resolver_in)),
+                               std::istreambuf_iterator<char>());
+    std::vector<std::string> kAllKinds;
+    const std::string needle = "pipeline_kind == \"";
+    for (size_t at = resolver.find(needle); at != std::string::npos;
+         at = resolver.find(needle, at + 1)) {
+      const size_t start = at + needle.size();
+      const size_t end = resolver.find('"', start);
+      REQUIRE(end != std::string::npos);
+      kAllKinds.push_back(resolver.substr(start, end - start));
+    }
+    // A derivation that found nothing would pass every assertion below without
+    // walking anything, so the count is asserted before it is used. Eleven is
+    // what the table carries today; a twelfth kind reds HERE, which is the point.
+    CHECK_MESSAGE(kAllKinds.size() == 11,
+                  "ResolveLtx2PipelineRecipe declares " << kAllKinds.size()
+                                                        << " kinds, not the 11 this tripwire was "
+                                                           "written against. Re-read the "
+                                                           "ic_lora_reference refusals in "
+                                                           "ltx2_video.cpp, then update this "
+                                                           "count.");
+    REQUIRE(kAllKinds.size() >= 11);
     const char* const kAllVersions[] = {"2", "2.3", "2.4", "2.5"};
     int resolved_with_flag = 0;
-    for (const char* kind : kAllKinds) {
+    for (const std::string& kind_s : kAllKinds) {
+      const char* const kind = kind_s.c_str();
       for (const char* version : kAllVersions) {
         vllm::Ltx2PipelineRecipe recipe;
         try {
