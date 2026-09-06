@@ -1050,6 +1050,22 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   wave in A2 may quote a throughput result against this reading, and the run's
   recipe, revisions and contention state are still owed beside the number.
 
+  **The recipe, revisions and contention state are now RECORDED**
+  ([#3014](https://github.com/mudler/vllm.cpp/issues/3014)), which discharges
+  the second of those two sentences and leaves the first standing. They live in
+  `.agents/benchmark-record.md` under `## SPEC-DFLASH2 G4`, with the command
+  that re-derives each figure from `/mnt/nas_share/rc/dflash2-staged/` beside
+  it. Three things that entry establishes and this one does not say. The vLLM
+  arm did NOT profile in that run, so 96.01% is OURS ALONE and no cross-arm
+  kernel comparison exists in the evidence at all. The non-GEMM lever
+  re-derives as **3.4548%** rather than 3.46%, which is a rounding of the
+  numerator to 0.165 s and moves neither the 10.06% total nor any conclusion.
+  The 220.8 and 227.2 GB/s pair and the 11.1% gap are inputs from elsewhere:
+  neither string is in the evidence, so the third lever is checkable only once
+  the pair is sourced. G4's own lease id went to the job's stdout and is
+  likewise not in the evidence directory, so it stays unrecorded rather than
+  reconstructed.
+
 ## Now
 
 `SPEC-DFLASH2` stays `ACTIVE`. The veto STANDS at both construction sites, the
