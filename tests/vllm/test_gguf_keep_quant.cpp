@@ -553,8 +553,13 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // IQ2_S (256-elem, Q8_K-act) and MXFP4 (32-elem, Q8_0-act) are keep-quant
         // capable as of the UD-IQ2_M vehicle, so they route like the others.
         // The DEVICE axis (review #523): the running device's kernel set can be
-        // narrower than the loader's CPU-derived list — ROCm implements exactly
-        // {Q8_0, Q4_K, Q5_K, Q6_K}; the rest keep expand_bf16 there.
+        // narrower than the loader's CPU-derived list — ROCm implemented
+        // exactly {Q8_0, Q4_K, Q5_K, Q6_K} through #2247; IQ4_XS joined with
+        // KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940). IQ3_XXS joined the same
+        // row's ROCm kernel set but is not in `all_types` below (nor is
+        // Q2_K, a pre-existing gap this row does not close), so it is not
+        // exercised by this particular exhaustive table; it is gated instead
+        // by tests/vt/test_backend_cross_device.cpp's cross-device cases.
         // QUANT-GGUF-IQ-VECDOT (#2247) put IQ2_XS and IQ4_XS in this list.
         // They were gather-only between #2245 and #2247 — decoder, no vec_dot —
         // and the `vec_dot` rows are what moved them onto the GEMM arm.
@@ -566,7 +571,7 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         const bool rocm = kRouteDev == vt::DeviceType::kROCM;
         const bool device_capable =
             !rocm || type == kQ8_0 || type == kQ4_K || type == kQ5_K ||
-            type == kQ6_K;
+            type == kQ6_K || type == kIQ4_XS;
         const bool block_capable = cpu_capable && device_capable;
         const int64_t blk = (type == kQ4_0 || type == kQ5_0 || type == kQ8_0 ||
                              type == kMXFP4 || type == kIQ4_NL)
@@ -655,13 +660,13 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // Both outcomes are actually exercised (a table that never keeps anything
   // would pass every assertion above vacuously). The kept count is
   // device-dependent (review #523): 12 block-capable encodings x 2 keep-capable
-  // GEMM roles where the device covers the CPU list; 4 x 2 on ROCm (ROCm's
-  // kernel set is {Q8_0, Q4_K, Q5_K, Q6_K}, and neither Q5_0 nor IQ4_NL nor
-  // either IQ*_XS is in it). The GATHER role adds 13 more (the 12, plus Q8_K,
-  // which has a decoder and no vec_dot) on any device that REGISTERS the block
-  // gather, and nothing on a device that does not. Written as named terms
-  // rather than one number so a future change to any one of them says which one
-  // moved. Both moves are now on record and they are mirror images:
+  // GEMM roles where the device covers the CPU list; 4 x 2 on ROCm through
+  // #2247 (ROCm's kernel set was {Q8_0, Q4_K, Q5_K, Q6_K}). The GATHER role
+  // adds 13 more (the 12, plus Q8_K, which has a decoder and no vec_dot) on
+  // any device that REGISTERS the block gather, and nothing on a device that
+  // does not. Written as named terms rather than one number so a future
+  // change to any one of them says which one moved. Both moves are now on
+  // record and they are mirror images:
   // LOADER-GGUF-IQ (#2240) moved the GATHER term 11 -> 13 and left GEMM at 20,
   // the shape of a decode-only port; QUANT-GGUF-IQ-VECDOT (#2247) moves the
   // GEMM term 20 -> 24 and leaves GATHER at 13, the shape of a dot-only port.
@@ -683,7 +688,15 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // was, the same decode-only shape #2240 had. That asymmetry IS the row's
   // per-tier result: IQ3_S stays compressed in a gather table and expands to
   // bf16 in a GEMM, on every device.
-  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 8 : 24;
+  //
+  // KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940) moves the ROCm GEMM term 8 -> 10
+  // (IQ4_XS joins {Q8_0, Q4_K, Q5_K, Q6_K}) and leaves every other device's
+  // GEMM term and every device's GATHER term untouched: IQ4_XS was already
+  // CPU-capable and already counted at `24` on CPU/CUDA, so only the ROCm
+  // narrowing moved. IQ3_XXS also joined ROCm's kernel set in the same row but
+  // is not in `all_types` above, so it does not move this number; see the
+  // comment beside `device_capable`.
+  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 10 : 24;
   const int gather_kept =
       vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 14 : 0;
   CHECK(kept == gemm_kept + gather_kept);

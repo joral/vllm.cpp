@@ -137,10 +137,16 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
   switch (dev) {
     case vt::DeviceType::kROCM:
       // src/vt/rocm/rocm_grouped_gemm.hip implements exactly these on both the
-      // grouped and non-grouped arms; Q4_0/Q2_K/Q3_K/IQ2_*/IQ3_*/MXFP4 are
-      // owed (recorded in .agents/specs/rocm-gg-keep-quant.md).
+      // grouped and non-grouped arms. IQ4_XS/IQ3_XXS added by
+      // KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940) -- this is the fix for the
+      // host-RAM SIGSEGV a real IQ4_XS checkpoint hit on ROCm before this row:
+      // these two dtypes used to fall through to `false` here and keep the
+      // pre-existing expand-bf16 residency this comment block warns against.
+      // Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ2_S/MXFP4 are still owed (recorded in
+      // .agents/specs/rocm-gg-keep-quant.md and tracked by the same issue).
       return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
-             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K;
+             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K ||
+             dt == vt::DType::kIQ4_XS || dt == vt::DType::kIQ3_XXS;
     default:
       // CUDA falls back to the CPU kernel for anything it lacks
       // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.
