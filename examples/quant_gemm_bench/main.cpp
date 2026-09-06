@@ -164,6 +164,15 @@ void Bench(vt::DType dt, int d_off, int dmin_off, const char* type_name) {
 // tile-aligned (M=128, N%16==0, K%256==0), so the Q6_K leg on gfx1200/gfx1201
 // takes the new WMMA arm by default; `VT_ROCM_QUANT_WMMA=0` forces the scalar
 // one for the A/B (see the file header note — two processes, not one).
+//
+// "prefill gate_up tail" (M=132, N=12288) deliberately un-aligns M by one
+// tile (132 = 8*16 + 4) at this row's own widest production N: an
+// independent review found the M/N-tail-fill launch sized its host-side
+// grid to the FULL m*n domain rather than to the remainder it actually
+// computes, so a shape with a large aligned corner and a wide N launches
+// and address-computes close to as many warps as the whole GEMM just to
+// fill in a thin remainder strip. This shape isolates that launch's own
+// cost from the WMMA corner's, at production scale.
 void BenchDevice(vt::Backend& backend, vt::Device device, vt::DType dt, int d_off,
                  int dmin_off, const char* type_name) {
   const int64_t be = (dt == vt::DType::kQ4_0 || dt == vt::DType::kQ8_0) ? 32 : 256;
@@ -171,6 +180,7 @@ void BenchDevice(vt::Backend& backend, vt::Device device, vt::DType dt, int d_of
       {128, 3072, 2048, "prefill qkv"},
       {128, 12288, 2048, "prefill gate_up"},
       {128, 2048, 6144, "prefill down"},
+      {132, 12288, 2048, "prefill gate_up tail"},
       {1, 3072, 2048, "decode qkv"},
   };
   vt::Queue q = backend.CreateQueue();

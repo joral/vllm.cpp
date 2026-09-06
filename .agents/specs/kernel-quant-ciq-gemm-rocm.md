@@ -470,3 +470,82 @@ paths need the scalar kernel permanently, by design, not as a stopgap
 awaiting format coverage; that framing predates the tail fix and no longer
 applies. `## Owed` above is current: Q5_K (a separate row) and the
 gfx1100/gfx1151 WMMA tiles (separate rows) are what remains.
+
+**Independent review repair (two LOW findings, both closed on
+`row/KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4-w1`).** An independent review of this
+row's implementation wave (PR #2991) found two non-blocking gaps in the
+W1.5 tail-fill landing, both fixed in the same follow-up commit:
+
+1. **Stale `docs/ENVIRONMENT.md` row.** `VT_ROCM_QUANT_WMMA`'s doc entry
+   still described the Q6_K-only, exact-16-alignment gate from before the
+   Q4_K and W1.5 commits in this same branch. Corrected to name both
+   kernels (`KQuantGemmKWmmaQ6K`/`KQuantGemmKWmmaQ4K`) and the actual gate
+   (`m >= 16 && n >= 16`, not exact alignment). A stale comment making the
+   same claim at `QuantWmmaEnabled`'s definition (`rocm_grouped_gemm.hip`)
+   was corrected alongside it — same fact, same staleness, same file
+   already in scope.
+
+2. **Tail-fill launch grid sized to the full domain.** Both tail-fill call
+   sites in `MatmulBTQuantKernelRocm` launched `KQuantGemmK` over the
+   entire `m*n` grid and relied on an `i < skip_m && j < skip_n` guard to
+   no-op every warp landing inside the WMMA corner. For a wide production
+   `N` (this row's own `N=12288` shape) and a large aligned corner, the
+   no-op warps outnumber the real ones by roughly the corner's own area —
+   an unmeasured, real launch-overhead cost the row had not isolated.
+   Fixed by replacing the skip guard with an index remap: a launched
+   index `t` now enumerates ONLY the remainder — the bottom strip
+   `[skip_m,m)x[0,n)` (contiguous at the buffer's own row stride `n`, so
+   no separate stride parameter), then the right strip
+   `[0,skip_m)x[skip_n,n)` — and the host sizes the tail-fill grid to
+   `bottom_strip + right_strip`, not `m*n`. The pre-existing full-grid path
+   (`skip_m == 0 && skip_n == 0`, every call site outside the tail arm)
+   takes an unchanged branch in the same kernel.
+
+   Hardware-verified on the RX 9060 XT: the existing M=37/N=50
+   (both-misaligned) case still passes, plus two NEW asymmetric cases this
+   row had not isolated — M=37/N=48 (bottom-strip-only remainder, N exactly
+   aligned) and M=32/N=50 (right-strip-only remainder, M exactly aligned)
+   — both formats, CPU-oracle NMSE (measured 0.0 for every shape and
+   format against the fixed kernel — bit-identical to the CPU oracle, not
+   merely under tolerance) plus the existing dispatch-count reachability
+   check.
+
+   **Mutation-proving the new mechanism, not the retired guard.** The
+   guard-based guarantee this row's spec already recorded (`&&` to `||`)
+   no longer applies once the mechanism changed; re-asserting it would
+   have proven nothing. Two mutations were tried against the NEW
+   index-remap, and the first is recorded because it under-proves rather
+   than over-proves: an off-by-one at the bottom/right boundary
+   (`t < bottom_strip` to `t <= bottom_strip`) reds only 0 to 3.18e-4 NMSE
+   depending on shape — under this suite's 5e-4 bound — because it
+   miscomputes exactly ONE cell out of the FULL `m*n` output the whole-
+   buffer NMSE is normalized against (and on the M=37/N=48 shape, whose
+   remainder is bottom-strip-only, it reds NOTHING at all: that shape's
+   `right_strip` is 0, so `t` never reaches the mutated boundary). That
+   result is evidence about this test's proof strength at this scale, not
+   a clean pass — recorded rather than discarded. The second mutation —
+   the right-strip remap's divisor (`t2 / (n - skip_n)` to `t2 / n`,
+   `t2 % (n - skip_n)` to `t2 % n`, a forgot-to-narrow-the-divisor bug in
+   the same class) — reds unambiguously: NMSE `nan`/`-nan` on both the
+   combined M=37/N=50 case and the N-misaligned M=32/N=50 case, all
+   formats (out-of-bounds device reads through a corrupted `i`/`j`).
+   Reverting either mutation restores an identical source hash
+   (`sha256sum` verified) and an identical GREEN result.
+
+   **Op-level A/B, same tool, `examples/quant-gemm-bench` extended with a
+   `M=132, N=12288, K=2048` shape** (M=132 deliberately un-aligns M by one
+   tile past 8*16 at this row's own widest production N), same-binary
+   toggle by reverting only `rocm_grouped_gemm.hip` to its pre-repair
+   content and rebuilding (not `VT_ROCM_QUANT_WMMA`, which selects the
+   scalar arm entirely rather than isolating the tail-fill launch), best-
+   of-6, idle host:
+
+   | Format | before (full-grid tail launch) | after (remainder-sized tail launch) | ratio |
+   |---|---:|---:|---:|
+   | Q6_K | 1449.0-1449.8 GFLOP/s | 1678.1-1680.0 GFLOP/s | +15.8-15.9% |
+   | Q4_K | 1809.3-1826.7 GFLOP/s | 2179.7-2187.6 GFLOP/s | +19.3-20.9% |
+
+   Real, not negligible, and reported at the actual measured range rather
+   than a single cherry-picked run. Q8_0 (a different, unrelated launch
+   path that carries no tail-fill mechanism) was measured alongside as a
+   control and is flat before/after (~2065-2083 GFLOP/s), as expected.

@@ -857,21 +857,58 @@ __global__ void GroupedKQ8K(OutT* __restrict__ out, const uint8_t* __restrict__ 
 
 // --- non-grouped keep-quant GEMM (cuda_quant_dot.cu QuantDotGemmKernel :706) ---
 // warp per (i,j); no expert indirection (w_row = weight + j*w_row_bytes).
+//
 // skip_m/skip_n: the WMMA tile-aligned corner [0,skip_m)x[0,skip_n) a caller
 // already filled and this launch must not recompute (KERNEL-QUANT-CIQ-GEMM-
-// ROCM-RDNA4's M/N tail arm). Every existing call site passes 0,0, which
-// makes the guard `i < 0 && j < 0` — always false — so this is a pure
-// addition: unchanged behavior wherever the tail arm does not use it.
+// ROCM-RDNA4's M/N tail arm). Every pre-existing call site passes 0,0 and
+// takes the FULL-GRID branch below unchanged -- the tail arm is the only
+// caller that passes a nonzero skip_m or skip_n.
+//
+// The tail-fill call sites used to launch this kernel over the entire m*n
+// grid and rely on an `i < skip_m && j < skip_n` guard to no-op every warp
+// landing inside the corner. That is correct but not sized to the work: for
+// a large aligned corner and a wide N (e.g. N=12288, this row's own
+// production benchmark shape), the no-op warps outnumber the real ones by
+// roughly the corner's own area, so the launch and its address computation
+// cost close to as much as the whole GEMM to fill in what is typically a
+// thin remainder strip. This review finding (KERNEL-QUANT-CIQ-GEMM-ROCM,
+// independent review round) replaces the skip guard with an index remap so
+// the host can size the tail-fill grid to the remainder itself, not m*n:
+// a launched index `t` enumerates ONLY the bottom strip [skip_m,m)x[0,n)
+// (contiguous at the buffer's own row stride n, so it needs no separate
+// stride parameter) followed by the right strip [0,skip_m)x[skip_n,n) --
+// together the exact complement of the WMMA corner, and disjoint from each
+// other by construction (the bottom strip already claims every row at or
+// past skip_m; the right strip only visits rows before it).
 template <typename OutT, int Fmt>
 __global__ void KQuantGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
                             const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
                             int64_t nsb, size_t w_row_bytes, size_t w_block_bytes,
                             int64_t skip_m, int64_t skip_n) {
-  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
-  if (warp >= m * n) return;
-  const int64_t i = warp / n;
-  const int64_t j = warp % n;
-  if (i < skip_m && j < skip_n) return;
+  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  int64_t i, j;
+  if (skip_m == 0 && skip_n == 0) {
+    // Full-grid path, byte-for-byte the launch every pre-existing call site
+    // still takes: unchanged from before this review finding.
+    if (t >= m * n) return;
+    i = t / n;
+    j = t % n;
+  } else {
+    // Tail-fill path: t enumerates only the remainder the WMMA corner left
+    // untouched, bottom strip first then right strip (see the kernel-level
+    // note above for the shapes and why they are disjoint).
+    const int64_t bottom_strip = (m - skip_m) * n;
+    const int64_t right_strip = skip_m * (n - skip_n);
+    if (t >= bottom_strip + right_strip) return;
+    if (t < bottom_strip) {
+      i = skip_m + t / n;
+      j = t % n;
+    } else {
+      const int64_t t2 = t - bottom_strip;
+      i = t2 / (n - skip_n);
+      j = skip_n + t2 % (n - skip_n);
+    }
+  }
   const int lane = threadIdx.x;
   const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
   const BlockQ8_K* a_row = act + i * nsb;
@@ -1175,8 +1212,9 @@ std::atomic<uint64_t> g_kq_wmma_q4k_dispatches{0};
 // VT_ROCM_QUANT_WMMA=0 forces the scalar arm even on gfx1200/gfx1201 — the
 // A/B escape hatch every WMMA arm in this tree ships with
 // (VT_ATTN_PREFILL_SHAREDK_WMMA is the paged-attention precedent). Default
-// on: the gate below still requires the runtime architecture match and a
-// 16-aligned M/N before this path is ever reached.
+// on: the gate below still requires the runtime architecture match and
+// `m >= 16 && n >= 16` (not exact alignment — the M/N tail arm fills the
+// rest) before this path is ever reached.
 bool QuantWmmaEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_ROCM_QUANT_WMMA");
@@ -1336,10 +1374,15 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     // prompt hand-trimmed to exactly 288/512 tokens to engage the WMMA arm
     // at all), so requiring exact alignment meant the common case fell back
     // to scalar for the WHOLE shape, not just the remainder. The scalar
-    // kernel's new `skip_m`/`skip_n` guard fills in that remainder --
+    // kernel's `skip_m`/`skip_n`-indexed tail fills in that remainder --
     // bottom rows [m_aligned, m) x all columns, and the right columns
     // [0, m_aligned) x [n_aligned, n) -- without recomputing the corner
-    // WMMA already wrote.
+    // WMMA already wrote. The tail-fill grid below is sized to that
+    // remainder (`grid_tail`), not to the full m*n grid `grid` above: an
+    // independent review found the original full-grid launch (relying on a
+    // skip guard to no-op every warp inside the corner) cost close to as
+    // much as the whole GEMM to fill a typically thin remainder strip, for
+    // a large aligned corner and wide N.
     const bool wmma_ok = (fmt == 2 || fmt == 0) && m >= 16 && n >= 16 &&
                         QuantWmmaEnabled() && Gfx12QuantWmmaHostOk(q.device.index);
     auto launch = [&](auto ot) {
@@ -1356,7 +1399,13 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
             o, w, qact, m, n, nsb, n_tiles);
         const int64_t m_aligned = m_tiles * 16, n_aligned = n_tiles * 16;
         if (m_aligned < m || n_aligned < n) {
-          KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          // Remainder cell count: the bottom strip [m_aligned,m)x[0,n) plus
+          // the right strip [0,m_aligned)x[n_aligned,n) -- see KQuantGemmK's
+          // own comment for why these two are exactly the WMMA corner's
+          // complement. Sized to the remainder, not m*n.
+          const int64_t remainder = (m - m_aligned) * n + m_aligned * (n - n_aligned);
+          const int64_t grid_tail = (remainder + kWarpsPerBlock - 1) / kWarpsPerBlock;
+          KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid_tail), block, 0, s>>>(
               o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, m_aligned, n_aligned);
         }
         return;
@@ -1372,7 +1421,9 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
             o, w, qact, m, n, nsb, n_tiles);
         const int64_t m_aligned = m_tiles * 16, n_aligned = n_tiles * 16;
         if (m_aligned < m || n_aligned < n) {
-          KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          const int64_t remainder = (m - m_aligned) * n + m_aligned * (n - n_aligned);
+          const int64_t grid_tail = (remainder + kWarpsPerBlock - 1) / kWarpsPerBlock;
+          KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid_tail), block, 0, s>>>(
               o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, m_aligned, n_aligned);
         }
         return;
