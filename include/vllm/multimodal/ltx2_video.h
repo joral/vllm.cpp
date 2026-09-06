@@ -465,6 +465,48 @@ inline constexpr char kLtx2RetakeFrameRateExtra[] = "retake_frame_rate";
 inline constexpr char kLtx2RegenerateVideoExtra[] = "regenerate_video";
 inline constexpr char kLtx2RegenerateAudioExtra[] = "regenerate_audio";
 
+// ── IC-LoRA REFERENCE CONDITIONING. Row LTX25-IC-LORA-REF-VIDEO (#3020) ─────
+//
+// Read ONLY on an engine whose recipe declares `ic_lora_reference`, which is
+// `pipeline_kind = ic_lora` alone. `ICLoraPipeline` is a pipeline CLASS upstream
+// (ic_lora.py:60) and no other pipeline in `ltx-pipelines` calls
+// `append_ic_lora_reference_video_conditionings`, so serving the arm elsewhere
+// would be inventing conditioning the reference does not have.
+//
+// The reference CLIP itself is `VideoGenParams::ref_video_dir` — a directory of
+// `frame_%06d.ppm`, this ABI's standing spelling for a video, because no demuxer
+// is vendored here. Upstream reads a container (`decode_video_by_frame`,
+// iclora_utils.py:141) and its folder arm is the adaptation row LTX25-RETAKE
+// already recorded.
+
+// The STRENGTH half of `--video-conditioning PATH STRENGTH`
+// (ic_lora.py:416-425), which becomes `VideoConditionByReferenceLatent.strength`
+// (iclora_utils.py:166) and therefore the reference tokens' denoise mask
+// `1 - strength`. Default 1.0. Upstream's flag is REQUIRED and takes both halves
+// together; here the path is a request field that already exists, so only the
+// strength needs a name.
+inline constexpr char kLtx2RefVideoStrengthExtra[] = "ref_video_strength";
+
+// The MASK_PATH half of `--conditioning-attention-mask MASK_PATH STRENGTH`
+// (ic_lora.py:427-441), as a directory of `frame_%06d.ppm` for the reason above.
+// Upstream loads it at the STAGE-1 resolution (`args.height // 2`, `:460-461`);
+// this engine reads it at the stage's own grid, which is the same number derived
+// rather than assumed.
+inline constexpr char kLtx2CondAttentionMaskDirExtra[] = "conditioning_attention_mask_dir";
+
+// Its STRENGTH half (`:454-455`), multiplied into the downsampled mask
+// (iclora_utils.py:156). Default 1.0, and refused outside [0, 1] exactly as
+// `ICLoraPipeline.__call__` refuses it.
+//
+// A STRENGTH BELOW 1 WITHOUT A MASK IS REFUSED BY NAME, and that is a mirror
+// rather than a limitation. Upstream's scalar-only arm (`iclora_utils.py:157-158`)
+// cannot be reached from the CLI: `conditioning_attention_strength` is assigned
+// only inside `if args.conditioning_attention_mask is not None`
+// (ic_lora.py:452-455) and is 1.0 otherwise, so a sub-1.0 strength always
+// arrives with a mask. It is a Python-API-only branch, MEASURED as such by
+// `kLtx2RefWrapScalarBelowOne`, and it is recorded owed rather than guessed at.
+inline constexpr char kLtx2CondAttentionStrengthExtra[] = "conditioning_attention_strength";
+
 // ── TEXT-TO-AUDIO. Row LTX25-T2A-ONE-STAGE (#1005) ─────────────────────────
 //
 // These are read ONLY on a `pipeline_kind = t2a_one_stage` engine — that is a

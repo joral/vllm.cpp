@@ -972,6 +972,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/ltx2_video_vae_encoder_load.cpp
   src/vllm/model_executor/models/ltx2_audio_vae_encoder_load.cpp
   src/vllm/model_executor/models/ltx2_audio_input.cpp
+  src/vllm/model_executor/models/ltx2_iclora_reference.cpp
   src/vllm/model_executor/models/ltx2_image_preprocess.cpp
   # LTX-2.5 RETAKE (row LTX25-RETAKE, #924): the temporal region mask, the
   # truncate-or-pad conform, and the frame-directory source. Its own TU for the
