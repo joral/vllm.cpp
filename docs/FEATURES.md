@@ -59,7 +59,7 @@ against. Tracked by #2794 (goldens predate the pin) and #2817 (the advance).
 | Embeddable behind a C ABI | ✅ | ☐ | ☐ | ✅ |
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
-| Architectures | 43 registered, 27 gated | 130+ | 100+ | 100+ |
+| Architectures | 44 registered, 27 gated | 130+ | 100+ | 100+ |
 | Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 | Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, C++20 `std::numbers` pi, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
@@ -136,7 +136,7 @@ against. Tracked by #2794 (goldens predate the pin) and #2817 (the advance).
 The supported set is exactly what the C++ registry registers: every
 architecture self-registers via `REGISTER_VLLM_MODEL`, and
 `scripts/check-supported-models.py` gates this list against the source so it
-cannot drift. Today that is **43 registered architectures**. Each row names the
+cannot drift. Today that is **44 registered architectures**. Each row names the
 checkpoint it was gated against and the verdict; caveats are in
 [Project status](../README.md#project-status), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
@@ -242,6 +242,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DFlash2 block-diffusion (dynamic conv + candidate selector) | Qwen3 DFlash2 draft, safetensors or GGUF (bf16 / Q8_0 / Q4_K_M) | Gated against vLLM: 4/4 token-exact, 45/47 draft blocks identical, acceptance identical per prompt. All 7 DFlash2 suites green on `sm_121a`, zero CUDA skips | GREEDY only. Speed 0.8017x vLLM: RECORDED, no floor, NOT a pass (#1562). A GGUF draft is dequantized to bf16 at load (#1314) |
 | Async scheduling × speculative decoding | any Eagle-type speculator (`mtp`, `dflash`/DFlash2, `dspark`) | `test_mtp_depth` W7 cases: a spec engine resolves async ON and emits the sync scheduler's exact tokens through both engine fronts (depth-1 and the depth-2 batch queue); `test_engine_core_proc` pins the -1-placeholder / worker-fill contract | Mirrors vLLM's polarity (async disabled only OUTSIDE the Eagle-type family): drafts ride as `-1` placeholders the worker fills from its own propose; host `ngram` and `draft_model` stay synchronous. `VT_ASYNC_SCHED=0` rolls back. Spec steps keep the host sampler (device-resident spec sampling owed); the GPU TPOT A/B owed (#1824) |
+| DFlash2 DRAFT weights in ModelOpt NVFP4 | a DFlash2 draft whose own `config.json` declares `quant_method: "modelopt"` and `quant_algo` NVFP4 / W4A16_NVFP4 | `test_qwen3_dflash2_nvfp4` 14/14 (317) over a REAL safetensors file through `MakeQwen3DFlashDraftConfig` + `LoadQwen3DFlash`, the pair `LoadDflashDraft` calls: seven packed owners per layer with `n`, `k` and `weight_scale_2` asserted per module, the merged bf16 owners left empty, and the 12 excluded modules read BF16 | The arm question is the DECLARATION, as upstream's `get_draft_quant_config` makes it, with the tensors cross-checked in BOTH directions. `fc`, `candidate_selector.hidden_projection` and both conv `kernel_projection`s have no packed owner and are refused BY NAME. Declared W4A4 runs W4A16 and the load says so (#2760). LOAD-gated only: `vt::MatmulNvfp4` is CUDA-only, so no host twin exists and the device leg is owed (#2758) |
 | DFlash/DFlash2 shared `lm_head` kept PACKED | a DFlash or DFlash2 draft off an NVFP4 safetensors target | `test_qwen3_dflash2_draft` 36/36 (353): block logits BITWISE equal to `Qwen3_5MTPModel::ComputeLogits` on the same packed head, and `FromModelDir` loads and drafts off one | Widening a head stays refused by name: GGUF `output.weight`, FP8, W4A4. `VT_LMHEAD_FP4=0` rolls back to the refusal. DSpark and the CUDA arm owed (#1628) |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
 
@@ -256,9 +257,9 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
 | `Dots3NoteMTPModel` | dots3-note nextn head (the target arch `Dots3NoteForCausalLM` IS registered; see the supported table above) | W10 owns it and it is deliberately NOT registered: a speculator that cannot propose makes the engine accept a speculative config it then dies on mid-run. The checkpoint ships exactly one nextn layer, and since W5c (#2176) its 19 tensors are a NAMED W10 deferral in the language tower's accounting rather than a refusal, which is what vLLM's own loader does with them. Blocked behind the target row: no oracle runs here, 298.67 GB fp8 against a 122 GiB ceiling, so NO number is claimable on any axis ([spec](../.agents/specs/dots3-note.md), #699) |
 
-27 of the 39 registered text-generation architectures carry a passing
+27 of the 40 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
-(The 43 registered total also covers 3 Parakeet ASR entry points and the
+(The 44 registered total also covers 3 Parakeet ASR entry points and the
 `LlamaModel` embedding arch, which are not text generation.)
 vLLM registers 130+ text architectures, so this is a curated, gated subset, not
 a breadth claim. The first EMBEDDING architecture is registered and live

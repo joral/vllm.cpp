@@ -1995,6 +1995,10 @@ vllm_cpp_add_test(test_combine_row_predicate vllm/v1/worker/test_combine_row_pre
 # per-STEP reduction both sampling entry points and the input-combine refusal
 # turn on. Same shape and same reason as the row predicate above.
 vllm_cpp_add_test(test_verify_route_predicate vllm/v1/worker/test_verify_route_predicate.cpp)
+# SPEC-DFLASH2 A2-3 (#2911): the async placeholder fill's per-request rule, read
+# off the same per-req_state draft buffer the combine's scatter reads. Same shape
+# and same reason as the two predicates above -- one rule, one expression.
+vllm_cpp_add_test(test_draft_fill vllm/v1/worker/test_draft_fill.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
 vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
 # ENG-POOL-BEST-FIT (#1922): the shared scratch pool must reach a steady state
@@ -2812,6 +2816,12 @@ vllm_cpp_add_test(test_qwen35_exl3 vllm/models/test_qwen35_exl3.cpp)
 # and forward, gated through LoadQwen3DFlash over a real safetensors file and
 # then through Qwen3DFlashModel::ForwardBlockLogits.
 vllm_cpp_add_test(test_qwen3_dflash2_exl3 vllm/models/test_qwen3_dflash2_exl3.cpp)
+# MODEL-DFLASH2-NVFP4 (#2758): the ModelOpt NVFP4 arm of the same DRAFT loader,
+# gated through MakeQwen3DFlashDraftConfig + LoadQwen3DFlash over a real
+# safetensors file — the exact pair LoadDflashDraft calls. A load gate and not a
+# forward twin: vt::MatmulNvfp4 is registered for CUDA only, so there is no host
+# path to decode a packed weight against.
+vllm_cpp_add_test(test_qwen3_dflash2_nvfp4 vllm/models/test_qwen3_dflash2_nvfp4.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
