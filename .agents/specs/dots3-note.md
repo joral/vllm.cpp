@@ -8301,10 +8301,11 @@ restored byte-for-byte (source sha
 `e67a97754e2266c91efe48e0845e8324d1644ecf285667e200940220ce80b4f1`) and both
 baseline binary shas were reproduced after EVERY one of them, not only the last.
 The binary shas name a build at `origin/main` `4e748e4a7`; the tree was merged
-with `origin/main` `84cb258bb` afterwards and re-run, which reproduces the same
-20/21843 and 32/16499 at new shas `479b2b4fbc1ad0cc` and `ec245323b4b751aa`
-(`test_dots3_note_audio` 28/4206, sha `c4972c02ce8f6892`). Counts, not binary
-shas, are what carries across a base move.
+with `origin/main` `84cb258bb` and then `704c9aace` afterwards and re-run at
+each, which reproduces the same 20/21843 and 32/16499 at shas
+`479b2b4fbc1ad0cc` and `ec245323b4b751aa` (`test_dots3_note_audio` 28/4206, sha
+`c4972c02ce8f6892`) both times. Counts, not binary shas, are what carries across
+a base move.
 
 | # | what it changes | `test_dots3_note_vision` | `test_openai_api_server_dots3_mm_forward` |
 |---|---|---|---|
@@ -9696,9 +9697,15 @@ warning. `per_block_cast_to_fp8` slices to the shape of ITS input, which the
 outer function already padded, so the slice is the identity. §4.20.1.1 keeps the
 error and §4.20.4.1's N1/N2 are the mutations that would now catch it.
 
+**This is a BEHAVIOUR CHANGE on the served path, not only a records repair.** An
+image request against the released `vision_config` used to travel the bf16 class
+and print a stderr warning; it now travels `MoESwiGLUFFNFP8` and enters the
+block-FP8 GEMM. The served gate asserts both sides of that move.
+
 Nothing here is compared against vLLM: §6.4 option B stands, nothing ran
 upstream end to end, and **removing a false claim about upstream is not a parity
-claim**. R5 and the `use_ue8m0` `## Owed` entry are corrected in place
+claim**. No parity, throughput, latency or memory property is claimable on this
+row at all. R5 and the `use_ue8m0` `## Owed` entry are corrected in place
 (§4.20.5).
 
 **W8a LANDED (#2860): ONE dots3-note request now carries TWO `mm_features`, the
