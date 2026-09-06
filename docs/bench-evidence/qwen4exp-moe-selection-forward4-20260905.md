@@ -206,27 +206,71 @@ looks like a result is this row's defining trap.
 because `rc ps` lists only pending and running work, so absence there is not
 cancellation:
 
-| Field | Value at 2026-09-05T21:36:32Z |
+| Field | Value at 2026-09-06T02:13:21Z |
 |---|---|
 | `id` | `9e0864da-9b37-4309-b863-04810de0e068` |
-| `state` | `queued` |
+| `state` | `queued`, at queue position 1 on `thor:gpu0` |
 | `exit_code` | `None` |
 | `device_id` | `thor:gpu0` |
 | `queued_at` | `2026-09-05T21:10:41Z` |
 | `started_at` | `None` |
 | `finished_at` | `None` |
 
-The job had not dequeued 26 minutes after submission. `thor:gpu0` was held for
-that whole period by an unrelated job. **A queued job survives the death of the
-client that submitted it**, so this id stays valid and the next reader queries it
-by id rather than resubmitting. See section 6.
+The job had not dequeued **5 hours** after submission. `thor:gpu0` was held for
+that whole period by one unrelated job, which reached 5 h 36 m. **A queued job
+survives the death of the client that submitted it**, so this id stays valid and
+the next reader queries it by id rather than resubmitting. The job also wrote no
+`out/` directory on the share, which is the independent confirmation that it never
+started: `job.sh` creates that directory in its first action. See section 6.
+
+### `rc jobs` truncates to 20 rows by default, and the absence reads as a vanished job
+
+This nearly became a false finding in this wave, and it is the same shape as the
+trap the rest of this document is about, so it is recorded here.
+
+A poller that queried `rc jobs -o json` every minute reported the job normally for
+259 minutes and then reported it **missing** for the next 41. Nothing had changed
+about the job. `rc jobs` defaults to `-n 20`, the fleet ran more than 20 jobs after
+this one was submitted, and the row simply fell off the end of the default window.
+Asking for `-n 200` returns it, still `queued`, with `started_at` null.
+
+Two rules follow, and both are about not reading absence as an event:
+
+- **Query the history with an explicit limit.** `rc jobs -o json -n 200` is the
+  widest the server accepts. It refuses anything larger with
+  `bad_request: limit must be an integer between 1 and 200`.
+- **A job missing from a listing is not a job that ended.** `rc ps` shows only
+  pending and running work, and `rc jobs` shows only the most recent rows. Neither
+  absence is a terminal state. The terminal states are on the record itself, in
+  `state`, `exit_code` and `finished_at`.
+
+### The job DEQUEUED at 2026-09-06T02:15:40Z, and it is running
+
+The table above is stamped, and the stamp is what makes it readable: two minutes
+after that reading the job started. `rc jobs -o json -n 200` now returns
+`state = running`, `started_at = 2026-09-06T02:15:40Z`, `exit_code = None`,
+`finished_at = None`, and `rc ps` lists it on `thor:gpu0`. **No reading is claimed
+from it here.** What is quoted below is the job's own per-step output, because an
+`exit_code` of 0 would say only that the script ended, not that any step inside it
+did what a record claims:
+
+```text
+### 02:15:47 === B. THE BINARY IS WAVE ARMTOKENS', BY DIGEST ===
+RESULT BINARY sha256=1d129fa0ab96663bea8f50f715117596241a7f2f8ae77e877ba5853bb198792f (expect 1d129fa0ab96663bea8f50f715117596241a7f2f8ae77e877ba5853bb198792f)
+RESULT BINARY CARRIES: VT_MOE_SEL_FP=1(>=1) moesel_fmt=2(>=1) poscontrol=3(>=1) negcontrol=0(==0)
+```
+
+So the binary under measurement is ARMTOKENS' by digest and it carries the tap,
+with the negative control reading 0 as it must. The selection result itself is
+owed by whoever reads this job to completion, and section 6 still stands.
 
 ## 6. What this document does not establish
 
 - **Whether the matched pair's layer-0 selection flips.** The job that answers it
-  was queued behind another job on `thor:gpu0` and had not started when this
-  document was written. Nothing here places `4.324e-05` on either side of the
-  bracket.
+  sat at queue position 1 on `thor:gpu0` for 5 hours behind one unrelated job, and
+  it started at `2026-09-06T02:15:40Z` while this document was being written. It
+  had produced no selection reading when this text was committed. Nothing here
+  places `4.324e-05` on either side of the bracket.
 - **Anything about forwards 4, 6 and 7 on a non-degenerate pair.** MOEDIV's
   reading at those forwards exists and is VOID, because its CUDA arm ran a
   different input. This document corrects the reason the reading is unavailable.
