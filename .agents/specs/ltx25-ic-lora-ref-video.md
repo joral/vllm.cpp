@@ -273,10 +273,50 @@ the production call site, not the helper.
 
 ## 6. Mutations
 
-Every claimed guarantee is mutated in a scratch copy, each mutation confirmed
-APPLIED and COMPILED before its result is recorded. Eight of eight A24 waves
-shipped a guarantee that mutation showed nothing measured; this row assumes the
-same until each one has fired.
+Twelve, each applied by `scripts`-external `mutate.py`, which REFUSES when its
+`old` text is not found and asserts the edit took; each then COMPILED, both
+suites run, and the tree restored with `git checkout --` plus a `git status
+--porcelain` emptiness assertion. `unit` is `test_ltx2_iclora_reference`
+(97 assertions green), `reach` is `test_ltx2_video --test-case='ltx2 ic-lora*'`
+(169 assertions green).
+
+| # | mutation | unit | reach | verdict |
+|---|---|---|---|---|
+| M1 | delete the production `vin.attention_mask` assignment | 97/97 pass | **4 failed** | DETECTED — the reachability property |
+| M2 | never apply `Ltx2ConditionVideoByReference` | 97/97 pass | **threw** | DETECTED |
+| M3 | `temporal_subsample` steps from 0 | **21 failed** | 169/169 pass | DETECTED |
+| M4 | drop the causal first-frame carve-out | **1 failed** | 169/169 pass | DETECTED |
+| M5 | cross block on ALL existing rows | **3 failed** | 169/169 pass | DETECTED |
+| M6 | drop `scale != 1` from the divisibility guard | 97/97 pass | 169/169 pass | **SURVIVED — IDENTITY** |
+| M7 | read the reference at the phase's own grid | **4 failed** | **1 failed** | DETECTED |
+| M8 | apply the reference on every phase | 97/97 pass | **1 failed** | DETECTED |
+| M9 | never multiply the mask by the strength | 97/97 pass | **1 failed** | DETECTED |
+| M10 | an append no longer extends the mask | **1 failed** | 169/169 pass | DETECTED |
+| M11 | the refusal takes a second predicate | 97/97 pass | 169/169 pass | **SURVIVED — IDENTITY** |
+| M12 | broadcast a short 1-D mask instead of refusing | **1 failed** | 169/169 pass | DETECTED |
+
+**Ten of twelve detected. Neither survivor is a blind spot, and both are
+identities provable rather than argued.**
+
+**M6.** The mutant drops `downscale_factor != 1` from
+`downscale_factor != 1 && (h % downscale_factor || w % downscale_factor)`. For
+`downscale_factor == 1` the right conjunct is `h % 1 || w % 1`, which is `0`
+for every `h` and `w`. The two predicates therefore agree on every input, and no
+fixture can separate them. Upstream writes the guard (`iclora_utils.py:112`) and
+this port mirrors it; it is documentation of intent, not behaviour.
+
+**M11.** The mutant replaces `serves_reference` in the refusal with
+`im.pipeline_kind != "ic_lora"`. `serves_reference` is
+`im.recipe.ic_lora_reference`, and that field is set by `IcLoraRecipe` alone,
+which `ResolveLtx2PipelineRecipe` reaches only for `pipeline_kind == "ic_lora"`.
+So over the recipe table AS IT STANDS the two expressions are the same
+predicate. **It stops being an identity the moment a second recipe sets the
+flag**, and this row therefore adds the tripwire for that day:
+`test_ltx2_pipeline`'s recipe-table case walks all eleven kinds against all four
+versions and requires exactly ONE resolved pair to carry `ic_lora_reference`,
+naming `ltx2_video.cpp`'s refusals as what must be re-read. That converts an
+unmeasured residual into a guarded one; it does not make M11 detectable today,
+because today it changes nothing.
 
 ## Owed
 
@@ -305,4 +345,6 @@ same until each one has fired.
 
 ## Now
 
-`ACTIVE` — implementation on `row/LTX25-IC-LORA-REF-VIDEO`.
+`DONE` — landed on `row/LTX25-IC-LORA-REF-VIDEO`. A15 and A16 are served and
+reached from `Generate`; the dead `Ltx2ModalityInput::attention_mask` seam has a
+production writer. What stays owed is in `## Owed` and is refused by name.

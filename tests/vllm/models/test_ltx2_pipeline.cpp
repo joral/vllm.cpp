@@ -1173,6 +1173,53 @@ TEST_CASE("ltx2 the recipe table mirrors vLLM-Omni's, and refuses everything els
     CHECK(std::string(vllm_test::kLtx2OmniRecipeVersions[i]) != "2.5");
   }
 
+  // `ic_lora_reference` IS TRUE FOR EXACTLY ONE KIND, and this walk is what
+  // keeps that true. Row LTX25-IC-LORA-REF-VIDEO (#3020).
+  //
+  // WHY IT EXISTS, stated as a MEASUREMENT rather than a worry. The phase loop
+  // routes on `im.recipe.ic_lora_reference` and its refusals read the SAME local,
+  // because a refusal and its route predicate written as two expressions is how
+  // this campaign shipped a silently wrong answer. Mutation M11 replaced the
+  // refusal's half with `im.pipeline_kind != "ic_lora"` and BOTH suites stayed
+  // green — 97/97 and 169/169 — because over the recipe table as it stands the
+  // two expressions are the same predicate. That is an IDENTITY, not a blind
+  // spot, and it stops being one the moment a second recipe sets this flag.
+  //
+  // So this case is the tripwire for that day: a second recipe carrying
+  // `ic_lora_reference` reds HERE, where the reader is told to reconcile the
+  // refusal, rather than in a render that silently refuses a supported request.
+  {
+    const char* const kAllKinds[] = {"one_stage",   "distilled_two_stage", "dfr",
+                                     "res2s_two_stage", "dmd2",            "retake",
+                                     "a2vid_two_stage", "ti2vid_two_stage",
+                                     "keyframe_interpolation", "t2a_one_stage", "ic_lora"};
+    const char* const kAllVersions[] = {"2", "2.3", "2.4", "2.5"};
+    int resolved_with_flag = 0;
+    for (const char* kind : kAllKinds) {
+      for (const char* version : kAllVersions) {
+        vllm::Ltx2PipelineRecipe recipe;
+        try {
+          recipe = vllm::ResolveLtx2PipelineRecipe(kind, version);
+        } catch (const std::exception&) {
+          continue;  // an unkeyed pair; the table refuses it by name
+        }
+        INFO("kind = ", kind, " version = ", version);
+        if (recipe.ic_lora_reference) {
+          ++resolved_with_flag;
+          CHECK_MESSAGE(std::string(kind) == "ic_lora",
+                        "a recipe other than 'ic_lora' declares ic_lora_reference. The phase "
+                        "loop's refusals in ltx2_video.cpp must be re-read: they name 'ic_lora' "
+                        "in their text, and that text is now wrong.");
+        } else {
+          CHECK(std::string(kind) != "ic_lora");
+        }
+      }
+    }
+    CHECK_MESSAGE(resolved_with_flag == 1,
+                  "exactly one (kind, version) pair carries ic_lora_reference; got "
+                      << resolved_with_flag);
+  }
+
   // The 2.4 and 2.5 rows this port adds, sourced from Lightricks.
   CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("one_stage", "2.4"));
   CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5"));
