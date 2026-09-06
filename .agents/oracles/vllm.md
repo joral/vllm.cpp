@@ -32,12 +32,24 @@ this section keeps them apart, because the pin advanced
 that put step 6 after step 7, so the advance carries obligations it has not
 discharged.
 
-### Established, and this is the whole of it
+### Established, on two boards
 
-`e126687a9a828d513c01a07cd69f025f27d63280` (2026-08-31, vllm#53896, the revision
-that registers `Qwen4ExpForCausalLM`) **builds from source and runs a model** on
-`thor:gpu0`. Measured 2026-09-03, aarch64, NVIDIA Thor, compute capability 11.0,
-driver 595.78:
+**This heading used to read "and this is the whole of it", and it named only the
+Thor build.** The 2026-09-04 capture on `dgx:gpu0` establishes strictly more —
+item 2 below and the `dgx:gpu0` row in `## Device-scoped gateability` — so the
+claim of wholeness was false the moment those landed. It is corrected here rather
+than left for a reader to reconcile against the section that falsifies it.
+
+**On `dgx:gpu0` (GB10, `sm_121a`), 2026-09-04**, job `7386f034`: builds from
+source at this revision, runs `facebook/opt-125m`, and reproduces the committed
+golden `tests/parity/goldens/opt_greedy/greedy_ids.npy` under the declared
+`#2794` recipe — `TOKENGATE_VERDICT PASS`. Item 2 states the numbers and the
+narrowness. That is the strongest thing established at this pin.
+
+**On `thor:gpu0`**, `e126687a9a828d513c01a07cd69f025f27d63280` (2026-08-31,
+vllm#53896, the revision that registers `Qwen4ExpForCausalLM`) **builds from
+source and runs a model**. Measured 2026-09-03, aarch64, NVIDIA Thor, compute
+capability 11.0, driver 595.78:
 
 ```console
 SRCBUILD_RC=0   94 min, MAX_JOBS=4, TORCH_CUDA_ARCH_LIST=11.0, CUDA 13.0.88
@@ -112,9 +124,18 @@ half [`../sync/2026-09-02-e126687.md`](../sync/2026-09-02-e126687.md)
    benchmark.** This item used to say "No reading on `dgx:gpu0`. Only
    `thor:gpu0` was measured, on one day." That is no longer true. Job
    `7386f034` built the oracle from source on `dgx:gpu0` on 2026-09-04 and passed
-   the OPT token gate on it (item 2 above); job `8c4f639c` read the installed
-   package's own metadata there on 2026-09-05
-   ([`../sync/2026-09-05-e126687-step6-c1a.md`](../sync/2026-09-05-e126687-step6-c1a.md)).
+   the OPT token gate on it (item 2 above); job
+   `d7908816-96a3-40ed-8024-c3ad0cc34d77` read the installed package's own
+   metadata there on 2026-09-05, `VERSION_READ_RC=0` at its `step35.log:73` with
+   the `metadata_vllm=` block at `:75`
+   ([`../sync/2026-09-05-e126687-pingate.md`](../sync/2026-09-05-e126687-pingate.md)
+   §2 item 3). **Not job `8c4f639c`, which this item credited until now**: that
+   job's own read returned `VERSION_READ_RC=1` with
+   `ModuleNotFoundError: No module named 'vllm'`, and its `succeeded`/`exit 0`
+   attests the job and not the step inside it.
+   [`../sync/2026-09-05-e126687-step6-c1a.md`](../sync/2026-09-05-e126687-step6-c1a.md)
+   still names the wrong job; it belongs to another wave and
+   [#2997](https://github.com/mudler/vllm.cpp/issues/2997) owes its repair.
    **What is still absent is a benchmark reading.** Every binding number in this
    tree was taken on GB10 at the PRIOR pin, none has been re-taken at this one,
    and a build-and-identity reading does not transfer to a throughput row.
@@ -166,11 +187,30 @@ string in the engine banner at `:340`; the second row's records
 `VLLM_VERSION = 0.26.0.dev0+g5559679229` in its build-identity block. They are
 kept, with their pin column, because they are real measurements of a real board
 and deleting them would destroy evidence — but they do not answer the question at
-the CURRENT pin. `thor:gpu0` is still deliberately NOT added: the run that put the
-pin here served `facebook/opt-125m` with no golden comparison, so it measured no
-gate at all, and adding it would make the table say the thing the pin advance did
-not buy. The `dgx:gpu0` row is admitted precisely because it did compare against
-a committed golden and passed.
+the CURRENT pin.
+
+`thor:gpu0` is still deliberately NOT added, and the reason is NOT that it
+skipped the golden. It compared: `2026-09-03-e126687-runhalf.md:214-221` records
+`All 96 token ids equal tests/parity/goldens/opt_greedy/greedy_ids.npy exactly,
+on both legs`, `EXACT_MATCH_vs_pin_golden True  mismatched_positions 0` under
+eager and under compiled, reproduced on a second lease. **An earlier version of
+this paragraph said that run had "no golden comparison"; that is false, and the
+discriminator it stated does not discriminate.** The real one is in the next
+paragraph of the same file, which tells the reader how to take its own result:
+
+> **Read that as informative and not as a gate.** The golden was captured at the
+> **pin**, 1465 commits earlier, on `dgx` (sm_121a), against a bf16-materialized
+> checkpoint; this is the **candidate** on Thor (sm_110) against the raw fp16
+> checkpoint that vLLM rounds at load. Agreement across that many differences is
+> worth recording and is not a parity result, because nothing here was designed
+> as one and one battery of six prompts at 16 tokens gates nothing.
+
+The `dgx:gpu0` row is admitted because it holds every one of those differences
+fixed: the declared `#2794` recipe (`scripts/opt-oracle-capture.py`, `--runs 5`)
+on the board the golden came from, against the same bf16-materialized
+checkpoint. Thor's agreement is a stronger fact than a skipped comparison and it
+is still not this table's subject, which is a gate measured under the conditions
+its golden was captured under.
 
 | device | arch | pin measured at | measured | builds | runs a gate model | evidence |
 |---|---|---|---|---|---|---|
