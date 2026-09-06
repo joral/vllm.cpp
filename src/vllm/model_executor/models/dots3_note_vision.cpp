@@ -326,6 +326,15 @@ Dots3NoteVisionMoeArm ResolveDots3NoteVisionMoeArm(
   return arm;
 }
 
+bool Dots3NoteVisionFp8UnrunnableHere(const Dots3NoteVisionMoeArm& arm,
+                                      vt::DeviceType device) {
+  // The whole predicate, in one place, because it is the thing that decides
+  // whether a served image request is answered or refused. `VisionMoeFfn` is
+  // its only production caller and the gate asks it directly; see the header's
+  // note for why the conjunction is named rather than inlined.
+  return arm.fp8 && !dense_fp8_block::BlockFp8Runnable(device);
+}
+
 int64_t Dots3NoteVisionFp8PadTo128(int64_t extent) {
   // `_ceil_to_multiple` (`vision.py:222-223` @ 9035151d6) == DeepGEMM's `align`
   // (`deep_gemm/utils/math.py:9-10` @ `e21c821f`).
@@ -1035,7 +1044,18 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
   // to say so here rather than to fault at the first GEMM of the first image.
   // The shared `RefuseUnrunnableFp8BlockWeight` is the seam for this; it names
   // the projection, the device and the arch cell.
-  if (arm.fp8 && !dense_fp8_block::BlockFp8Runnable(d.q.device.type)) {
+  //
+  // AND THIS GUARD NOW FIRES ON THE RELEASED CHECKPOINT, which it did not do
+  // before PR #2947 corrected the resolver. `arm.fp8` was false for the
+  // released `vision_config` and this whole `if` was unreachable for it, so an
+  // image request against that checkpoint was ANSWERED on the bf16 class on
+  // every device. It is now refused by name on any CUDA build outside the cell.
+  // That is a behaviour change and not only a records repair; the spec's
+  // `## Owed` carries it with its unblocking condition, and
+  // `test_dots3_note_vision`'s G5 asserts that the released config reaches this
+  // predicate. Falling back to bf16 here instead would be a silent divergence
+  // from the class upstream builds, which is the trade AGENTS.md refuses.
+  if (Dots3NoteVisionFp8UnrunnableHere(arm, d.q.device.type)) {
     RefuseUnrunnableFp8BlockWeight(
         "vision_encoder.blocks." + std::to_string(block) + ".mlp.experts",
         d.q.device.type);

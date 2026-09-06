@@ -63,14 +63,34 @@
 //                                         expert at a time (no `vt` grouped
 //                                         block-FP8 MoE op exists)
 //
-// AND WHAT IT STILL IS NOT: a tower that takes that arm on the RELEASED
-// checkpoint. `note_vision_fused_moe_fp8` quantizes an activation of width
-// `moe_intermediate_size` in groups of 128, the released value is 2112, and
-// `per_token_group_quant_fp8` asserts divisibility, so upstream's own default
-// class raises there. `ResolveDots3NoteVisionMoeArm` is where that is decided
-// and said; `Dots3NoteVisionRefusal` still names W9 for a blockwise-QUANTIZED
-// CHECKPOINT, which is a different thing and is still owed. See
-// `.agents/specs/dots3-note.md` §4.11, §4.12 and §4.20.
+// AND IT IS THE ARM THE RELEASED CHECKPOINT TAKES. This paragraph said the
+// opposite until PR #2947 and that claim was FALSE, so it is corrected here
+// rather than deleted. It read `note_vision_fused_moe_fp8` as quantizing an
+// activation of width `moe_intermediate_size`, the released 2112 as failing
+// `per_token_group_quant_fp8`'s divisibility assertion, and upstream's own
+// default class as raising there. `_per_block_cast_to_fp8_padded` pads each
+// expert shard up to a multiple of 128 and NEVER SLICES THE PAD BACK, so the
+// stored shard is 2176, `w13` is 4352, the width that assertion reads is 2176,
+// and `2176 % 128 == 0`. `ResolveDots3NoteVisionMoeArm` carries the arithmetic
+// and the retraction in full; it keys only on `embed_dim`, which is 1536 on the
+// released checkpoint, so that checkpoint runs the FP8 class here.
+//
+// WHAT IS STILL OUT OF REACH, and it is two unrelated things.
+//   (a) A CUDA BUILD OUTSIDE THE `cutlass-fp8` ARCH CELL `12.0a,12.1a`
+//       (`cmake/CudaArchFeatures.cmake:290`) registers no
+//       `vt::MatmulFp8BlockScaled` at all, so an image request against the
+//       released `vision_config` is REFUSED BY NAME there. It used to be
+//       ANSWERED, on the bf16 class, and the released checkpoint changing arm
+//       is what changed that. `thor:gpu0` (sm_110) and `orin:gpu0` (sm_87) are
+//       both outside the cell and both are this row's own e2e hosts.
+//       `VisionMoeFfn`'s `Dots3NoteVisionFp8UnrunnableHere` guard is where this
+//       is decided and said; the spec's `## Owed` carries the unblocking
+//       condition, which is #1189 milestone M5 reaching those arches.
+//   (b) A blockwise-QUANTIZED CHECKPOINT, the `-fp8` sibling that ships
+//       `weight_scale_inv` on disk instead of the bf16 experts this cast
+//       converts at load. `Dots3NoteVisionRefusal` still names W9 for it, it is
+//       a different thing from this arm, and it is still owed.
+// See `.agents/specs/dots3-note.md` §4.11, §4.12 and §4.20.
 //
 // WHY IT SHARES NO CODE WITH `qwen3_vl_vision`. The two towers agree on the
 // block OUTLINE and on almost nothing below it: RMSNorm vs LayerNorm, no bias
@@ -177,9 +197,12 @@ struct Dots3NoteVisionParams {
   // W6b ported the OTHER class and nothing here read the key at all; #2881 is
   // that finding.
   //
-  // Reading it is NOT the same as taking that branch, because upstream's FP8
-  // class cannot execute on the released geometry -- see
-  // `ResolveDots3NoteVisionMoeArm`, which is where that is decided and said.
+  // Reading it IS taking that branch on the released checkpoint. This comment
+  // used to say the opposite -- that upstream's FP8 class cannot execute on the
+  // released geometry -- and that was FALSE: the weight cast pads 2112 to 2176
+  // and does not slice the pad back, so nothing raises. See
+  // `ResolveDots3NoteVisionMoeArm`, which keys only on `embed_dim` and carries
+  // the retracted arithmetic in full.
   bool enable_fp8_moe = true;
 
   // The adapter (`vision.py:419-496`). `patch_merger` is the arm the released
@@ -280,7 +303,9 @@ struct Dots3NoteVisionParams {
 // padding cannot move a scale and is ported anyway" was true of the scale
 // VALUES and false about the SHAPE. `fp8_utils.py:563` reads the shape.
 //
-// TWO STATES, AND THE SECOND ONE IS NARROW:
+// TWO FIELDS, THREE OUTCOMES, AND THE MIDDLE ONE IS NARROW. The struct has
+// two members and this predicate has three answers; they are not the same
+// count, and the list below is the three:
 //   `enable_fp8_moe` false                  -> bf16, `upstream_raises` empty.
 //       Upstream's own other branch, and W6b's arm, unchanged.
 //   true, `embed_dim` not a multiple of 128 -> bf16, `upstream_raises` set.
@@ -309,6 +334,24 @@ struct Dots3NoteVisionMoeArm {
 
 Dots3NoteVisionMoeArm ResolveDots3NoteVisionMoeArm(
     const Dots3NoteVisionParams& v);
+
+// WOULD `VisionMoeFfn` REFUSE ON THIS DEVICE? The forward's arch guard, named
+// rather than spelled inline, so a gate can ask the production predicate itself
+// instead of re-deriving the conjunction beside it.
+//
+// It is exactly `arm.fp8 && !dense_fp8_block::BlockFp8Runnable(device)`. Both
+// halves matter and neither is a config property: the FIRST is decided by
+// `ResolveDots3NoteVisionMoeArm` and is TRUE on the released `vision_config`
+// since PR #2947 corrected the resolver, and the SECOND is decided by which
+// arch cell this build compiled -- `vt::MatmulFp8BlockScaled` is registered
+// only for `cutlass-fp8` `12.0a,12.1a`. Their conjunction is the behaviour
+// change that arm correction brings with it: on a CUDA build outside that cell
+// the released checkpoint is now refused BY NAME where the bf16 class used to
+// answer. `dense_fp8_block::BlockFp8Runnable` is declared in
+// `dense_fp8_block_gemm.h`, which this header deliberately does not pull in, so
+// this is a declaration and the definition sits beside the call site.
+bool Dots3NoteVisionFp8UnrunnableHere(const Dots3NoteVisionMoeArm& arm,
+                                      vt::DeviceType device);
 
 // `_ceil_to_multiple(value, 128)` (`vision.py:222-223` @ `9035151d6`), which is
 // DeepGEMM's own `align` (`deep_gemm/utils/math.py:9-10` @ `e21c821f`). Exposed

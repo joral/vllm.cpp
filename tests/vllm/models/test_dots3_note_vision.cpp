@@ -3418,4 +3418,47 @@ TEST_CASE("dots3-note W9d: a device with no block-scaled FP8 GEMM is refused BY 
   REQUIRE(a != std::string::npos);
   REQUIRE(b != std::string::npos);
   CHECK(msg.substr(a) == qwen.substr(b));
+
+  // ── AND THE RELEASED CHECKPOINT NOW REACHES IT ───────────────────────────
+  //
+  // What is NEW is not the message, which W9d already asserted. It is that the
+  // released `vision_config` now satisfies the FIRST half of the guard's
+  // conjunction, so on a device with no block-scaled FP8 GEMM the guard fires
+  // for the checkpoint this tree already serves. Before PR #2947 the resolver
+  // sent the released config to bf16, `arm.fp8` was false, and this guard was
+  // unreachable for it on every device: the request was ANSWERED. It is now
+  // REFUSED on any CUDA build outside `cutlass-fp8` `12.0a,12.1a`, which is
+  // both of this row's own e2e hosts (`thor:gpu0` sm_110, `orin:gpu0` sm_87).
+  //
+  // WHAT THIS CANNOT DO, said rather than implied: it cannot EXECUTE the
+  // refusal from a served forward, because doing that needs a queue on a device
+  // whose `vt::MatmulFp8BlockScaled` is unregistered and no such device exists
+  // on this host. What it does instead is ask the production predicate itself
+  // -- `Dots3NoteVisionFp8UnrunnableHere`, which is the expression
+  // `VisionMoeFfn` evaluates, not a copy of it -- over the released config's
+  // own resolved arm. A mutation that returns `false` from that predicate reds
+  // this block and nothing else in either suite.
+  const vllm::Dots3NoteVisionMoeArm released =
+      vllm::ResolveDots3NoteVisionMoeArm(ParseDoc(ReleasedConfigDoc()));
+  REQUIRE(released.fp8);
+  // On the device this suite runs on, both ops exist, so nothing is refused --
+  // which is why every FP8 case above computes instead of throwing.
+  CHECK_FALSE(vllm::Dots3NoteVisionFp8UnrunnableHere(released,
+                                                     vt::DeviceType::kCPU));
+  // On a device with no block-scaled GEMM in any build, the released
+  // checkpoint's own arm makes the guard fire.
+  CHECK(vllm::Dots3NoteVisionFp8UnrunnableHere(released,
+                                               vt::DeviceType::kMETAL));
+  // ...and the OTHER arm never does, anywhere. `enable_fp8_moe` false is
+  // upstream's own bf16 branch and it needs no block-scaled GEMM at all, so a
+  // guard that fired on it would refuse a request this tree can serve.
+  nlohmann::json bf16_doc = ReleasedConfigDoc();
+  bf16_doc["vision_config"]["enable_fp8_moe"] = false;
+  const vllm::Dots3NoteVisionMoeArm bf16 =
+      vllm::ResolveDots3NoteVisionMoeArm(ParseDoc(bf16_doc));
+  REQUIRE_FALSE(bf16.fp8);
+  CHECK_FALSE(vllm::Dots3NoteVisionFp8UnrunnableHere(bf16,
+                                                     vt::DeviceType::kMETAL));
+  CHECK_FALSE(vllm::Dots3NoteVisionFp8UnrunnableHere(bf16,
+                                                     vt::DeviceType::kCPU));
 }

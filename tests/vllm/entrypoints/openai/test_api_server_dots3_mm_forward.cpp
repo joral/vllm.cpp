@@ -2299,11 +2299,31 @@ TEST_CASE("dots3-note W7c-2: a 44.1 kHz WAV is SERVED, at the RESAMPLED span") {
 //     answer "did anything reach this arm". The counter is read across ONE
 //     served request below.
 //
-//     NO PUBLISHED CHECKPOINT IS SHAPED LIKE THIS FIXTURE and the case says so
-//     rather than implying otherwise. The released `moe_intermediate_size` is
-//     2112 and upstream's own `per_token_group_quant_fp8` asserts against it
-//     (`fp8_utils.py:563-566` @ `9035151d6`), so the released tower runs the
-//     bf16 class and the cases in 5b above are its coverage, unchanged.
+//     THE RELEASED TOWER RUNS THIS ARM, and this block said it does not until
+//     PR #2947. The retracted claim was that the released
+//     `moe_intermediate_size` of 2112 trips `per_token_group_quant_fp8`'s
+//     divisibility assertion (`fp8_utils.py:563-566` @ `9035151d6`) and that
+//     the released tower therefore stays on the bf16 class. It was FALSE:
+//     `_per_block_cast_to_fp8_padded` (`vision.py:225-239`) pads 2112 to 2176
+//     and never slices the pad back, so the width that assertion reads is 2176.
+//     `ResolveDots3NoteVisionMoeArm` keys only on `embed_dim`, the released
+//     value is 1536, and the released checkpoint takes the FP8 class.
+//
+//     WHAT THIS FIXTURE IS, then, is a SMALL tower and not a bf16 stand-in:
+//     `E = Im = 256` against the released 1536 / 2112, sized so a per-block
+//     scale grid can be told from a per-tensor one. The released RAGGED expert
+//     width has its own case below, at `Im = 100 -> 128`, and it is the served
+//     proof that a PADDED operand reaches the kernel. The one config that still
+//     runs the bf16 class is a ragged `embed_dim`, and that case is below too.
+//
+//     AND IT DOES NOT RUN EVERYWHERE. A CUDA build outside the `cutlass-fp8`
+//     arch cell `12.0a,12.1a` (`cmake/CudaArchFeatures.cmake:290`) registers no
+//     `vt::MatmulFp8BlockScaled`, so `VisionMoeFfn` refuses the released
+//     checkpoint BY NAME there -- a request the bf16 class used to answer, and
+//     the behaviour change the released checkpoint's new arm brings with it.
+//     This suite runs on CPU, which has both ops, so it cannot reach that
+//     refusal; `test_dots3_note_vision`'s G5 asserts the predicate and the
+//     message, and the spec's `## Owed` carries the unblocking condition.
 // ---------------------------------------------------------------------------
 
 namespace {

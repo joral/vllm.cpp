@@ -8090,8 +8090,9 @@ is the fixture that closes (2), and G0b is the case that reads it.
 
 2. **The class selection, as a resolved value.**
    `ResolveDots3NoteVisionMoeArm` answers `vision.py:369` and, when the answer
-   is the FP8 class, whether this build can execute what that class does. It
-   returns **two** states:
+   is the FP8 class, whether this build can execute what that class does. Its
+   **two** fields carry **three** outcomes -- the counts are different and the
+   list below is the three:
    - `enable_fp8_moe` false → the bf16 class, no notice. This is upstream's
      other branch and W6b's arm, unchanged byte for byte.
    - `enable_fp8_moe` true and `embed_dim` a multiple of 128 → the FP8 class.
@@ -8159,11 +8160,52 @@ is the fixture that closes (2), and G0b is the case that reads it.
    **`clamp_min` denominator**, which is the one arithmetic difference from the
    bf16 arm that no shared-helper comparison can fake. §4.20.3 measures it.
 
-5. **The refusals.** A device with no block-scaled GEMM is refused by name
-   through the shared `RefuseUnrunnableFp8BlockWeight`, which now also names the
-   arch cell that decides it. The LANGUAGE blockwise arm and the AUDIO FP8 arm
-   are refused permanently and by name, with their unblocking conditions
-   (§4.20.6).
+5. **The refusals, and one of them is a BEHAVIOUR CHANGE.** A device with no
+   block-scaled GEMM is refused by name through the shared
+   `RefuseUnrunnableFp8BlockWeight`, which now also names the arch cell that
+   decides it.
+
+   **That refusal is not a pre-existing property for this checkpoint, and it
+   costs a served answer.** `VisionMoeFfn`'s guard is
+   `Dots3NoteVisionFp8UnrunnableHere(arm, device)`, which is
+   `arm.fp8 && !dense_fp8_block::BlockFp8Runnable(device)`. Before W9d the
+   released `vision_config` resolved to the bf16 class, `arm.fp8` was false, and
+   the guard was unreachable for it on EVERY device: an image request was
+   answered everywhere. It is now `true`, so on any CUDA build outside the
+   `cutlass-fp8` arch cell `12.0a,12.1a`
+   (`cmake/CudaArchFeatures.cmake:290`) the same request THROWS.
+   **`thor:gpu0` (sm_110) and `orin:gpu0` (sm_87) are both outside that cell and
+   both are this row's own designated e2e hosts** (§6.3).
+
+   **This is the one axis on which upstream RUNS and this port REFUSES.**
+   Upstream has no arch cell here at all: `note_vision_fused_moe_fp8`
+   (`vision_moe.py:25` @ `9035151d6`) dispatches a Triton kernel that compiles
+   for whatever arch it is asked for. The refusal is still the right call rather
+   than a bf16 fallback -- a fallback would silently run a class upstream did
+   not build, which is exactly the trade AGENTS.md refuses, and the refusal
+   names the projection, the device, the arch cell and the issue that owes the
+   kernel. It is nonetheless a capability this tree had and no longer has on
+   those two hosts, so it is carried in `## Owed` with its unblocking condition
+   rather than left in a comment.
+
+   **The practical bound, stated neither inflated nor waved away.** Nothing this
+   project owns holds the released 576.89 GB checkpoint (§6.2), so no request
+   against THAT artifact is refused today by anything except its size. What is
+   reachable today is any smaller dots3-note-shaped checkpoint whose
+   `vision_config` leaves `enable_fp8_moe` at its default and whose `embed_dim`
+   is 128-aligned, served from a CUDA build outside the cell -- and this row's
+   own future e2e on Thor or Orin, which is the concrete case that will meet it
+   first.
+
+   **No gate here can measure it.** Every test in this tree runs on a CPU queue,
+   and CPU registers both ops, so the refusal cannot be reached from a served
+   forward on this host. `test_dots3_note_vision`'s G5 asserts the message and
+   asserts that the released config's resolved arm makes the guard's predicate
+   fire on a device that has no block-scaled GEMM; it does not, and cannot,
+   execute the throw from `handle_chat_completions`.
+
+   The LANGUAGE blockwise arm and the AUDIO FP8 arm are refused permanently and
+   by name, with their unblocking conditions (§4.20.6).
 
 #### 4.20.3 The three instruments, and what none of them is
 
@@ -9540,7 +9582,7 @@ Carried openly under option B (§6.4), not waived:
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 
 - **`vt::QuantFp8Group` has no `use_ue8m0` rounding, and it is owed against the
-  LANGUAGE MoE only** (recorded at W5, #699; **NARROWED 2026-09-04 by W9d**,
+  LANGUAGE MoE only** (recorded at W5; **NARROWED 2026-09-04 by W9d**,
   §4.20.5, [#2881](https://github.com/mudler/vllm.cpp/issues/2881)). It does NOT
   bite at W5: it is the ACTIVATION quantizer and W5 is entirely on the bf16
   path, so nothing in that brick calls it. **It does NOT bite the VISION arm
@@ -9556,6 +9598,37 @@ Carried openly under option B (§6.4), not waived:
   disagree with the kernel upstream runs, silently. That question is unresolved
   and no brick has looked at it; the language blockwise arm is itself a
   permanent refusal below, so nothing schedulable is blocked on it.
+- **The vision FP8 arm cannot run on a CUDA build outside the `cutlass-fp8`
+  arch cell `12.0a,12.1a`, and since W9d that REFUSES the released checkpoint
+  where this tree used to answer it.** `VisionMoeFfn`'s guard is
+  `Dots3NoteVisionFp8UnrunnableHere`, which is
+  `arm.fp8 && !dense_fp8_block::BlockFp8Runnable(device)`. `arm.fp8` was false
+  for the released `vision_config` until W9d and the guard was unreachable for
+  it on every device; it is true now, and `vt::MatmulFp8BlockScaled` is compiled
+  only for that one cell (`cmake/CudaArchFeatures.cmake:290`,
+  `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:544-550`). So an image request
+  against a dots3-note tower that takes the FP8 arm THROWS
+  `RefuseUnrunnableFp8BlockWeight` on `thor:gpu0` (sm_110) and `orin:gpu0`
+  (sm_87) — this row's own two designated e2e hosts (§6.3) — and used to be
+  served there on the bf16 class. **This is the one axis on which upstream RUNS
+  and this port REFUSES**: upstream has no arch cell at all here, because
+  `note_vision_fused_moe_fp8` (`vision_moe.py:25` @ `9035151d6`) dispatches a
+  Triton kernel that compiles for whatever arch it is given. The refusal is the
+  deliberate choice over a silent bf16 fallback and it is not what is owed; what
+  is owed is the kernel. **Unblocking condition: a block-scaled FP8 GEMM
+  registered for those arches** — [#1189](https://github.com/mudler/vllm.cpp/issues/1189)
+  milestone M5 widening `VT_CUTLASS_FP8_ARCHS` past `12.0a,12.1a`, or an
+  equivalent arm — after which `BlockFp8Runnable` answers true there and this
+  entry closes with no change to this row's code. **The practical bound today is
+  small and is not inflated here:** no host this project owns holds the released
+  576.89 GB checkpoint (§6.2), so what this actually reaches is a smaller
+  dots3-note-shaped checkpoint with a 128-aligned `embed_dim` and the default
+  `enable_fp8_moe`, plus this row's own future e2e on Thor or Orin, which is the
+  case that will meet it first. **No gate in this tree can measure it**: every
+  test runs on a CPU queue and CPU registers both ops, so
+  `test_dots3_note_vision`'s G5 asserts the predicate and the message and cannot
+  execute the throw from a served request. Owner: this row, W9d. Issue
+  [#2881](https://github.com/mudler/vllm.cpp/issues/2881).
 - **The blockwise-FP8 arm itself is owed to W9**, and it is now refused BY NAME
   rather than by a bare tensor miss (W5a). `dots-studio/dots3-note-prev-fp8` @
   `7c14222e22423d6df6848eb0d1c5c3a88a00311a` carries
@@ -9697,10 +9770,23 @@ warning. `per_block_cast_to_fp8` slices to the shape of ITS input, which the
 outer function already padded, so the slice is the identity. §4.20.1.1 keeps the
 error and §4.20.4.1's N1/N2 are the mutations that would now catch it.
 
-**This is a BEHAVIOUR CHANGE on the served path, not only a records repair.** An
-image request against the released `vision_config` used to travel the bf16 class
-and print a stderr warning; it now travels `MoESwiGLUFFNFP8` and enters the
-block-FP8 GEMM. The served gate asserts both sides of that move.
+**This is a BEHAVIOUR CHANGE on the served path, not only a records repair, and
+it has TWO halves.** The first: an image request against the released
+`vision_config` used to travel the bf16 class and print a stderr warning; it now
+travels `MoESwiGLUFFNFP8` and enters the block-FP8 GEMM. The served gate asserts
+both sides of that move. **The second half COSTS a served answer and is not a
+records repair at all:** because `arm.fp8` is now true for the released config,
+`VisionMoeFfn`'s arch guard `Dots3NoteVisionFp8UnrunnableHere` fires for it, so
+on any CUDA build outside the `cutlass-fp8` arch cell `12.0a,12.1a`
+(`cmake/CudaArchFeatures.cmake:290`) that request is REFUSED BY NAME where it
+used to be answered on the bf16 class. `thor:gpu0` (sm_110) and `orin:gpu0`
+(sm_87) are both outside the cell and both are this row's own e2e hosts.
+Upstream has no arch cell here — its Triton kernel compiles for the arch it is
+asked for — so this is the one axis on which upstream runs and this port
+refuses. The refusal is deliberate and stays: a bf16 fallback would silently run
+a class upstream did not build. §4.20.2 item 5 carries the reasoning, the
+practical bound and why no gate on this host can measure it, and the `## Owed`
+entry below carries the unblocking condition.
 
 Nothing here is compared against vLLM: §6.4 option B stands, nothing ran
 upstream end to end, and **removing a false claim about upstream is not a parity
