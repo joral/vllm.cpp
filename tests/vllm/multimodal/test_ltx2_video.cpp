@@ -13727,6 +13727,59 @@ TEST_CASE("ltx2 video: the BARE-spelled duration head loads through the second c
   CHECK(trace.duration_head_not_bf16 == 0);
 }
 
+// THE SECOND RENDER ROUTE, WHICH REPORTED A WIDTH NOTHING MEASURED. The two
+// cases above enter through `Generate`'s video path. `GenerateAudioOnly` is the
+// OTHER production route into the head -- a text-to-audio request carries no
+// video stream, which is why `DurationHead.forward` admits a null one at all
+// (t2a_one_stage.py:103-107) -- and it writes the same two trace fields from its
+// own call. Nothing reached it: `auto_duration` appeared in this suite only on
+// the video route, and the t2a fixture never named a `duration_head_path`.
+//
+// That is this row's own O6 finding one level up. O6 found the second LOADER
+// site nothing reached and covered it; this covers the second RENDER site.
+// Replacing that route's two writes with an absurd report -- `not_bf16` at
+// 999999 and `values` at 0 -- left the whole suite green before this case
+// existed, so an f32 head on a t2a render was invisible.
+TEST_CASE("ltx2 t2a: an auto-duration render reports the head's width through the second route") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = T2aParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/t2a_auto", "a b c");
+  // The count has to GO, not change: an explicit count beside `auto_duration`
+  // is refused two cases below, and refused on purpose.
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  vllm::multimodal::VideoResult res;
+  REQUIRE_NOTHROW(res = engine->Generate(gen));
+
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+
+  // THE ROUTE, asserted locally rather than assumed from the pipeline kind: a
+  // build that fell through to the video path would satisfy every width check
+  // below while measuring the call site the two cases above already cover.
+  CHECK(trace.t2a_rendered);
+  CHECK(res.frame_count == 0);
+
+  // THE HEAD RAN HERE, on an audio stream alone. Upstream passes
+  // `video_encoding=None` on this pipeline, so this is also the only case in
+  // this suite that predicts from one modality.
+  INFO("t2a head predicted " << trace.duration_seconds << "s -> " << trace.duration_frames
+                             << " frames");
+  REQUIRE(trace.duration_frames > 0);
+
+  // AND IT RAN AT UPSTREAM'S WIDTH, which is the claim this case was added to
+  // make measurable on this route. `duration_head_values` is the control: a
+  // counter that ran over nothing also reports zero wide values.
+  REQUIRE(trace.duration_head_values > 0);
+  CHECK(trace.duration_head_not_bf16 == 0);
+}
+
 // A RETAKE HAS NO PREDICTOR, AND THIS ROW REFUSED TO LET ONE SILENTLY WIN
 // TWO STATEMENTS EARLIER. `retake.py` reads its frame count off the source
 // clip's metadata (`:220`) and constructs no `DurationPredictor`, so an

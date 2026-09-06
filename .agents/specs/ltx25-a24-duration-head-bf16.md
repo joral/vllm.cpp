@@ -467,6 +467,22 @@ bare-spelling fixture (`paths.duration_head_bare`) had existed since #2900 with
 **no case using it**. The fallback was therefore unreached and M3 could not have
 been seen. A production case for it was added before the mutations were read.
 
+**AND THE SAME SHAPE ONE LEVEL UP, WHICH THIS ROW SHIPPED BEFORE REVIEW CAUGHT
+IT.** There are two RENDER routes into the head as well. `Ltx2VideoEngine::
+Generate` is one; `GenerateAudioOnly` is the other, because a text-to-audio
+request predicts from an audio stream alone (`t2a_one_stage.py:103-107` passes
+`video_encoding=None`). Both write `duration_head_not_bf16` and
+`duration_head_values`, and nothing reached the second: every `auto_duration`
+case in `test_ltx2_video` was on the video route, and the t2a fixture named no
+`duration_head_path`. Fresh review measured it — replacing that route's two
+writes with `not_bf16 = 999999; values = 0` left the full suite green — so an
+f32 head on a t2a render reported an absurd width that nothing read. The repair
+is a t2a case that loads a head, renders with `auto_duration`, and asserts the
+same two widths; the mutation now reds it, and each of the two assertions reds
+on its own half. Finding O6 was therefore about a CALL SITE class rather than
+about the loader, and this row missed the second instance of the class it had
+just named.
+
 ### O7. The digest, and why it exists
 
 The goldens carry an FNV-1a digest of the bf16 weight and token words per
