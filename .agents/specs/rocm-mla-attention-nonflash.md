@@ -434,6 +434,70 @@ is still not isolated from the kernels. A future job stages its own script into
 - A THIRD op turns out to block generation. Return the op's name and stop;
   §Reached set would then be wrong and has to be corrected before more code.
 
+## The allocator A/B, run at last (rc job `8c458a73`, `strix:gpu0`, 2026-09-05)
+
+job8 ran the control leg job7 never reached, and then repeated the managed leg
+with kernel serialisation. **Both exit statuses are trustworthy this time** --
+the run is a plain redirect with no pipe, so `$?` is the run's own status and
+not `awk`'s, which is the defect that made job7 report a core dump as `rc=0`.
+
+| Leg | Configuration | Result | Wall |
+|---|---|---|---|
+| job7 | `VT_ROCM_MANAGED_ALLOC=1` | **core dump** | 4118 s |
+| job8-1 | default `hipMalloc` (what we ship) | **rc=124, TIMED OUT** -- it did not crash | 9001 s |
+| job8-2 | managed + `AMD_SERIALIZE_KERNEL=3` + `HSA_ENABLE_SDMA=0` | **rc=0, EXITED CLEANLY** | 6942 s |
+
+**`vllm-cli` exits 1 on a refusal and 0 on a completed generation**, so job8-2's
+`rc=0` is consistent with GENERATION, and it is the first clean exit this board
+has produced on this model since `6b97a6800`. **No token is claimed, because no
+token was observed** -- see the capture failure below.
+
+### What the three legs suggest, and what they do not
+
+The original hypothesis was that `#2511`'s allocator change alone explains the
+missing token, and it predicted the managed leg would generate. job7 refuted
+that: managed alone dumps core. job8-2 shows managed **plus** serialised kernels
+**plus** SDMA disabled exits 0.
+
+So the next hypothesis is that the fault is an **asynchrony or DMA race rather
+than the allocator or the kernel arithmetic**: `AMD_SERIALIZE_KERNEL=3` makes
+every kernel launch synchronous and `HSA_ENABLE_SDMA=0` takes the SDMA copy
+engine out of the path, and between them the crash stops happening.
+
+**That is a direction, not an attribution.** job8-2 moved TWO variables at once
+against job7, so neither is isolated, and the two runs are on a contended shared
+box on different days. Splitting them is one leg each and is owed.
+
+The default-allocator leg is the one the shipping configuration uses, and it
+neither crashed nor finished in 2.5 h. Whether it was making progress or wedged
+is not established, for the same reason as below.
+
+### The capture failed, and it lost exactly the result the job was run to get
+
+Both legs' captured output is **empty**: `leg-default.stamped` and
+`leg-serial.stamped` are zero bytes on the share. So "it generated" is an
+inference from an exit code and not an observation, and "the default leg printed
+nothing" cannot be distinguished from "the default leg's output was lost".
+
+The defect is in the job, not in the tree. The runner copied only the STAMPED
+file to `/workspace` and left the raw file on the worker's `/tmp`, so when the
+lease ended the evidence went with the worker. `stdbuf -oL` was supposed to make
+the stamper's timestamps real; it appears not to have reached the binary's
+output at all, which is consistent with `stdbuf` setting `LD_PRELOAD` for C
+stdio and not reaching a C++ `streambuf` detached by `sync_with_stdio(false)`.
+
+**This is the third instrument failure in this row's history and the second that
+destroyed a result rather than merely misreporting one** -- after `$?` across a
+pipe, and the block-buffered timestamper. The pattern is the same each time: the
+instrument's failure mode is indistinguishable from a real observation.
+
+job10 repeats job8-2's exact configuration with four independent capture paths:
+a PTY via `script -q -e -c` (which forces line buffering on C++ iostreams, not
+only C stdio), an unconditional copy of the raw file to the share, a `cat` of
+the raw file into the job's own log, and a re-echo of its tail. It also prints
+`RAW BYTES CAPTURED`, so a zero reads as a CAPTURE failure rather than as
+silence from the program.
+
 ## Owed
 
 - **Whether GLM-5.3 generates on `gfx1151` at all after #2511.** No token has
@@ -448,11 +512,22 @@ is still not isolated from the kernels. A future job stages its own script into
   measured resetting 12/12 under a gate-sized native run, so separating a board
   fault from a kernel fault is the next traceable step. Owner `BACKEND-ROCM`,
   issue [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
-- **The default-allocator control leg.** Job `a77aa104`'s LEG B never ran: the
-  CIFS share dropped after leg A, `bash` could not read the rest of its own
-  script off `/workspace`, and the job idled to its 8 h kill. There is still no
-  A/B, so the allocator is not isolated from the kernels. The rerun stages its
-  script into `/tmp` first. Owner `BACKEND-ROCM`, issue
+- **The default-allocator control leg RAN** (job `8c458a73`, leg 1) and timed
+  out at 9000 s without crashing, `rc=124`. What is still owed is what it was
+  DOING: its captured output is zero bytes, so "wedged" and "loading slowly"
+  are not separated. Owner `BACKEND-ROCM`, issue
+  [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
+- **A token, actually observed.** Job `8c458a73` leg 2 exited `rc=0` in 6942 s
+  under managed allocation with `AMD_SERIALIZE_KERNEL=3` and
+  `HSA_ENABLE_SDMA=0`, which for `vllm-cli` means a completed generation rather
+  than a refusal -- but the capture was empty, so the token is inferred from an
+  exit code and NOT observed. job10 repeats that leg with four capture paths.
+  Until it returns, this row claims no token. Owner `BACKEND-ROCM`, issue
+  [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
+- **Serialisation and SDMA are confounded.** job8 leg 2 moved
+  `AMD_SERIALIZE_KERNEL=3` and `HSA_ENABLE_SDMA=0` together against job7's
+  crashing managed leg, so neither is isolated. One leg each is owed. Owner
+  `BACKEND-ROCM`, issue
   [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
 - **The ~41 min load under plain `hipMalloc`** is STILL an observation, not a
   measurement. Job `a77aa104` carried a per-line timestamper meant to settle it
