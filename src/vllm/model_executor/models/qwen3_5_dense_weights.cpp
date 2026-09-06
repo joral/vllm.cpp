@@ -4,6 +4,7 @@
 // by name (notes §3.6) and swaps the MoE block for the dense SwiGLU MLP.
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -183,14 +184,6 @@ void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
   Qwen3_5DenseModel::PrepareBf16Resident(weights, queue);
   vt::GetBackend(queue.device.type).Synchronize(queue);
   (void)ReleaseResidentQwen3_5DenseHostWeights(weights);
-}
-
-// VT_MODELOPT_W4A4 (default 0): consume a projection's on-disk activation
-// divisor, setting `alpha` and so flipping `IsTrueW4A4()` to the fp4-ACTIVATION
-// GEMM (docs/ENVIRONMENT.md). ONE reader, so the spellings cannot drift.
-bool ModelOptW4A4OptIn() {
-  const char* w4a4 = std::getenv("VT_MODELOPT_W4A4");
-  return w4a4 != nullptr && w4a4[0] == '1';
 }
 
 // One compressed-tensors NVFP4 W4A4 Linear -> RAW fp4-resident Nvfp4Weight kept
@@ -379,8 +372,6 @@ OwnedTensor LoadLmHeadAnyDtype(const TensorResolver& get, const TensorExists& ha
   return OwnedTensor{};
 }
 
-namespace {
-
 // compressed-tensors and ModelOpt both ship NVFP4, with different names AND a
 // different global-scale convention:
 //
@@ -394,11 +385,20 @@ namespace {
 // the first U8 tensor. LoadCtNvfp4Raw already reciprocates internally, so the
 // ModelOpt scale is passed through as 1/weight_scale_2 to land on the same math
 // (identical to the lm_head conversion in LoadLmHeadAnyDtype).
-bool IsNvfp4Projection(const TensorExists& has, const std::string& proj) {
+//
+// MODEL-DFLASH2-NVFP4 (#2758): EXPORTED, and no longer file-local. The DFlash2
+// draft loader asks the SAME question about the SAME spelling for its own
+// weights, and a second copy of this probe is the "two descriptions of one
+// rule" failure AGENTS.md `## Changing the rules or a checker` names. It is the
+// argument `DenseLmHeadTakesNvfp4` already makes one screen down, for the same
+// consumer. Declared in `qwen3_5_dense.h`; the bodies are unchanged.
+bool IsNvfp4Projection(const std::function<bool(const std::string&)>& has,
+                       const std::string& proj) {
   return has(proj + ".weight_packed") || has(proj + ".weight_scale_2");
 }
 
-Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& has,
+Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get,
+                               const std::function<bool(const std::string&)>& has,
                                const std::string& proj) {
   if (has(proj + ".weight_packed")) return LoadCtNvfp4Raw(get, proj);
 
@@ -480,6 +480,8 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
   }
   return r;
 }
+
+namespace {
 
 // MODEL-FP8-BLOCK-WEIGHT (#1189 M3), spec
 // `.agents/specs/model-fp8-block-weight.md`. Does this projection take the
@@ -787,6 +789,16 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
 }
 
 }  // namespace
+
+// VT_MODELOPT_W4A4 (default 0): consume a projection's on-disk activation
+// divisor, setting `alpha` and so flipping `IsTrueW4A4()` to the fp4-ACTIVATION
+// GEMM (docs/ENVIRONMENT.md). ONE reader, so the spellings cannot drift --
+// which is why MODEL-DFLASH2-NVFP4 (#2758) exported it rather than reading the
+// same variable a second time from the DFlash draft loader.
+bool ModelOptW4A4OptIn() {
+  const char* w4a4 = std::getenv("VT_MODELOPT_W4A4");
+  return w4a4 != nullptr && w4a4[0] == '1';
+}
 
 bool DenseLmHeadFp4Enabled() {
   const char* v = std::getenv("VT_LMHEAD_FP4");
@@ -1116,6 +1128,39 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
     const std::string modelopt_refusal =
         layers::modelopt::RefusalForQuantizationConfig(*quant, all_names);
     VT_CHECK(modelopt_refusal.empty(), "qwen3_5 dense: " + modelopt_refusal);
+
+    // QUANT-QWEN38-27B-NVFP4-ARM W7 (#2760). The FOURTH whole-checkpoint read,
+    // and the only one that is not a refusal.
+    //
+    // A THIRD ModelOpt artifact of this model declares an algorithm this build
+    // does not execute, and the refusal above cannot see it.
+    // `RadixArk/Qwen3.8-27B-NVFP4` @ `554ebba9` -- the target
+    // `pangoleen/qwen3.8-27b-dgx-spark-dflash2` serves, and the artifact
+    // `r0b0tlab/...-MTP-sm121` was derived from -- declares
+    // `{"quant_algo": "NVFP4", "group_size": 16}` on all 193 of its NVFP4
+    // modules, declares `config_groups.group_1.input_activations` 4-bit static,
+    // and ships `<proj>.input_scale` on every one. `Refusal` accepts that,
+    // correctly: its question is whether the shipped SPELLING matches the
+    // declaration, and it does. The arm the loader then takes is the one
+    // `VT_MODELOPT_W4A4` decides, and it defaults to the weight-only W4A16
+    // dispatcher.
+    //
+    // SO WE RUN W4A16 ON A W4A4 CHECKPOINT, AND UNTIL THIS LINE WE PRINTED
+    // NOTHING. The weight bytes per step are identical either way, so no
+    // throughput axis moves and no roofline changes; the activation path and the
+    // numerics differ, and a token gate cannot see that because W4A16 of a W4A4
+    // checkpoint is numerically plausible. This does not refuse and does not
+    // move any arm -- the checkpoint loads exactly as it did -- it makes the
+    // divergence VISIBLE DEBT instead of a silent one. Whether the W4A4 path
+    // should run at all is a lease-side question with a same-binary A/B and a
+    // token gate attached; it is `## Owed` in
+    // `.agents/specs/qwen38-27b-quant-arms.md`, tracked by #2760.
+    const std::string activation_notice =
+        layers::modelopt::ActivationArmNoticeForQuantizationConfig(
+            *quant, all_names, ModelOptW4A4OptIn());
+    if (!activation_notice.empty()) {
+      std::fprintf(stderr, "qwen3_5 dense: %s\n", activation_notice.c_str());
+    }
   }
 
   Qwen3_5DenseWeights w;
