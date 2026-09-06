@@ -54,6 +54,7 @@
 #include "vllm.h"
 #include "vt/backend.h"
 #include "vt/device.h"
+#include "vt/dtype.h"
 #include "vllm/multimodal/video_engine.h"
 #include "vllm/multimodal/render_phase_log.h"
 
@@ -13632,6 +13633,42 @@ TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
   // Every count this path emits sits on the causal temporal grid.
   CHECK((trace.duration_frames - 1) % 8 == 0);
 
+  // ── THE HEAD'S TWO WIDTHS (A24 wave 6, row LTX25-A24-DURATION-HEAD-BF16,
+  //    issue #2955) ─────────────────────────────────────────────────────────
+  //
+  // Upstream resolves ONE pipeline dtype and it is bfloat16 (distilled.py:109),
+  // handed to the head at :163-165. Everything above this point -- the frame
+  // count, the grid, the trace, the render -- was green while this tree ran the
+  // head at f32, because a frame count is an integer either arm produces and
+  // `duration_seconds` is one scalar. These are the two lines that can see it,
+  // and they claim DIFFERENT things on purpose.
+  //
+  // STORAGE: the resident bag's bytes over its parameter count. `Load` asks for
+  // `kBF16` at both call sites; this is what says the file agreed. Reverting
+  // EITHER call site alone reds it.
+  const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+  INFO("duration head weights: " << trace.duration_head_weight_bytes << " bytes over "
+                                 << trace.duration_head_weight_elems << " parameters");
+  REQUIRE(trace.duration_head_weight_elems > 0);
+  CHECK(trace.duration_head_weight_bytes == trace.duration_head_weight_elems * bf16_bytes);
+
+  // ARITHMETIC: how many values the head PRODUCED that could not have come out
+  // of a bf16 store. Zero on this arm; `duration_head_values` is the control
+  // that the counter looked at anything, because a counter over nothing also
+  // reports zero and would make the line above it read as a pass.
+  INFO("duration head produced " << trace.duration_head_values << " values, "
+                                 << trace.duration_head_not_bf16 << " wider than bf16");
+  REQUIRE(trace.duration_head_values > 0);
+  CHECK(trace.duration_head_not_bf16 == 0);
+  // AND THE PREDICTED SECONDS IS ITSELF A bf16 WORD -- R4, the last rounding and
+  // the only one a user sees. Swept across the head's output bias at 25 fps on
+  // the shipped widths, 10 of 1000 samples FLIP THE FRAME COUNT by eight frames
+  // on the 8k+1 grid, so this is the store point that decides how much video
+  // gets rendered. A discrete selection has bimodal error, which is why the
+  // frame count above is asserted as an equality and never as a band.
+  const float seconds = static_cast<float>(trace.duration_seconds);
+  CHECK(seconds == vt::BF16ToF32(vt::F32ToBF16(seconds)));
+
   // AND IT IS NOT THE RECIPE'S. The same request against an engine with no head
   // renders the recipe default; a predicted count that happened to equal it would
   // make everything above pass for the wrong reason.
@@ -13643,6 +13680,104 @@ TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
   recipe_gen.num_frames = 0;
   const vllm::multimodal::VideoResult recipe_res = plain->Generate(recipe_gen);
   CHECK(res.frame_count != recipe_res.frame_count);
+}
+
+// THE BARE SPELLING, WHICH NOTHING REACHED. `Ltx2VideoEngine::Load` has TWO
+// `Ltx2LoadDurationHeadWeights` call sites: the prefixed one, and a fallback for
+// a head stored without upstream's `duration_head.` prefix. The fixture for the
+// bare spelling has existed since row LTX25-DURATION-HEAD-WIRE (#2900) and NO
+// case used it, so the second call site was unreached and reverting its dtype
+// alone could not be seen. That is wave 5's own M9 finding -- two loader sites
+// reverted together, neither visible alone -- reproduced here rather than
+// inherited, and the row's spec named it before this case existed.
+//
+// So this case is the pair to the one above: the same two widths, through the
+// OTHER call site, on a head whose keys carry no prefix at all.
+TEST_CASE("ltx2 video: the BARE-spelled duration head loads through the second call site") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head_bare;
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_bare");
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  vllm::multimodal::VideoResult res;
+  REQUIRE_NOTHROW(res = engine->Generate(gen));
+
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+  INFO("bare head predicted " << trace.duration_seconds << "s -> " << trace.duration_frames
+                              << " frames");
+  // THE HEAD RAN, which is what says the fallback bound a real bag rather than
+  // returning upstream's `None` and leaving the recipe to decide.
+  REQUIRE(trace.duration_frames > 0);
+  CHECK(res.frame_count == trace.duration_frames);
+
+  // AND IT RAN AT UPSTREAM'S WIDTH. Reverting the bare call site alone to `kF32`
+  // reds these two and nothing else in this suite.
+  const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+  INFO("bare duration head weights: " << trace.duration_head_weight_bytes << " bytes over "
+                                      << trace.duration_head_weight_elems << " parameters");
+  REQUIRE(trace.duration_head_weight_elems > 0);
+  CHECK(trace.duration_head_weight_bytes == trace.duration_head_weight_elems * bf16_bytes);
+  REQUIRE(trace.duration_head_values > 0);
+  CHECK(trace.duration_head_not_bf16 == 0);
+}
+
+// THE SECOND RENDER ROUTE, WHICH REPORTED A WIDTH NOTHING MEASURED. The two
+// cases above enter through `Generate`'s video path. `GenerateAudioOnly` is the
+// OTHER production route into the head -- a text-to-audio request carries no
+// video stream, which is why `DurationHead.forward` admits a null one at all
+// (t2a_one_stage.py:103-107) -- and it writes the same two trace fields from its
+// own call. Nothing reached it: `auto_duration` appeared in this suite only on
+// the video route, and the t2a fixture never named a `duration_head_path`.
+//
+// That is this row's own O6 finding one level up. O6 found the second LOADER
+// site nothing reached and covered it; this covers the second RENDER site.
+// Replacing that route's two writes with an absurd report -- `not_bf16` at
+// 999999 and `values` at 0 -- left the whole suite green before this case
+// existed, so an f32 head on a t2a render was invisible.
+TEST_CASE("ltx2 t2a: an auto-duration render reports the head's width through the second route") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = T2aParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/t2a_auto", "a b c");
+  // The count has to GO, not change: an explicit count beside `auto_duration`
+  // is refused two cases below, and refused on purpose.
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  vllm::multimodal::VideoResult res;
+  REQUIRE_NOTHROW(res = engine->Generate(gen));
+
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+
+  // THE ROUTE, asserted locally rather than assumed from the pipeline kind: a
+  // build that fell through to the video path would satisfy every width check
+  // below while measuring the call site the two cases above already cover.
+  CHECK(trace.t2a_rendered);
+  CHECK(res.frame_count == 0);
+
+  // THE HEAD RAN HERE, on an audio stream alone. Upstream passes
+  // `video_encoding=None` on this pipeline, so this is also the only case in
+  // this suite that predicts from one modality.
+  INFO("t2a head predicted " << trace.duration_seconds << "s -> " << trace.duration_frames
+                             << " frames");
+  REQUIRE(trace.duration_frames > 0);
+
+  // AND IT RAN AT UPSTREAM'S WIDTH, which is the claim this case was added to
+  // make measurable on this route. `duration_head_values` is the control: a
+  // counter that ran over nothing also reports zero wide values.
+  REQUIRE(trace.duration_head_values > 0);
+  CHECK(trace.duration_head_not_bf16 == 0);
 }
 
 // A RETAKE HAS NO PREDICTOR, AND THIS ROW REFUSED TO LET ONE SILENTLY WIN

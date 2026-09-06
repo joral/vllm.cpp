@@ -235,9 +235,16 @@ against a loaded head therefore uses upstream's own defaults, 1 s and 20 s.
 `/v1/videos` does not carry `auto_duration` either: that endpoint forwards no
 per-generation extra to any engine yet (#928).
 
-The head runs in f32 here where upstream builds it in bfloat16. That arm is
-owed under `## Owed` in `.agents/specs/ltx25-duration-head-wire.md`, as the
-eighth component of gap A24.
+The head computes and stores in **bfloat16**, which is the single dtype
+upstream resolves for the whole pipeline (`distilled.py:109`, handed to
+`DurationPredictor.from_checkpoint` at `:163-165`). It ran in f32 until A24 wave
+6 ([#2955](https://github.com/mudler/vllm.cpp/issues/2955)), the eighth and last
+component of that gap, and the resident head is now half the bytes it was. What
+the head still owes is not a width: its FP8 and NVFP4 arms belong to A22 and
+refuse by name, a CUDA arm is a residency question rather than a dtype one, and
+no real-weight render has been run because no checkpoint carrying a
+`duration_head.` block is available here -- which was equally true of the f32
+arm.
 
 ## Dynamic frame-rate temporal rounds
 
