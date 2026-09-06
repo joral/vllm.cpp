@@ -116,13 +116,15 @@ llama.cpp `b10451`. Rows below were read at the prior pin `555967922`.
 """
 
 
-# The prose surfaces as `main` sees them: three named paths, mirroring
+# The prose surfaces as `main` sees them: the five named paths, mirroring
 # `PIN_SURFACES` in the checker, so the through-`main` cases exercise the same
 # per-file requirement the real tree carries.
 PIN_SURFACES_FIXTURE = {
     "NOW.md": PIN_SURFACE,
     "docs/FEATURES.md": PIN_SURFACE,
     "docs/benchmarks/how-we-measure.md": PIN_SURFACE,
+    "docs/benchmarks/speculative-decoding.md": PIN_SURFACE,
+    "docs/benchmarks/vllm-online-serving.md": PIN_SURFACE,
 }
 
 
@@ -528,11 +530,93 @@ class PinSurfaceTests(unittest.TestCase):
         self.assertEqual(pin_errors(rewrapped), [])
 
     def test_an_unmarked_file_that_is_not_required_is_ignored(self) -> None:
-        # The 286 files that name a prior pin on purpose, in miniature.
+        # The many files that name a prior pin on purpose, in miniature.
         self.assertEqual(
             pin_errors("The prior pin was `555967922`, and that stays true.\n", required=False),
             [],
         )
+
+    def test_a_marker_at_the_start_of_a_line_is_reported(self) -> None:
+        # THE RENDERING CASE, and the one this suite could not see. A column-1
+        # HTML comment is a CommonMark type-2 HTML block, it interrupts the
+        # paragraph, and the rest of the line is emitted raw -- so the span's
+        # own value renders as literal backticks. `docs/FEATURES.md:46` shipped
+        # this shape and three documents asserted it was invisible.
+        broken = PIN_SURFACE.replace(
+            "(<!--pin:commit-->`1111111111`<!--/pin-->, the parity pin",
+            "\n<!--pin:commit-->`1111111111`<!--/pin-->, the parity pin",
+        )
+        self.assertNotEqual(broken, PIN_SURFACE)
+        errs = pin_errors(broken)
+        self.assertEqual(len(errs), 1)
+        self.assertIn("starts its line", errs[0])
+        # It names the LINE, because a reader has to find it.
+        self.assertIn("NOW.md:5:", errs[0])
+
+    def test_a_closing_marker_at_the_start_of_a_line_is_reported(self) -> None:
+        # The closer breaks the same way, so the rule cannot look only at
+        # openers.
+        errs = pin_errors(
+            PIN_SURFACE.replace("`1111111111`<!--/pin-->", "`1111111111`\n<!--/pin-->")
+        )
+        self.assertEqual(len(errs), 1)
+        self.assertIn("starts its line", errs[0])
+
+    def test_an_indented_marker_at_a_block_boundary_is_reported(self) -> None:
+        # Four spaces after a blank line is an indented code block, and the
+        # marker becomes VISIBLE text. Measured on `gh api /markdown`.
+        errs = pin_errors(
+            PIN_SURFACE.replace(
+                "(<!--pin:commit-->", "\n\n    <!--pin:commit-->"
+            )
+        )
+        self.assertTrue(any("starts its line" in e for e in errs), errs)
+
+    def test_a_marker_that_merely_follows_text_is_accepted(self) -> None:
+        # The benign direction of the same rule: one character of prose before
+        # the marker is enough to keep it inline, and the rule must not fire.
+        # Without this case the rule could be "never wrap near a marker".
+        self.assertEqual(
+            pin_errors(
+                PIN_SURFACE.replace(
+                    "(<!--pin:commit-->", "\n(<!--pin:commit-->"
+                )
+            ),
+            [],
+        )
+
+    def test_the_live_surfaces_carry_no_line_initial_marker(self) -> None:
+        # The rule applied to the tree, not to a fixture. This is the case that
+        # would have caught `docs/FEATURES.md:46` before it landed.
+        for path in check_oracle_pins.PIN_SURFACES:
+            with self.subTest(surface=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertEqual(
+                    [m.group(1) for m in check_oracle_pins.PIN_AT_LINE_START.finditer(text)],
+                    [],
+                )
+
+    def test_a_mis_cased_marker_kind_is_reported(self) -> None:
+        # `PIN_OPEN` was `[a-z]*` and could not express this, so beside a valid
+        # span the opener and span counts agreed and NOTHING reported it.
+        errs = pin_errors(PIN_SURFACE.replace("pin:label", "pin:LABEL"))
+        self.assertEqual(len(errs), 1)
+        self.assertIn("opener(s) but", errs[0])
+
+    def test_a_marker_kind_outside_the_lowercase_class_is_reported(self) -> None:
+        for kind in ("Commit", "commit2", "pin-commit"):
+            with self.subTest(kind=kind):
+                errs = pin_errors(PIN_SURFACE.replace("pin:commit", f"pin:{kind}"))
+                self.assertTrue(any("opener(s) but" in e for e in errs), errs)
+
+    def test_an_uppercase_revision_is_reported_for_its_case(self) -> None:
+        # `E126687A` IS hexadecimal. Telling its author otherwise is false about
+        # the value they wrote; the defect is the case, because the authority is
+        # lowercase and the comparison is `startswith`.
+        errs = pin_errors(PIN_SURFACE.replace("1111111111", "AAAAAAAAAA"))
+        self.assertEqual(len(errs), 1)
+        self.assertIn("hexadecimal but not lowercase", errs[0])
+        self.assertNotIn("is not a hexadecimal revision", errs[0])
 
     def test_the_expectation_comes_from_the_authority_only(self) -> None:
         # A TAUTOLOGY GUARD. The rule opens no file: hand it an authority that
@@ -664,6 +748,25 @@ class ParityThroughMainTests(unittest.TestCase):
         unmarked = dict(PIN_SURFACES_FIXTURE)
         unmarked["NOW.md"] = "Pin: vLLM `1111111111` (9.9.9rc1.dev1).\n"
         self.assertEqual(self.run_main(PARITY_RECORD, PARITY_SYNC, surfaces=unmarked), 1)
+
+    def test_main_fails_when_a_marker_starts_a_line(self) -> None:
+        # The rendering rule, REACHED from the entry point. Deleting
+        # `check_pin_surfaces(...)` from `main` turns this green too, and it is
+        # the shape `docs/FEATURES.md:46` shipped: a marker at column 1 inside
+        # a paragraph, which GitHub renders as a broken paragraph and literal
+        # backticks. Nothing in the suite could see that class before.
+        broken = dict(PIN_SURFACES_FIXTURE)
+        broken["docs/FEATURES.md"] = PIN_SURFACE.replace(
+            "(<!--pin:commit-->", "\n<!--pin:commit-->"
+        )
+        self.assertNotEqual(broken["docs/FEATURES.md"], PIN_SURFACE)
+        self.assertEqual(self.run_main(PARITY_RECORD, PARITY_SYNC, surfaces=broken), 1)
+
+    def test_main_fails_when_a_marker_kind_is_mis_cased(self) -> None:
+        # The `[a-z]*` opener class made this rc 0 beside a valid commit span.
+        mis_cased = dict(PIN_SURFACES_FIXTURE)
+        mis_cased["docs/FEATURES.md"] = PIN_SURFACE.replace("pin:label", "pin:LABEL")
+        self.assertEqual(self.run_main(PARITY_RECORD, PARITY_SYNC, surfaces=mis_cased), 1)
 
     def test_main_fails_when_a_declared_surface_does_not_exist(self) -> None:
         # A declared surface that was renamed or deleted must be REPORTED, not

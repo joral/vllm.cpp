@@ -20,7 +20,10 @@ pin. This checker is what stops that rule decaying into prose:
     block in `.agents/upstream-sync.md`, which is the authority (#2829).
   * every `pin:commit` / `pin:label` span in the PROSE surfaces named by
     `PIN_SURFACES` agrees with that same authority, and each of those paths
-    carries at least one `commit` span (#2883).
+    carries at least one `commit` span (#2883);
+  * no marker in those surfaces STARTS ITS LINE, because at column 1 an HTML
+    comment is a CommonMark block that interrupts the paragraph and stops the
+    span's value rendering as Markdown. See `PIN_AT_LINE_START`.
 
 THE PARITY RECONCILIATION, because it reverses what this docstring used to say.
 
@@ -59,11 +62,17 @@ WHAT IT DOES NOT DO, so nobody cites it for more than it delivers:
 
 THE PROSE SURFACES, and why they are delimited rather than parsed (#2883).
 
-`.agents/NOW.md`, `docs/FEATURES.md` and `docs/benchmarks/how-we-measure.md`
-restate the abbreviated revision and the release label in sentences. #2880
-declined to gate them and its argument was narrower than it read: a grep for the
-two prior pins returns 286 files that name them ON PURPOSE, which rules out a
-REGEX OVER PROSE and does not rule out a rule over NAMED PATHS.
+`.agents/NOW.md`, `docs/FEATURES.md`, `docs/benchmarks/how-we-measure.md`,
+`docs/benchmarks/speculative-decoding.md` and
+`docs/benchmarks/vllm-online-serving.md` restate the abbreviated revision and
+the release label in sentences. #2880
+declined to gate them and its argument was narrower than it read: a grep for a
+prior pin returns files that name it ON PURPOSE, which rules out a REGEX OVER
+PROSE and does not rule out a rule over NAMED PATHS. #2880 measured 286 such
+files; the figure was restated here and in two specs as if measured again, and
+it is not the number this tree carries -- `git grep -l 555967922` returns 846
+at `aa7056b46`. Either count rules out the regex, which is why the conclusion
+stands and the figure did not.
 
 A token rule over unmarked prose was built far enough to reject it, and it fails
 on real content in both directions. `docs/FEATURES.md` names the llama.cpp pin
@@ -75,10 +84,12 @@ version appears in the sentence passes a surface reading `0.28.1rc1.dev1320`.
 So the surfaces are DELIMITED instead. An inline `<!--pin:commit-->` /
 `<!--pin:label-->` span makes the span content the value: no token regex, no
 sentence shape, no positional assumption, and nothing outside a span is read, so
-the rule cannot fire when somebody rewraps a paragraph. HTML comments are
-stripped when Markdown renders, so the public prose is unchanged in a browser.
-The markers' ABSENCE from a named path is an error, which is what stops the rule
-being silenced by deleting them.
+the rule cannot fire when somebody rewraps a paragraph. A marker renders as
+nothing ONLY WHERE IT IS INLINE, so `PIN_AT_LINE_START` is a rule and not a
+convention: the first version of this change asserted the invisibility in three
+documents, measured it in none, and broke a paragraph of `docs/FEATURES.md` on
+GitHub's own renderer. The markers' ABSENCE from a named path is an error, which
+is what stops the rule being silenced by deleting them.
 
 Run with `--self-test` to sweep the FIXTURES corpus below in both directions:
 every `bad=True` fixture must be reported and every `bad=False` one must not.
@@ -104,25 +115,31 @@ UPSTREAM_SYNC = ROOT / ".agents/upstream-sync.md"
 
 # The PROSE surfaces (#2883). The pin is restated in public projections, and
 # until now nothing reconciled them against the authority above. They are read
-# ONLY inside a `<!--pin:...-->` span, so the 286 files that name a PRIOR pin on
-# purpose are never looked at, and neither is any unmarked sentence in these
-# files -- `docs/FEATURES.md` restates the current pin a second time at line 46
-# and that sentence is deliberately free prose.
+# ONLY inside a `<!--pin:...-->` span, so the hundreds of files that name a
+# PRIOR pin on purpose are never looked at, and neither is any unmarked sentence
+# in these files. `docs/FEATURES.md` restates the CURRENT pin twice -- line 14
+# and again in the *Results.* paragraph -- and BOTH are marked. An unmarked
+# restatement of the current pin inside a named surface is exactly the pin
+# nothing reconciles that #2883 filed, so leaving one deliberately free would
+# have kept half the defect.
 # Each of these must exist and carry at least ONE `commit` span, and every span
 # in them is validated. The rule reads THESE PATHS AND NOTHING ELSE.
 #
 # A GLOB OVER `.agents/` AND `docs/` WAS BUILT FIRST AND REJECTED, on evidence.
-# It reddened on this rule's OWN SPEC, which quotes the marker in a fenced block
-# to explain it -- 4 openers, 2 spans, and a "not a hexadecimal revision" whose
-# value was half the document. Documentation of a marker is not a surface
-# carrying one, and no cheap rule tells them apart. Scanning named paths is also
-# exactly what #2883 proposed. The cost is one line here when a fourth surface
-# is marked, and `docs/benchmarks/speculative-decoding.md` and
-# `docs/benchmarks/vllm-online-serving.md` are the two that owe it.
+# It reddened on this rule's OWN SPEC, which quotes the markers in a fenced
+# block to explain them: more openers than complete spans, and a "not a
+# hexadecimal revision" whose value was half the document. No count is written
+# down here on purpose -- it is a measurement of ANOTHER file, it moves whenever
+# somebody explains the marker one more time, and this comment carried it wrong
+# for exactly that reason. Documentation of a marker is not a surface carrying
+# one, and no cheap rule tells them apart. Scanning named paths is also exactly
+# what #2883 proposed. The cost is one line here per surface.
 PIN_SURFACES = (
     ROOT / ".agents/NOW.md",
     ROOT / "docs/FEATURES.md",
     ROOT / "docs/benchmarks/how-we-measure.md",
+    ROOT / "docs/benchmarks/speculative-decoding.md",
+    ROOT / "docs/benchmarks/vllm-online-serving.md",
 )
 
 REQUIRED_KEYS = (
@@ -160,12 +177,62 @@ TABLE_ID = re.compile(r"^\|[^|]*\|\s*`([a-z0-9-]+)`\s*\|")
 DECLARATION = re.compile(r"\*\*Secondary oracle:\*\*\s*`([a-z0-9-]+)`")
 
 # The pin-surface delimiters. `PIN_SPAN` matches a COMPLETE span; `PIN_OPEN`
-# matches any opener at all, including a kind nobody defined. Counting the two
-# against each other is what turns an unclosed or misspelled marker into an
+# matches an opener whose KIND is any identifier, defined or not. Counting the
+# two against each other is what turns an unclosed or misspelled marker into an
 # error instead of a span that quietly stops existing.
+#
+# THE OPENER CLASS IS WIDER THAN THE KIND SET ON PURPOSE, and it is not "any
+# opener at all", which is what this comment used to claim. It was `[a-z]*`,
+# which could not express kinds it was supposed to catch: `pin:LABEL`,
+# `pin:Commit`, `pin:commit2` and `pin:pin-commit` matched NEITHER regex, so
+# beside one valid span the counts agreed and the misspelled marker was
+# reported by nothing -- `pin:LABEL` and `pin:Commit` produced zero errors, and
+# the shape reproduces through `main` at rc 0. A detector that cannot represent
+# the defect is not a fail-closed rule. `[A-Za-z0-9_-]*` covers every kind
+# anybody would plausibly typo; a kind outside it (a space, a non-ASCII letter)
+# is still unmatched by both regexes and still passes, which is a smaller hole
+# and is named here rather than claimed away.
 PIN_SPAN = re.compile(r"<!--\s*pin:(commit|label)\s*-->(.*?)<!--\s*/pin\s*-->", re.S)
-PIN_OPEN = re.compile(r"<!--\s*pin:([a-z]*)\s*-->")
+PIN_OPEN = re.compile(r"<!--\s*pin:([A-Za-z0-9_-]*)\s*-->")
+# A marker that STARTS A LINE, which silently breaks the rendered document.
+#
+# Under CommonMark an HTML comment indented fewer than four spaces begins a
+# type-2 HTML block, and type 2 is one of the seven start conditions that may
+# INTERRUPT A PARAGRAPH. The rest of that line is then emitted as raw HTML: the
+# span's own value stops being Markdown, one paragraph renders as three blocks,
+# and the reader sees literal backticks where a `<code>` was.
+#
+# MEASURED ON GITHUB'S OWN RENDERER (`gh api /markdown`), one probe per shape,
+# because the previous version of this change reasoned about this and was wrong:
+#
+#   indent 0-3, mid-paragraph or after a blank line -> HTML block, paragraph
+#     splits, the value renders as literal backticks;
+#   indent >= 4 after a blank line -> INDENTED CODE BLOCK, and the marker
+#     itself becomes visible text, which is worse;
+#   indent >= 4 (or a tab) inside a paragraph -> a lazy continuation line, and
+#     the marker is inline and invisible.
+#
+# So the rule -- "a pin marker is never first on its line" -- refuses exactly
+# one shape that would have rendered correctly: a marker behind four spaces of
+# a paragraph CONTINUATION line. Nobody writes that, and it is one blank line
+# away from the worst of the three outcomes. The conservative boundary is
+# deliberate and is the cost of a rule with no renderer in it.
+#
+# The defect this catches is not hypothetical. `docs/FEATURES.md:46` shipped a
+# column-1 opener inside the *Results.* paragraph: `gh api /markdown` on the
+# whole file returned 21 `<p>` for a document with 20 paragraphs and printed
+# ``e126687a9a`` with its backticks, and the repaired file returns 20 `<p>` and
+# a second `<code>e126687a9a</code>`. No renderer is imported here -- this
+# checker is deliberately dependency-free and network-free, and a gate that
+# fails when GitHub is unreachable fails on the wrong thing -- so the rule is
+# the POSITION that produces the break, which is exactly checkable from bytes.
+PIN_AT_LINE_START = re.compile(r"^[ \t]*(<!--\s*(?:pin:[A-Za-z0-9_-]*|/pin)\s*-->)", re.M)
 HEX = re.compile(r"^[0-9a-f]+$")
+# Hexadecimal in ANY case, so a value that is hex but not lowercase is reported
+# for what it is. `vllm_commit` is stored lowercase and the comparison below is
+# `str.startswith`, so `E126687A` is a genuine mismatch -- but telling its
+# author it "is not a hexadecimal revision" is false about the value they wrote.
+HEX_ANY = re.compile(r"^[0-9a-fA-F]+$")
 # The FLOOR on an abbreviated revision, and the whole of what it is for.
 #
 # #2883 asks a rule to settle the abbreviation length, and observes that
@@ -385,6 +452,11 @@ def check_pin_surfaces(
     malformed vLLM revision; a containment rule over the same sentence accepts a
     surface reading `0.28.1rc1.dev1320`. Both failures are unreachable here
     because the span content IS the value.
+
+    The one thing outside a span that IS read is the marker's own POSITION. A
+    marker that starts its line changes the RENDERED document, and a rule whose
+    whole justification is "this is invisible to a reader" has to be able to
+    tell when it is not. See `PIN_AT_LINE_START`.
     """
     if parity is None:
         return  # parse_parity_pin already reported why, and it reported it once.
@@ -405,6 +477,15 @@ def check_pin_surfaces(
                 f"{len(spans)} complete span(s) -- an unclosed or misspelled "
                 "marker is an error, not a span that stops existing"
             )
+        for match in PIN_AT_LINE_START.finditer(text):
+            line_no = text.count("\n", 0, match.start()) + 1
+            errors.append(
+                f"{label}:{line_no}: pin marker {match.group(1)} starts its "
+                "line, so CommonMark reads it as a type-2 HTML block that "
+                "interrupts the paragraph and emits the rest of the line raw "
+                "-- the span's value then renders as literal Markdown. Reflow "
+                "so text precedes the marker on its line"
+            )
         seen_commit_spans[path] = sum(1 for kind, _ in spans if kind == "commit")
         for kind, raw in spans:
             value = raw.strip().strip("`").strip()
@@ -415,9 +496,18 @@ def check_pin_surfaces(
                 if commit is None:
                     continue  # parse_parity_pin already reported the omission.
                 if not HEX.match(value):
-                    errors.append(
-                        f"{label}: pin span {value!r} is not a hexadecimal revision"
-                    )
+                    if HEX_ANY.match(value):
+                        errors.append(
+                            f"{label}: pin span {value!r} is hexadecimal but "
+                            "not lowercase -- "
+                            f"{UPSTREAM_SYNC.name} stores vllm_commit "
+                            "lowercase and the prefix comparison is "
+                            "case-sensitive"
+                        )
+                    else:
+                        errors.append(
+                            f"{label}: pin span {value!r} is not a hexadecimal revision"
+                        )
                 elif len(value) < MIN_ABBREV:
                     errors.append(
                         f"{label}: pin span {value!r} is {len(value)} characters, "
@@ -693,6 +783,39 @@ PIN_SURFACE_FIXTURES: tuple[tuple[str, str, bool], ...] = (
     ("an empty span", _PIN_GOOD.replace("`1111111111`", ""), True),
     ("an unclosed marker", _PIN_GOOD.replace("`<!--/pin-->) since", "`) since"), True),
     ("a marker kind nobody defined", _PIN_GOOD.replace("pin:commit", "pin:sha"), True),
+    # The same defect OUTSIDE `[a-z]`, which the opener class could not express
+    # until this repair and which therefore passed beside a valid span.
+    ("a mis-cased marker kind", _PIN_GOOD.replace("pin:label", "pin:LABEL"), True),
+    ("a marker kind with a digit", _PIN_GOOD.replace("pin:commit", "pin:commit2"), True),
+    ("a hyphenated marker kind", _PIN_GOOD.replace("pin:commit", "pin:pin-commit"), True),
+    # Hexadecimal, and still wrong: the authority is lowercase and the
+    # comparison is `startswith`. The message has to say which of the two it is.
+    ("an uppercase revision", _PIN_GOOD.replace("1111111111", "AAAAAAAAAA"), True),
+    # THE RENDERING CASE. A marker that starts its line is a CommonMark type-2
+    # HTML block, it interrupts the paragraph, and the span's value renders as
+    # literal Markdown. `docs/FEATURES.md:46` shipped exactly this shape.
+    (
+        "an opening marker at the start of a line",
+        _PIN_GOOD.replace(" (<!--pin:commit-->", "\n<!--pin:commit-->"),
+        True,
+    ),
+    (
+        "a closing marker at the start of a line",
+        _PIN_GOOD.replace("`1111111111`<!--/pin-->", "`1111111111`\n<!--/pin-->"),
+        True,
+    ),
+    (
+        "an indented marker, which is a visible code block at a block boundary",
+        _PIN_GOOD.replace(" (<!--pin:commit-->", "\n\n      <!--pin:commit-->"),
+        True,
+    ),
+    # And the benign direction: a marker that merely FOLLOWS text on its line,
+    # however little, is inline and renders as nothing.
+    (
+        "a marker one character into its line",
+        _PIN_GOOD.replace(" (<!--pin:commit-->", "\n(<!--pin:commit-->"),
+        False,
+    ),
     ("no marker at all", "**Oracle pin.** vLLM 9.9.9rc1.dev1 (`1111111111`).\n", True),
     (
         "only a label span, so the revision is unchecked",

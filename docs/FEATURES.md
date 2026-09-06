@@ -42,12 +42,13 @@ The `GlmMoeDsaForCausalLM` ROCm arm is the worked example: the run was real at
 `9f3e6e223`, and #2511 later withdrew the premise it depended on.
 
 *Results.* Every "vs vLLM" figure on this page was captured at the **prior**
-parity pin `555967922` and **has not been re-validated** at the current pin
-<!--pin:commit-->`e126687a9a`<!--/pin-->, which advanced on 2026-09-03. `.agents/oracles/vllm.md` states in
-its own words that the pin advance "does NOT say any gate in this tree has been
-run against it", and `.agents/NOW.md` records "**NO gate has run at it**". The
-rows below name `vLLM 0.25.0` where that is the version they were measured
-against. Tracked by #2794 (goldens predate the pin) and #2817 (the advance).
+parity pin `555967922` and **has not been re-validated** at the
+current pin <!--pin:commit-->`e126687a9a`<!--/pin-->, which advanced on
+2026-09-03. `.agents/oracles/vllm.md` states in its own words that the pin
+advance "does NOT say any gate in this tree has been run against it", and
+`.agents/NOW.md` records "**NO gate has run at it**". The rows below name
+`vLLM 0.25.0` where that is the version they were measured against. Tracked
+by #2794 (goldens predate the pin) and #2817 (the advance).
 
 ## At a glance
 
