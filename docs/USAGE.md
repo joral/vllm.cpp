@@ -271,7 +271,9 @@ instead — 13 say `"<arch>: KV cache must be bf16 or f32"`, and Gemma-4 dies on
 step earlier inside a cast with `"cast_f32: out must be f32"`, which does not
 even name the architecture. Every one of the 16 refuses before writing, so the
 half-sized block is never fed floats; what differs is how much the message tells
-you. Metal and ROCm refuse it too. See
+you. Metal refuses it too. ROCm does NOT: `191f64608` landed that
+path and `src/vt/rocm/rocm_ops.hip:206` registers `kReshapeAndCacheFp8`, which
+`src/vt/ops.cpp:4899-4900` admits for `kROCM`. See
 [the row spec](../.agents/specs/fp8-kv-cache.md) for the exact list.
 
 A refusal arrives AFTER the pool has already been sized at half, which is the
@@ -295,6 +297,38 @@ vllm_engine_load(&mp, &engine);
 ```
 
 `vllm-cli` takes the same `--kv-cache-dtype` flag the server takes.
+
+## Disabling a model's sliding window
+
+Gemma-2, Gemma-3, Gemma-4, OLMo-2 and Muse-Glimmer apply a model-level sliding
+window to attention. `--disable-sliding-window` turns it off for whichever of them
+you load, mirroring vLLM's `ModelConfig.disable_sliding_window`
+(`vllm/config/model.py:248`):
+
+```sh
+server --model /models/gemma-3-4b-it --disable-sliding-window
+```
+
+A model with no sliding window ignores the flag, which is upstream's own
+behaviour, so it is safe to pass to any model. `--enable-sliding-window` is the
+explicit opposite; omitting both leaves the window on, which is the default and is
+byte-identical to every release before ABI v26.
+
+**Through the C ABI (v26).** `vllm_model_params.disable_sliding_window` is a
+tri-state int: `0` (the zero-initialized default) leaves the window on, `1`
+disables it, `2` explicitly enables it. Any other value fails
+`vllm_engine_load` with `VLLM_ERR_INVALID_ARGUMENT`:
+
+```c
+vllm_model_params mp = vllm_model_params_default();
+mp.model_path = "/path/to/gemma-3-4b-it";
+mp.disable_sliding_window = 1;
+vllm_engine *engine = NULL;
+vllm_engine_load(&mp, &engine);
+```
+
+This replaced the `VT_GEMMA2_SLIDING` and `VT_GEMMA3_SLIDING` environment knobs,
+which reached only two of the five families.
 
 `vllm-bench` takes it too, and its report header names the KV dtype it measured
 on -- both the value you asked for and the storage dtype the loader actually
