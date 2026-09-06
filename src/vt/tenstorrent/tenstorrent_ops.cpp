@@ -65,6 +65,7 @@
 #include <ttnn/tensor/shape/shape.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
+#include <ttnn/operations/eltwise/ternary/ternary.hpp>
 #include <ttnn/operations/eltwise/unary/unary.hpp>
 #include <ttnn/operations/experimental/reshape/view.hpp>
 #include <ttnn/operations/embedding/embedding.hpp>
@@ -1710,6 +1711,267 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
     }
   }
   if (!in_place) CommitDevice2D(out, std::move(dev_out));
+}
+
+// kKeepQuantDecode: Q4_K block decode as a device compute chain — the packed
+// stream is decoded on the device, not staged through a host decode. Contract
+// is DequantQ4_K (cpu_quant_dequant.cpp:167, GetScaleMinK4 just above it;
+// llama.cpp dequantize_row_q4_K): per block_q4_K {f16 d; f16 dmin; u8
+// scales[12]; u8 qs[128]}, y[g*32+l] = d1*(nib) - m1 with d1 = d*sc, m1 =
+// dmin*mm, sc/mm from GetScaleMinK4(is, scales), groups 0..7 over the 8
+// 32-nibble lanes (low nibbles first, then high nibbles, of the same 32
+// bytes). The eager arm mirrors kEmbedding's staging: Alloc hands back a
+// host-mapped pointer, so the packed bytes are read from t.data, assembled to
+// little-endian u32 words (the GGUF stream order ReadF16 already assumes),
+// and uploaded as one INT32 tensor. Every unpack step is device work:
+// bitwise masks/shifts for the nibbles, scale bytes, and f16 halves;
+// reshape/permute only reorder lanes; d/dmin widen f16->f32 exactly via the
+// integer bit-construction chain of vt::F16ToF32 (loader
+// minimax_h3_vae_loader.cpp:47): normal/inf bits are sign | (exp+112)<<23 |
+// mant<<13, subnormals ride the exact integer->f32 typecast times 2^-24,
+// zero keeps its sign bit, and one i32->f32 bitcast materializes the f32.
+// The one divergence from F16ToF32: a NaN scale's payload canonicalizes to
+// inf across the SFPU bitcast (hardware pin) — corrupt-GGUF territory, and
+// every finite pattern is bit-exact. nibbles and scale factors typecast to
+// f32 exactly (values <= 255); d1/m1 and the final y = d1*nib - m1 are
+// separate f32 ttnn ops (no FMA), the same IEEE order as the host under
+// -ffp-contract=off. Trace capture (BACKEND-TENSTORRENT-KEEPQUANT W3) owns a
+// device-authoritative staging arm; this eager arm reads the host-mapped
+// staging the same way kEmbedding does.
+// A device tensor filled with -0.0f. from_vector is a host memcpy, so the
+// negative-zero bit pattern survives staging intact — no SFPU op between the
+// host value and the device buffer (multiply and the i32<->f32 bitcast both
+// canonicalize -0 to +0). where() consumes it as the true branch of the
+// signed-zero repair.
+void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
+  TT_OP_TRACE("KeepQuantDecode");
+  VT_CHECK(packed.rank == 2 && out.rank == 2,
+           "tenstorrent kKeepQuantDecode: packed rank-2 [rows, nb], out "
+           "rank-2 [rows, nb*256]");
+  VT_CHECK(packed.dtype == DType::kQ4_K,
+           "tenstorrent kKeepQuantDecode: packed dtype must be kQ4_K");
+  VT_CHECK(out.dtype == DType::kF32,
+           "tenstorrent kKeepQuantDecode: out must be f32");
+  VT_CHECK(packed.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kKeepQuantDecode: contiguous required");
+  const int64_t rows = packed.shape[0];
+  const int64_t nb = packed.shape[1];
+  VT_CHECK(out.shape[0] == rows && out.shape[1] == nb * 256,
+           "tenstorrent kKeepQuantDecode: out shape mismatch");
+  const int64_t b64 = rows * nb;
+  const uint32_t B = static_cast<uint32_t>(b64);
+
+  EnsureHost(packed);
+  const uint8_t* bytes = packed.Ptr<uint8_t>();
+  // 36 u32 words per 144-byte block, little-endian (GGUF stream order; the
+  // f16 halves land in word 0: d in bits 0..15, dmin in bits 16..31).
+  std::vector<int32_t> words;
+  words.reserve(static_cast<size_t>(b64) * 36);
+  for (int64_t b = 0; b < b64; ++b) {
+    const uint8_t* blk = bytes + b * 144;
+    for (int wj = 0; wj < 36; ++wj) {
+      const uint8_t* p = blk + wj * 4;
+      words.push_back(static_cast<int32_t>(
+          static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+          (static_cast<uint32_t>(p[2]) << 16) |
+          (static_cast<uint32_t>(p[3]) << 24)));
+    }
+  }
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor w = ttnn::Tensor::from_vector<int32_t>(
+      std::move(words),
+      SpecOf(tt::tt_metal::Shape({B, 36u}), ttnn::DataType::INT32,
+             ttnn::Layout::ROW_MAJOR),
+      &device);
+
+  // f16 bit pattern (held in INT32) -> f32 value, the integer chain of
+  // vt::F16ToF32 (minimax_h3_vae_loader.cpp:47): normal/inf/NaN bits are
+  // sign | (exp+112)<<23 | mant<<13; subnormal mant*2^-24 is exact in f32
+  // (integer typecast times a power of two); zero keeps its sign bit. where()
+  // demands TILE, so the selection runs there; finite patterns come out
+  // bit-exact, and a NaN payload canonicalizes to inf across the SFPU
+  // bitcast (hardware pin — see the kernel comment above).
+  auto f16_bits_to_f32 = [](ttnn::Tensor t) {
+    t = ttnn::to_layout(t, ttnn::Layout::TILE);
+    const ttnn::Tensor sign_b = ttnn::bitwise_left_shift(
+        ttnn::bitwise_and(ttnn::bitwise_right_shift(t, 15), 1), 31);
+    const ttnn::Tensor mant = ttnn::bitwise_and(t, 0x3FF);
+    const ttnn::Tensor exp =
+        ttnn::bitwise_and(ttnn::bitwise_right_shift(t, 10), 0x1F);
+    const ttnn::Tensor normal_bits = ttnn::bitwise_or(
+        sign_b,
+        ttnn::bitwise_or(ttnn::bitwise_left_shift(ttnn::add(exp, 112), 23),
+                         ttnn::bitwise_left_shift(mant, 13)));
+    const ttnn::Tensor denorm_val =
+        ttnn::multiply(ttnn::typecast(mant, ttnn::DataType::FLOAT32),
+                       std::ldexp(1.0f, -24));
+    const ttnn::Tensor denorm_bits =
+        ttnn::bitwise_or(sign_b, ttnn::bitcast(denorm_val, ttnn::DataType::INT32));
+    const ttnn::Tensor sub_bits =
+        ttnn::where(ttnn::gt(mant, 0), denorm_bits, sign_b);  // +/- zero
+    const ttnn::Tensor out_bits =
+        ttnn::where(ttnn::gt(exp, 0), normal_bits, sub_bits);
+    return ttnn::to_layout(ttnn::bitcast(out_bits, ttnn::DataType::FLOAT32),
+                           ttnn::Layout::ROW_MAJOR);
+  };
+  ttnn::Tensor w0 = ttnn::slice(
+      w, ttsl::SmallVector<uint32_t>{0u, 0u},
+      ttsl::SmallVector<uint32_t>{B, 1u}, ttsl::SmallVector<uint32_t>{1u, 1u});
+  ttnn::Tensor d_bits = ttnn::bitwise_and(w0, 0xFFFF);
+  ttnn::Tensor dmin_bits =
+      ttnn::bitwise_and(ttnn::bitwise_right_shift(w0, 16), 0xFFFF);
+  ttnn::Tensor d = f16_bits_to_f32(d_bits);
+  ttnn::Tensor dmin = f16_bits_to_f32(dmin_bits);
+
+  // Scale bytes: words 1..3 hold scales[0..11]. Four byte-lane shifts, then a
+  // (t,word)->(word,t) lane order fix: concat stacks the shift tensors, so
+  // col = 3*lane + word; reshape to (lane,word), permute to (word,lane), and
+  // the flat order is scales[k], k = 4*word + lane.
+  ttnn::Tensor sw = ttnn::slice(
+      w, ttsl::SmallVector<uint32_t>{0u, 1u},
+      ttsl::SmallVector<uint32_t>{B, 4u}, ttsl::SmallVector<uint32_t>{1u, 1u});
+  auto byte_lane = [](const ttnn::Tensor& t, int shift) {
+    return ttnn::bitwise_and(ttnn::bitwise_right_shift(t, shift), 0xFF);
+  };
+  ttnn::Tensor sb = ttnn::reshape(
+      ttnn::permute(
+          ttnn::reshape(
+              ttnn::concat(std::vector<ttnn::Tensor>{
+                  byte_lane(sw, 0), byte_lane(sw, 8), byte_lane(sw, 16),
+                  byte_lane(sw, 24)},
+                  /*dim=*/1),
+              ttnn::Shape({B, 4u, 3u})),
+          ttsl::SmallVector<int64_t>{0, 2, 1}),
+      ttnn::Shape({B, 12u}));
+  ttnn::Tensor sa = ttnn::slice(
+      sb, ttsl::SmallVector<uint32_t>{0u, 0u},
+      ttsl::SmallVector<uint32_t>{B, 4u}, ttsl::SmallVector<uint32_t>{1u, 1u});
+  ttnn::Tensor sm = ttnn::slice(
+      sb, ttsl::SmallVector<uint32_t>{0u, 4u},
+      ttsl::SmallVector<uint32_t>{B, 8u}, ttsl::SmallVector<uint32_t>{1u, 1u});
+  ttnn::Tensor sc = ttnn::slice(
+      sb, ttsl::SmallVector<uint32_t>{0u, 8u},
+      ttsl::SmallVector<uint32_t>{B, 12u}, ttsl::SmallVector<uint32_t>{1u, 1u});
+  // GetScaleMinK4(is, scales) for is = 0..7, group-major: is<4 low pair from
+  // scales[is]/scales[is+4]; is>=4 high pair from scales[is+4] low bits and
+  // scales[is-4]/scales[is] top bits.
+  auto top6l4 = [](const ttnn::Tensor& t) {
+    return ttnn::bitwise_left_shift(ttnn::bitwise_right_shift(t, 6), 4);
+  };
+  ttnn::Tensor sc_f = ttnn::typecast(
+      ttnn::concat(std::vector<ttnn::Tensor>{
+          ttnn::bitwise_and(sa, 63),
+          ttnn::bitwise_or(ttnn::bitwise_and(sc, 0xF), top6l4(sa))},
+          /*dim=*/1),
+      ttnn::DataType::FLOAT32);  // {B, 8}, values <= 63: exact
+  ttnn::Tensor mm_f = ttnn::typecast(
+      ttnn::concat(std::vector<ttnn::Tensor>{
+          ttnn::bitwise_and(sm, 63),
+          ttnn::bitwise_or(ttnn::bitwise_right_shift(sc, 4), top6l4(sm))},
+          /*dim=*/1),
+      ttnn::DataType::FLOAT32);  // {B, 8}, values <= 63: exact
+
+  // Nibbles: words 4..35 are qs[128]; 8 nibble-lane shifts -> {B,256} with
+  // idx = 8*lane + word. Flat idx = 16l + 8h + 8q + r over (byte lane l,
+  // nibble half h, quarter q, word-in-quarter r); permute (l,h,q,r) ->
+  // (q,h,r,l) so the flat order is the output order q*64 + h*32 + 4r + l —
+  // scale group 2q+h covers the same 32-value run.
+  ttnn::Tensor qw = ttnn::slice(
+      w, ttsl::SmallVector<uint32_t>{0u, 4u},
+      ttsl::SmallVector<uint32_t>{B, 36u}, ttsl::SmallVector<uint32_t>{1u, 1u});
+  auto nib = [](const ttnn::Tensor& t, int shift) {
+    return ttnn::bitwise_and(ttnn::bitwise_right_shift(t, shift), 0xF);
+  };
+  ttnn::Tensor nibf = ttnn::typecast(
+      ttnn::reshape(
+          ttnn::permute(
+              ttnn::reshape(
+                  ttnn::concat(std::vector<ttnn::Tensor>{
+                      nib(qw, 0), nib(qw, 4), nib(qw, 8), nib(qw, 12),
+                      nib(qw, 16), nib(qw, 20), nib(qw, 24), nib(qw, 28)},
+                      /*dim=*/1),
+                  ttnn::Shape({B, 4u, 2u, 4u, 8u})),
+              ttsl::SmallVector<int64_t>{0, 3, 2, 4, 1}),
+          ttnn::Shape({B, 8u, 32u})),
+      ttnn::DataType::FLOAT32);  // {B, 8, 32}, values <= 15: exact
+
+  // y = (d*sc)*nib - (dmin*mm): the host's exact f32 order, as separate ops.
+  // Signed-zero repair first: the device multiply canonicalizes (-x)*0 to +0
+  // and the i32->f32 bitcast maps -0 to +0, while the host chain is
+  // IEEE-exact for zeros — y keeps d's sign through a zero product and
+  // dmin's through a zero m1 (mm is unsigned, so the IEEE sign of both
+  // intermediates is the f16 sign bit). The sign is read from the f16 BIT
+  // patterns — never from a device float, whose zero sign is already
+  // canonicalized — and where() demands TILE, so the repairs run there. The
+  // combine subtracts back in ROW_MAJOR: a TILE {B,8,1} operand physically
+  // pads to 32 columns and a TILE broadcast reads those padding columns as
+  // data, which corrupted every non-zero logical column (238/256 at B=1).
+  auto neg01 = [](const ttnn::Tensor& bits) {
+    return ttnn::to_layout(
+        ttnn::bitwise_and(ttnn::bitwise_right_shift(bits, 15), 1),
+        ttnn::Layout::TILE);
+  };
+  auto is_zero = [](ttnn::Tensor v) {
+    v = ttnn::to_layout(std::move(v), ttnn::Layout::TILE);
+    return ttnn::eq(
+        ttnn::bitwise_and(
+            ttnn::bitcast(std::move(v), ttnn::DataType::INT32), 0x7FFFFFFF),
+        0);
+  };
+  ttnn::Tensor prod =
+      ttnn::multiply(ttnn::reshape(ttnn::multiply(d, sc_f),
+                                   ttnn::Shape({B, 8u, 1u})),
+                     nibf);
+  // pred = (sign bit set) AND (value == 0), assembled in the f32 domain:
+  // neg01/zero masks typecast to {0,1} f32 and a MULTIPLY broadcasts them
+  // ({B,1,1} x {B,8,32} -> {B,8,32}, exact on {0,1}) — the same broadcast-
+  // multiply family the d1/nib path uses. logical_and with a broadcast
+  // predicate is avoided deliberately, and so is any {B,256} reshape of
+  // prod: with either present the ternary wrote only the first 16 output
+  // elements and left recycled buffer bytes beyond. Every tensor here stays
+  // {B,8,32} — one 32x32 tile per block, the shape every op handles.
+  auto zero_mask = [&](ttnn::Tensor v) {
+    return ttnn::typecast(is_zero(std::move(v)), ttnn::DataType::FLOAT32);
+  };
+  auto sign_mask = [&](const ttnn::Tensor& bits) {
+    return ttnn::typecast(neg01(bits), ttnn::DataType::FLOAT32);
+  };
+  ttnn::Tensor pred = ttnn::multiply(
+      ttnn::reshape(sign_mask(d_bits), ttnn::Shape({B, 1u, 1u})),
+      zero_mask(prod));
+  // All three where() inputs in TILE: the ternary demands a TILE predicate,
+  // and a TILE predicate mixed with ROW_MAJOR branches made it write only
+  // its first 16 output elements (stale recycled bytes beyond).
+  ttnn::Tensor prodT = ttnn::to_layout(prod, ttnn::Layout::TILE);
+  ttnn::Tensor neg0T = ttnn::Tensor::from_vector<float>(
+      std::vector<float>(static_cast<size_t>(B) * 256, -0.0f),
+      SpecOf(tt::tt_metal::Shape({B, 8u, 32u}), ttnn::DataType::FLOAT32,
+             ttnn::Layout::TILE),
+      &device);
+  prod = ttnn::to_layout(
+      ttnn::where(pred, neg0T, prodT), ttnn::Layout::ROW_MAJOR);
+  ttnn::Tensor m1 = ttnn::reshape(ttnn::multiply(dmin, mm_f),
+                                  ttnn::Shape({B, 8u, 1u}));
+  // Repair m1 at its FINAL {B,8,1} shape: the subtract must consume the
+  // where() output directly. Reshaping a to_layout(ROW_MAJOR) round-trip
+  // output before the subtract made the broadcast read block 0's m1 row for
+  // every block (constant y offset per element beyond block 0).
+  ttnn::Tensor pred8 = ttnn::multiply(
+      ttnn::reshape(sign_mask(dmin_bits), ttnn::Shape({B, 1u, 1u})),
+      zero_mask(m1));
+  ttnn::Tensor m1T = ttnn::to_layout(m1, ttnn::Layout::TILE);
+  ttnn::Tensor neg0T8 = ttnn::Tensor::from_vector<float>(
+      std::vector<float>(static_cast<size_t>(B) * 8, -0.0f),
+      SpecOf(tt::tt_metal::Shape({B, 8u, 1u}), ttnn::DataType::FLOAT32,
+             ttnn::Layout::TILE),
+      &device);
+  m1 = ttnn::to_layout(
+      ttnn::where(pred8, neg0T8, m1T), ttnn::Layout::ROW_MAJOR);
+  ttnn::Tensor y = ttnn::subtract(prod, m1);
+  y = ttnn::reshape(ttnn::to_layout(std::move(y), ttnn::Layout::ROW_MAJOR),
+                    ttnn::Shape({B, 256u}));
+  CommitDeviceLogical2D(out, std::move(y), static_cast<uint32_t>(rows),
+                        static_cast<uint32_t>(nb * 256));
 }
 
 // Upload a rank-1 affine vector as TILE BFLOAT16 [1, d], caching on the weight's
@@ -6394,6 +6656,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ReluFn>(&ReluKernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
+    RegisterOp(OpId::kKeepQuantDecode, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<KeepQuantDecodeFn>(&KeepQuantDecodeKernel)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kTENSTORRENT,

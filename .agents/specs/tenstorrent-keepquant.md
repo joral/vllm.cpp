@@ -195,12 +195,18 @@ to make a failure pass.
 - Block-decoding n-gram gather ([#2394](https://github.com/mudler/vllm.cpp/issues/2394)).
 - IQ-family / sub-IQ1_S encodings (unsloth fork formats).
 - The int8-dot perf lever; llama.cpp-comparable throughput numbers.
-- `docs/USAGE.md` vehicle pin at W1; 27B arm entry at W4.
+- `docs/USAGE.md` vehicle pin when the arm first runs end to end (the W3
+  capture leg hashes the local bytes); 27B arm entry at W4.
 
 ## Now
 
-`ACTIVE`, 2026-09-05. W0 staged: substrate surveyed (no tt-metal k-quant
-primitive — the kernel is ours), design settled (resident blocks, on-core
-decode, bf16 tile dot), predicate seam named
-(`gguf_keep_quant.cpp:136-148`). Next: W1, the Q4_K block-decode device path
-with bit-exact decode tests, red-first.
+`ACTIVE`, 2026-09-05. W1 complete: the Q4_K block-decode device kernel
+(`KeepQuantDecodeKernel`, `tenstorrent_ops.cpp`) is bit-exact against
+`vt::cpu::BlockToFloat` on the full sweep (rows {1,3,17} x nb {1,2,16},
+memcmp-level, 53/53 cases green), with the signed-zero repair all-TILE:
+`ttnn::where` demands a TILE predicate and silently writes only its first 16
+elements when a TILE predicate is mixed with ROW_MAJOR branches; the f32
+{0,1}-mask multiply pred replaces `logical_and` (rank promotion of a broadcast
+predicate); m1 is repaired at its final {B,8,1} shape. Next: W2, the dot
+provider + `kTENSTORRENT` predicate arm + registration, mutation-red. The
+vehicle pin stays owed until the arm first runs (W3).
