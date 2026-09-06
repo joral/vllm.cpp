@@ -904,8 +904,8 @@ class AgentRecordMutationTests(unittest.TestCase):
         """A beyond-pin row must not inflate the AT-THE-PIN model inventory.
 
         `check_model_invariants` pins what vLLM's OWN registry holds at
-        `555967922`: 324 category/target rows, 373 memberships, 356
-        architectures, 310 targets, 261 modules. It counts a row only when the
+        `e126687a9a`: 324 category/target rows, 373 memberships, 356
+        architectures, 309 targets, 245 modules. It counts a row only when the
         Upstream cell carries a backticked `module`-colon-colon-`class` token.
         So a row for an architecture that is NOT at the pin -- MuseGlimmer,
         KimiK3, MiniMaxH3DiT, and the seven recipe architectures rowed for
