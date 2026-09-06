@@ -96,6 +96,12 @@ void MoeCombineGateKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
 void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
                                     const Tensor& weight, const Tensor& expert_ids);
+// The fused MoE gate+up+clamped-SwiGLU grouped GEMM (rocm_moe_gate_up_swiglu.hip).
+// GLM-5.3-Flash reads this and kMatmulBTQuantGrouped through `vt::OpRegistered`
+// before it takes a device queue (glm5_next_forward.cpp:307-311, #2942).
+void MoeGateUpSwiGLUGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& gate_w, const Tensor& up_w,
+                                      const Tensor& expert_ids, float limit);
 // BACKEND-ROCM-GDN-KERNELS family 1 (rocm_gdn_state.hip): the indexed state I/O
 // pair `IndexedGdnOpsNative()` requires (issue #41, spec rocm-gdn-kernels.md).
 void GdnStateGatherKernelRocm(Queue& q, Tensor& working, const Tensor& cache,
@@ -255,6 +261,9 @@ struct Registrar {
     RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<MatmulBTQuantGroupedFn>(&MatmulBTQuantGroupedKernelRocm)));
+    RegisterOp(OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGateUpSwiGLUGroupedFn>(
+                   &MoeGateUpSwiGLUGroupedKernelRocm)));
     RegisterOp(OpId::kGdnStateGather, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<GdnStateGatherFn>(&GdnStateGatherKernelRocm)));
