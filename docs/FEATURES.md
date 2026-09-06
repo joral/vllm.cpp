@@ -11,7 +11,7 @@ the agent-facing parity inventory with upstream file references see
 **Legend.** ✅ supported and gated. ◐ partial, usable with named gaps. ☐ not yet.
 n/a means the feature does not apply to that engine's design.
 
-Reference versions: vLLM 0.28.1rc1.dev132 (`e126687a9a`, the parity pin since
+Reference versions: vLLM <!--pin:label-->0.28.1rc1.dev132<!--/pin--> (<!--pin:commit-->`e126687a9a`<!--/pin-->, the parity pin since
 2026-09-03), SGLang v0.5.15, llama.cpp `b10451`, MLX-LM as of 2026-07. Rows
 describing what vLLM has were read at the PRIOR pin `555967922` unless they say
 otherwise; the 290-commit-range PORT-NOW queue for the advance is classified and
@@ -42,12 +42,13 @@ The `GlmMoeDsaForCausalLM` ROCm arm is the worked example: the run was real at
 `9f3e6e223`, and #2511 later withdrew the premise it depended on.
 
 *Results.* Every "vs vLLM" figure on this page was captured at the **prior**
-parity pin `555967922` and **has not been re-validated** at the current pin
-`e126687a9a`, which advanced on 2026-09-03. `.agents/oracles/vllm.md` states in
-its own words that the pin advance "does NOT say any gate in this tree has been
-run against it", and `.agents/NOW.md` records "**NO gate has run at it**". The
-rows below name `vLLM 0.25.0` where that is the version they were measured
-against. Tracked by #2794 (goldens predate the pin) and #2817 (the advance).
+parity pin `555967922` and **has not been re-validated** at the
+current pin <!--pin:commit-->`e126687a9a`<!--/pin-->, which advanced on
+2026-09-03. `.agents/oracles/vllm.md` states in its own words that the pin
+advance "does NOT say any gate in this tree has been run against it", and
+`.agents/NOW.md` records "**NO gate has run at it**". The rows below name
+`vLLM 0.25.0` where that is the version they were measured against. Tracked
+by #2794 (goldens predate the pin) and #2817 (the advance).
 
 ## At a glance
 
@@ -242,6 +243,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DFlash2 block-diffusion (dynamic conv + candidate selector) | Qwen3 DFlash2 draft, safetensors or GGUF (bf16 / Q8_0 / Q4_K_M) | Gated against vLLM: 4/4 token-exact, 45/47 draft blocks identical, acceptance identical per prompt. All 7 DFlash2 suites green on `sm_121a`, zero CUDA skips | GREEDY only. Speed 0.8017x vLLM: RECORDED, no floor, NOT a pass (#1562). A GGUF draft is dequantized to bf16 at load (#1314) |
 | Async scheduling × speculative decoding | any Eagle-type speculator (`mtp`, `dflash`/DFlash2, `dspark`) | `test_mtp_depth` W7 cases: a spec engine resolves async ON and emits the sync scheduler's exact tokens through both engine fronts (depth-1 and the depth-2 batch queue); `test_engine_core_proc` pins the -1-placeholder / worker-fill contract | Mirrors vLLM's polarity (async disabled only OUTSIDE the Eagle-type family): drafts ride as `-1` placeholders the worker fills from its own propose; host `ngram` and `draft_model` stay synchronous. `VT_ASYNC_SCHED=0` rolls back. Spec steps keep the host sampler (device-resident spec sampling owed); the GPU TPOT A/B owed (#1824) |
+| DFlash2 DRAFT weights in ModelOpt NVFP4 | a DFlash2 draft whose own `config.json` declares `quant_method: "modelopt"` and `quant_algo` NVFP4 / W4A16_NVFP4 | `test_qwen3_dflash2_nvfp4` 14/14 (317) over a REAL safetensors file through `MakeQwen3DFlashDraftConfig` + `LoadQwen3DFlash`, the pair `LoadDflashDraft` calls: seven packed owners per layer with `n`, `k` and `weight_scale_2` asserted per module, the merged bf16 owners left empty, and the 12 excluded modules read BF16 | The arm question is the DECLARATION, as upstream's `get_draft_quant_config` makes it, with the tensors cross-checked in BOTH directions. `fc`, `candidate_selector.hidden_projection` and both conv `kernel_projection`s have no packed owner and are refused BY NAME. Declared W4A4 runs W4A16 and the load says so (#2760). LOAD-gated only: `vt::MatmulNvfp4` is CUDA-only, so no host twin exists and the device leg is owed (#2758) |
 | DFlash/DFlash2 shared `lm_head` kept PACKED | a DFlash or DFlash2 draft off an NVFP4 safetensors target | `test_qwen3_dflash2_draft` 36/36 (353): block logits BITWISE equal to `Qwen3_5MTPModel::ComputeLogits` on the same packed head, and `FromModelDir` loads and drafts off one | Widening a head stays refused by name: GGUF `output.weight`, FP8, W4A4. `VT_LMHEAD_FP4=0` rolls back to the refusal. DSpark and the CUDA arm owed (#1628) |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
 
