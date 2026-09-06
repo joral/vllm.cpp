@@ -387,12 +387,63 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
 - **R4 — no GPU in CI.** A2-2 through A2-4 have device arms that the CPU tier
   degenerates. Each device case must be a VISIBLE skip with a non-zero
   assertion count on the arm that does run.
+- **R5 — the runner suite cannot see the discarded-row rule, and A2-4 measured
+  that it cannot.** #2920's mixed `num_reqs > 1` runner case does not assert
+  that a DISCARDED row's token column is left untouched, so it cannot see a
+  rule that writes one. Dropping the `discard` guard reds `test_committed_ids`
+  7 of 9 while `test_runner` stays **GREEN**, so
+  `tests/vllm/v1/worker/test_committed_ids.cpp` is the only instrument in this
+  tree for that rule. A wave that changes the committed-id apply and gates it
+  on `test_runner` alone has no instrument for its own defect. This is R1's
+  class — a guarantee that no test could red — which three separate A2-3
+  reviews each found independently. It is recorded here, and not only in the
+  A2-4 commit body, because the next wave reads `## Risks` and the mutation
+  table in `## Now` is rewritten at every landing.
 
 ## Stop conditions
 
 - G4 reading GPU busy at or above 95% turns this into a parity-only row. The
   mirror obligation stands, the throughput ceiling is zero, and the waves are
   scheduled accordingly rather than dropped.
+
+  **AMENDED IN PART on 2026-09-06 by the operator, on the decomposition of
+  G4's own trace** ([#3004](https://github.com/mudler/vllm.cpp/issues/3004)).
+  The measurement is untouched and the reading stands: the decode GPU is
+  **96.01% busy** in `--cuda-graph-trace=node` mode and **96.53%** in graph
+  mode, against this spec's own threshold that at or above 95% refutes the
+  throughput half outright. With about 4% idle, no async chain delivers the
+  11.1% per-step gap against vLLM on its own.
+
+  The clause that is superseded is **"the throughput ceiling is zero"**, and
+  only that clause. G4 refuted the async chain as a SUFFICIENT fix. It did not
+  refute it as a CONTRIBUTING one, and the original stop condition drew the
+  second conclusion from evidence that supports only the first. The
+  decomposition of the same trace ranks idle as the LARGEST single lever
+  available:
+
+  | lever | perfect-case gain |
+  |---|---:|
+  | **remove all idle** | **3.99%** |
+  | remove all non-GEMM kernel time | 3.46% |
+  | every GEMM at our best observed rate (220.8 -> 227.2 GB/s) | 2.61% |
+  | **total ceiling** | **10.06%** |
+  | **gap to vLLM** | **11.1%** |
+
+  No single lever closes the gap. All three together are still about one point
+  short, and that missing point belongs to
+  [#2964](https://github.com/mudler/vllm.cpp/issues/2964) and not to this row.
+  "Async cannot close the gap alone" is true. "Async is worthless" is what the
+  superseded clause implied, and it is false.
+
+  **The amended condition.** A2-4 proceeds as a necessary-but-not-sufficient
+  contributor and claims **NO** throughput result. A2-5 remains gated on its
+  own G3/G4 evidence and is **NOT** authorized by this amendment. Every
+  sentence in this spec that forbids a wave in A2 from quoting a throughput
+  result keeps its full force; the amendment changes whether these waves may
+  exist, not what they may claim. The original text above is kept because the
+  reading it rests on is correct on its own terms and because this project
+  does not delete evidence to reduce context. What changed is the conclusion,
+  not the number.
 - A wave needing V2-runner semantics this tree does not have,
   `NEEDS_DECISION` naming the dependency.
 - Any correctness gate red that a scoped fix cannot green, `BLOCKED` with the
@@ -988,6 +1039,17 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   quote a throughput result against this reading. What is still owed here is the
   run's recorded recipe, revisions and contention state beside the number.
 
+  **AMENDED IN PART on 2026-09-06; read `## Stop conditions` for the decision
+  and its basis** (#3004). The number, the threshold and the reading are
+  unchanged. The superseded sentence is "**A2-4 and A2-5 are STOPPED on it**":
+  the decomposition of this same trace ranks idle as the largest of three
+  levers (3.99% of a 10.06% total ceiling against an 11.1% gap), so the reading
+  refutes async as a sufficient fix and not as a contributing one. A2-4
+  proceeds as a necessary-but-not-sufficient contributor and A2-5 stays gated
+  on its own G3/G4 evidence. The last two sentences above are NOT amended: no
+  wave in A2 may quote a throughput result against this reading, and the run's
+  recipe, revisions and contention state are still owed beside the number.
+
 ## Now
 
 `SPEC-DFLASH2` stays `ACTIVE`. The veto STANDS at both construction sites, the
@@ -1117,7 +1179,8 @@ no throughput result.** Gate G4 has run on the operator's device — 96.01% busy
 the decode GPU, against this spec's own threshold that a reading at or above 95%
 refutes the throughput half outright — and A2-4 and A2-5 are STOPPED on it. The
 round-3 repair took no lease and measured no device; every number below is from
-the CPU tier. A2-3 lands for structural value only: it discharges A2-1's
+the CPU tier. (That STOPPED sentence was the position when A2-3 landed. It was
+amended in part on 2026-09-06; see `## Stop conditions`.) A2-3 lands for structural value only: it discharges A2-1's
 `## Owed` and removes a reason-A hazard, and nothing in it is offered as a step
 toward the row's 11% gap.
 
@@ -1278,9 +1341,21 @@ its sizing, its staging retain rule and the ids it returns, and NOT that the cop
 ran off the main stream.
 
 **NO THROUGHPUT RESULT IS CLAIMED, AND NONE MAY BE.** G4 reads 96.01% GPU busy
-and the stop condition above stands: A2-4 lands for its structural value and to
-unblock A2-5, exactly as A2-3 did. The download this wave adds is `num_reqs`
-int64s per spec decode step under `spec_on()` and is not measured here.
+and the stop condition above stands as amended: A2-4 lands for its structural
+value and to unblock A2-5, exactly as A2-3 did. The download this wave adds is
+`num_reqs` int64s per spec decode step under `spec_on()` and is not measured
+here.
+
+**THE STOP CONDITION WAS AMENDED WITH THIS WAVE, NOT BY IT.** The operator
+amended `## Stop conditions` on 2026-09-06 and the decision is recorded there
+with its basis (#3004). In short: G4's 96.01% / 96.53% reading refuted async as
+a SUFFICIENT fix, and the clause "the throughput ceiling is zero" overstated it.
+The decomposition of the same trace ranks idle first at 3.99%, ahead of non-GEMM
+kernel time at 3.46% and GEMM rate at 2.61%, for a 10.06% ceiling against an
+11.1% gap; the missing point is #2964's. So A2-4 contributes and is not
+sufficient on its own, it claims nothing, and A2-5 remains gated on its own
+G3/G4 evidence. The original stop-condition text and its G4 reasoning are kept
+in place, because the reading is correct and only the conclusion changed.
 
 A2-5 is the next wave. What it is now blocked on is no longer the residency
 refusal, which is gone; it is the three `## Owed` entries above — the flip
