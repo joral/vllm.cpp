@@ -271,7 +271,9 @@ instead — 13 say `"<arch>: KV cache must be bf16 or f32"`, and Gemma-4 dies on
 step earlier inside a cast with `"cast_f32: out must be f32"`, which does not
 even name the architecture. Every one of the 16 refuses before writing, so the
 half-sized block is never fed floats; what differs is how much the message tells
-you. Metal and ROCm refuse it too. See
+you. Metal refuses it too. ROCm does NOT: `191f64608` landed that
+path and `src/vt/rocm/rocm_ops.hip:206` registers `kReshapeAndCacheFp8`, which
+`src/vt/ops.cpp:4899-4900` admits for `kROCM`. See
 [the row spec](../.agents/specs/fp8-kv-cache.md) for the exact list.
 
 A refusal arrives AFTER the pool has already been sized at half, which is the
