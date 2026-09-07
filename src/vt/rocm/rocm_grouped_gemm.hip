@@ -871,10 +871,24 @@ __global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t*
     }
     // Cooperative activation stage: ItGroup*16 rows this time, same
     // division-free-in-practice flat word loop as `...Shared` above.
+    //
+    // Clamped to the rows that are actually VALID for this it_base: `qact`
+    // (EnsureQuantScratch's scratch buffer) is sized at exactly
+    // m_tiles*16 rows, no padding, and the last blockIdx.y block's
+    // it_base can leave fewer than ItGroup*16 rows before that logical
+    // end whenever m_tiles % ItGroup != 0 (the ragged last block, not an
+    // edge case). Copying the unconditional ItGroup*16 rows there read
+    // past the buffer -- an out-of-bounds device read that never
+    // corrupted OUTPUT only because the `it_i` bounds check below already
+    // skips every row this loop would otherwise not have filled, so
+    // leaving those rows' shared memory unwritten from a prior fill is
+    // safe.
     {
       constexpr int kWordsPerRow = static_cast<int>(sizeof(BlockQ8_K) / sizeof(int));
-      constexpr int kTotalWords = ItGroup * 16 * kWordsPerRow;
       constexpr int kBlockThreads = WarpsPerBlock * 32;
+      const int valid_rows = static_cast<int>(
+          min(static_cast<int64_t>(ItGroup) * 16, (m_tiles - it_base) * 16));
+      const int kTotalWords = valid_rows * kWordsPerRow;
       auto* act_dst_i = reinterpret_cast<int*>(&act_stage[0]);
       const auto* act_base_i = reinterpret_cast<const int*>(a_row0);
       const int64_t words_per_global_row = static_cast<int64_t>(nsb) * kWordsPerRow;
@@ -1336,10 +1350,16 @@ __global__ void KQuantGemmKWmmaQ4KBigTile(OutT* __restrict__ out, const uint8_t*
       const int tile16 = t % 16;
       DequantQ4KTile16(xb_cur[row], tile16, w_stage[wy][tile16][row]);
     }
+    // Same OOB-clamped staging as `KQuantGemmKWmmaQ6KBigTile` above -- see
+    // its comment for why the row range must be clamped to
+    // min(ItGroup*16, (m_tiles - it_base)*16) rather than the unconditional
+    // ItGroup*16.
     {
       constexpr int kWordsPerRow = static_cast<int>(sizeof(BlockQ8_K) / sizeof(int));
-      constexpr int kTotalWords = ItGroup * 16 * kWordsPerRow;
       constexpr int kBlockThreads = WarpsPerBlock * 32;
+      const int valid_rows = static_cast<int>(
+          min(static_cast<int64_t>(ItGroup) * 16, (m_tiles - it_base) * 16));
+      const int kTotalWords = valid_rows * kWordsPerRow;
       auto* act_dst_i = reinterpret_cast<int*>(&act_stage[0]);
       const auto* act_base_i = reinterpret_cast<const int*>(a_row0);
       const int64_t words_per_global_row = static_cast<int64_t>(nsb) * kWordsPerRow;
@@ -1949,7 +1969,10 @@ bool QuantWmmaShareActEnabled() {
 // activation-row groups reused per staged load instead of 1). Mutually
 // exclusive with `VT_ROCM_QUANT_WMMA_SHARE_ACT` at the call site below --
 // this is a different grid/loop shape, not an addition to it. Default
-// OFF pending `examples/quant-gemm-bench`.
+// OFF pending `examples/quant-gemm-bench`. PRECEDENCE: the dispatch below
+// checks this toggle first in its `else if` chain, so setting both
+// VT_ROCM_QUANT_WMMA_BIGTILE=1 and VT_ROCM_QUANT_WMMA_SHARE_ACT=1 at once
+// silently runs BigTile only -- there is no diagnostic for that overlap.
 bool QuantWmmaBigTileEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE");
@@ -2133,13 +2156,20 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
             n_tiles % wpb == 0) {
           // BigTile's grid is 2D and its jt dimension is sized EXACTLY to
           // n_tiles/wpb (no remainder block) -- the same precondition
-          // Shared uses, and for the same reason: a warp whose jt would
-          // fall outside n_tiles must never exist in a launched block,
-          // because its early `return` would desync the block's later
-          // __syncthreads() calls from warps that keep running. The `it`
-          // (M) direction needs no such precondition: its raggedness is
-          // handled by a block-uniform `continue` inside the loop, not a
-          // per-warp early return.
+          // Shared uses. Mutation-tested (review of #3036): removing this
+          // modulo check does NOT let an out-of-range jt reach a launched
+          // block -- grid_x = n_tiles / wpb below is already floor
+          // division, so grid_x*wpb <= n_tiles always holds and no warp's
+          // jt can land past n_tiles. The failure this precondition
+          // actually guards against is narrow N: for a shape where
+          // n_tiles < wpb (e.g. n_tiles=3 with wpb=8, the pre-existing
+          // N=48 WMMA test), floor division makes grid_x == 0, and HIP
+          // rejects that zero-sized launch outright with "invalid
+          // configuration argument" (an uncaught exception at launch),
+          // not a hang or an in-block desync. The `it` (M) direction
+          // needs no such precondition: its raggedness is handled by a
+          // block-uniform `continue` inside the loop, not a per-warp
+          // early return.
           g_kq_wmma_bigtile_dispatches.fetch_add(1, std::memory_order_relaxed);
           const int64_t grid_x = n_tiles / kQuantWmmaWideWarpsPerBlock;
           const int64_t grid_y =
