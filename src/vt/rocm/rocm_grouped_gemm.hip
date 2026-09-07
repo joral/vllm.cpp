@@ -496,6 +496,21 @@ static_assert(16 % kGroupGemmBatch == 0, "16 scale-groups must divide evenly int
 // other WMMA kernels stay inside (see `rocm_paged_attn.hip`'s own note).
 static_assert(kQuantWmmaWideWarpsPerBlock * 6400 <= 65536,
              "widened WMMA block must stay under the 64KiB LDS budget");
+// The Shared arms (issue #3034) add ONE block-wide activation buffer on
+// top of the per-warp budget above: sizeof(BlockQ8_K) == 292, 16 rows,
+// independent of WarpsPerBlock (every warp reads the SAME 16 rows).
+static_assert(kQuantWmmaWideWarpsPerBlock * 6400 + 16 * 292 <= 65536,
+             "cooperative-activation-share arm must stay under the 64KiB LDS budget");
+// The BigTile arms (issue #3034, second cut) widen the shared activation
+// buffer to kQuantWmmaBigTileItGroup*16 rows instead of 16, to amortize
+// the staging cost over more MMA uses per load. 3 is the largest value
+// that still fits this card's 64KiB LDS budget alongside the existing
+// per-warp weight-side footprint above; llama.cpp's own tile reuses over
+// ~8 (128 activation rows), which would need 8*16*292 = 37,376 B more and
+// does not fit here (51,200 + 37,376 > 65,536).
+constexpr int kQuantWmmaBigTileItGroup = 3;
+static_assert(kQuantWmmaWideWarpsPerBlock * 6400 + kQuantWmmaBigTileItGroup * 16 * 292 <= 65536,
+             "bigger-cooperative-tile arm must stay under the 64KiB LDS budget");
 
 template <typename OutT, int WarpsPerBlock>
 __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
@@ -621,6 +636,319 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
     const int64_t oi = i0 + ii, oj = j0 + jj;
     if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[c];
     else out[oi * n + oj] = DF32ToBF16(acc_f[c]);
+  }
+#endif  // VT_ROCM_QUANT_WMMA_OK
+}
+
+// --- Cooperative-activation-share arm of KQuantGemmKWmmaQ6K (issue #3034).
+// Traced through this kernel's own tile/warp math: `tile = blockIdx.x *
+// WarpsPerBlock + threadIdx.y`, `it = tile / n_tiles`, `jt = tile % n_tiles`.
+// Every warp in one block gets the SAME `it` whenever `n_tiles` is a
+// multiple of `WarpsPerBlock` (the host call site below only dispatches
+// here when that holds, falling back to the per-warp-independent kernel
+// otherwise) — so every warp in a block reads the IDENTICAL 16 activation
+// rows for a given superblock. The kernel above reads them independently,
+// once per warp, straight from global, every superblock: the confirmed
+// redundancy issue #3032's wider-block A/B could not touch (it widened
+// the same pattern without sharing it). This kernel is that same
+// mechanism with ONE change: the shared superblock's `BlockQ8_K` bytes
+// are staged into shared memory ONCE per block, cooperatively across
+// every warp's threads, and every read that used to hit global memory —
+// the WMMA `a_frag` load and, for Q4_K, the min-correction's `bsums`
+// read — now reads that one shared copy instead. Byte-for-byte identical
+// data; only where it comes from changes.
+template <typename OutT, int WarpsPerBlock>
+__global__ void KQuantGemmKWmmaQ6KShared(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                                         const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
+                                         int64_t nsb, int64_t n_tiles) {
+#if !defined(VT_ROCM_QUANT_WMMA_OK)
+  (void)out; (void)weight; (void)act; (void)m; (void)n; (void)nsb; (void)n_tiles;
+  return;
+#else
+  using namespace rocwmma;
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock +
+                       static_cast<int64_t>(threadIdx.y);
+  const int64_t m_tiles = m / 16;
+  if (tile >= m_tiles * n_tiles) return;
+  const int64_t it = tile / n_tiles;
+  const int64_t jt = tile % n_tiles;
+  const int64_t i0 = it * 16;
+  const int64_t j0 = jt * 16;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int wy = static_cast<int>(threadIdx.y);
+  const int block_tid = wy * 32 + lane;
+
+  __shared__ int8_t w_stage[WarpsPerBlock][16][16][16];
+  __shared__ int32_t raw_tile[WarpsPerBlock][kGroupGemmBatch][16][16];
+  // ONE shared copy of the current superblock's 16 activation rows, for
+  // the WHOLE BLOCK — not per warp, because every warp needs the same 16
+  // rows. sizeof(BlockQ8_K) == 292, so this is 16*292 == 4672 B (~4.6 KiB),
+  // independent of WarpsPerBlock; see the file-scope LDS static_assert.
+  __shared__ BlockQ8_K act_stage[16];
+
+  const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ6_K);
+  const BlockQ6_K* w_row_base[16];
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    w_row_base[r] =
+        reinterpret_cast<const BlockQ6_K*>(weight + static_cast<size_t>(j0 + r) * row_stride);
+  }
+  const BlockQ8_K* a_row0 = act + i0 * nsb;
+
+  float acc_f[8];
+#pragma unroll
+  for (int c = 0; c < 8; ++c) acc_f[c] = 0.0f;
+
+  for (int64_t sb = 0; sb < nsb; ++sb) {
+    const BlockQ6_K* xb_cur[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) xb_cur[r] = w_row_base[r] + sb;
+
+    int32_t isum[8];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) isum[c] = 0;
+
+    for (int t = lane; t < 16 * 16; t += 32) {
+      const int row = t / 16;
+      const int grp2 = t % 16;
+      DequantQ6KGroup16(xb_cur[row], grp2, w_stage[wy][grp2][row]);
+    }
+    // Cooperative activation stage, all WarpsPerBlock*32 threads together:
+    // 16 rows * sizeof(BlockQ8_K) bytes, strided in global (row-to-row
+    // distance is nsb*sizeof(BlockQ8_K), not sizeof(BlockQ8_K)) copied into
+    // the one contiguous shared act_stage[16].
+    {
+      // Word-sized (int) copy, one FLAT loop over all 1168 words so every
+      // one of WarpsPerBlock*32 threads is active on every iteration
+      // (~4.6 iterations/thread at 8 warps). The first cut split this into
+      // an outer per-row loop, which only kept ~73 of 256 threads busy per
+      // row and measured barely better than a naive byte-at-a-time copy
+      // (see issue #3034's own result table) -- the division this
+      // rewrite still does (`idx / kWordsPerRow`) is by the compile-time
+      // constant 73, which the compiler lowers to a multiply-shift
+      // sequence, not a genuine divide; the earlier version's real cost
+      // was under-parallelized threads, not the division it removed.
+      constexpr int kWordsPerRow = static_cast<int>(sizeof(BlockQ8_K) / sizeof(int));
+      constexpr int kTotalWords = 16 * kWordsPerRow;
+      constexpr int kBlockThreads = WarpsPerBlock * 32;
+      auto* act_dst_i = reinterpret_cast<int*>(&act_stage[0]);
+      const auto* act_base_i = reinterpret_cast<const int*>(a_row0);
+      const int64_t words_per_global_row = static_cast<int64_t>(nsb) * kWordsPerRow;
+      for (int idx = block_tid; idx < kTotalWords; idx += kBlockThreads) {
+        const int row = idx / kWordsPerRow;
+        const int w = idx % kWordsPerRow;
+        act_dst_i[idx] = act_base_i[row * words_per_global_row + sb * kWordsPerRow + w];
+      }
+    }
+    __syncthreads();
+
+    for (int gb = 0; gb < 16; gb += kGroupGemmBatch) {
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+        const int grp = gb + gi;
+        fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+        fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
+        fragment<accumulator, 16, 16, 16, int32_t> acc;
+        fill_fragment(acc, 0);
+        const int8_t* a_ptr = act_stage[0].qs + grp * 16;
+        const long a_ld = static_cast<long>(sizeof(BlockQ8_K));
+        load_matrix_sync(a_frag, a_ptr, a_ld);
+        load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
+        mma_sync(acc, a_frag, b_frag, acc);
+        store_matrix_sync(&raw_tile[wy][gi][0][0], acc, 16, mem_row_major);
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+        const int grp = gb + gi;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          const int cell = lane + c * 32;
+          const int ii = cell / 16, jj = cell % 16;
+          isum[c] += raw_tile[wy][gi][ii][jj] * static_cast<int32_t>(xb_cur[jj]->scales[grp]);
+        }
+      }
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      const int cell = lane + c * 32;
+      const int ii = cell / 16, jj = cell % 16;
+      const float d = DF16ToF32(xb_cur[jj]->d) * act_stage[ii].d;
+      acc_f[c] += d * static_cast<float>(isum[c]);
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < 8; ++c) {
+    const int cell = lane + c * 32;
+    const int ii = cell / 16, jj = cell % 16;
+    const int64_t oi = i0 + ii, oj = j0 + jj;
+    if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[c];
+    else out[oi * n + oj] = DF32ToBF16(acc_f[c]);
+  }
+#endif  // VT_ROCM_QUANT_WMMA_OK
+}
+
+// --- Bigger-cooperative-tile arm of KQuantGemmKWmmaQ6K (issue #3034, second
+// cut). The Shared kernel above amortized one activation load over only
+// WarpsPerBlock (8) MMA uses and measured a net regression (geomean
+// -11.5% vs the plain 8-warp arm) -- the staging cost was real and 8x
+// reuse did not clear it. llama.cpp's own `mul_mat_q` amortizes over
+// ~64 uses (8 warps x 8 activation sub-tiles each), which needs a
+// 128-row shared activation tile; at this kernel's existing per-warp
+// weight-side footprint (~50 KiB at 8 warps), that does not fit this
+// card's 64 KiB LDS budget (128*292 B = 36.5 KiB more would need ~86.5
+// KiB total). `ItGroup=3` (48 activation rows, ~14 KiB) is the largest
+// that DOES fit, giving ~24x reuse per staged load instead of 8x --
+// still short of llama's ~64x, but the next point on this curve.
+//
+// Mechanism: `jt` (this warp's fixed weight-row group) no longer shares
+// one `tile` index with `it` -- the grid is 2D. `blockIdx.x` gives every
+// warp its own fixed `jt` (as before); `blockIdx.y` gives the WHOLE BLOCK
+// a shared `it_base` spanning `ItGroup` activation-row groups, looped
+// inside each warp. The weight dequant fill happens ONCE per superblock
+// per warp (jt is fixed, so its rows never change across the loop) and
+// now serves all ItGroup iterations, not just one -- weight-side reuse,
+// which `KQuantGemmKWmmaQ6KShared` did not have either. `acc_f` grows to
+// `ItGroup` separate accumulators (three independent 16x16 output
+// tiles per warp, not one), which is the register-pressure cost this
+// design trades for the wider reuse.
+template <typename OutT, int WarpsPerBlock, int ItGroup>
+__global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                                          const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
+                                          int64_t nsb, int64_t n_tiles, int64_t m_tiles) {
+#if !defined(VT_ROCM_QUANT_WMMA_OK)
+  (void)out; (void)weight; (void)act; (void)m; (void)n; (void)nsb; (void)n_tiles; (void)m_tiles;
+  return;
+#else
+  (void)m;  // superseded by the precomputed m_tiles below
+  using namespace rocwmma;
+  const int64_t jt = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock +
+                     static_cast<int64_t>(threadIdx.y);
+  if (jt >= n_tiles) return;
+  const int64_t it_base = static_cast<int64_t>(blockIdx.y) * ItGroup;
+  const int64_t j0 = jt * 16;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int wy = static_cast<int>(threadIdx.y);
+  const int block_tid = wy * 32 + lane;
+
+  __shared__ int8_t w_stage[WarpsPerBlock][16][16][16];
+  __shared__ int32_t raw_tile[WarpsPerBlock][kGroupGemmBatch][16][16];
+  // ItGroup*16 rows, shared by the whole block (not per warp): every
+  // warp's ItGroup iterations read the SAME rows, regardless of `jt`.
+  __shared__ BlockQ8_K act_stage[ItGroup * 16];
+
+  const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ6_K);
+  const BlockQ6_K* w_row_base[16];
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    w_row_base[r] =
+        reinterpret_cast<const BlockQ6_K*>(weight + static_cast<size_t>(j0 + r) * row_stride);
+  }
+  const BlockQ8_K* a_row0 = act + it_base * 16 * nsb;
+
+  float acc_f[ItGroup][8];
+#pragma unroll
+  for (int g = 0; g < ItGroup; ++g)
+#pragma unroll
+    for (int c = 0; c < 8; ++c) acc_f[g][c] = 0.0f;
+
+  for (int64_t sb = 0; sb < nsb; ++sb) {
+    const BlockQ6_K* xb_cur[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) xb_cur[r] = w_row_base[r] + sb;
+
+    // Weight dequant: ONCE per superblock per warp, same as every other
+    // arm in this file -- and now shared across all ItGroup iterations
+    // below, not recomputed per iteration.
+    for (int t = lane; t < 16 * 16; t += 32) {
+      const int row = t / 16;
+      const int grp2 = t % 16;
+      DequantQ6KGroup16(xb_cur[row], grp2, w_stage[wy][grp2][row]);
+    }
+    // Cooperative activation stage: ItGroup*16 rows this time, same
+    // division-free-in-practice flat word loop as `...Shared` above.
+    {
+      constexpr int kWordsPerRow = static_cast<int>(sizeof(BlockQ8_K) / sizeof(int));
+      constexpr int kTotalWords = ItGroup * 16 * kWordsPerRow;
+      constexpr int kBlockThreads = WarpsPerBlock * 32;
+      auto* act_dst_i = reinterpret_cast<int*>(&act_stage[0]);
+      const auto* act_base_i = reinterpret_cast<const int*>(a_row0);
+      const int64_t words_per_global_row = static_cast<int64_t>(nsb) * kWordsPerRow;
+      for (int idx = block_tid; idx < kTotalWords; idx += kBlockThreads) {
+        const int row = idx / kWordsPerRow;
+        const int w = idx % kWordsPerRow;
+        act_dst_i[idx] = act_base_i[row * words_per_global_row + sb * kWordsPerRow + w];
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int it_i = 0; it_i < ItGroup; ++it_i) {
+      // Block-uniform: it_base and it_i are the same for every thread in
+      // the block, so every warp takes this branch identically -- safe
+      // around the __syncthreads() calls the batch loop below makes.
+      if (it_base + it_i >= m_tiles) continue;
+
+      int32_t isum[8];
+#pragma unroll
+      for (int c = 0; c < 8; ++c) isum[c] = 0;
+
+      for (int gb = 0; gb < 16; gb += kGroupGemmBatch) {
+#pragma unroll
+        for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+          const int grp = gb + gi;
+          fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+          fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
+          fragment<accumulator, 16, 16, 16, int32_t> acc;
+          fill_fragment(acc, 0);
+          const int8_t* a_ptr = act_stage[it_i * 16].qs + grp * 16;
+          const long a_ld = static_cast<long>(sizeof(BlockQ8_K));
+          load_matrix_sync(a_frag, a_ptr, a_ld);
+          load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
+          mma_sync(acc, a_frag, b_frag, acc);
+          store_matrix_sync(&raw_tile[wy][gi][0][0], acc, 16, mem_row_major);
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+          const int grp = gb + gi;
+#pragma unroll
+          for (int c = 0; c < 8; ++c) {
+            const int cell = lane + c * 32;
+            const int ii = cell / 16, jj = cell % 16;
+            isum[c] += raw_tile[wy][gi][ii][jj] * static_cast<int32_t>(xb_cur[jj]->scales[grp]);
+          }
+        }
+        __syncthreads();
+      }
+
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        const int cell = lane + c * 32;
+        const int ii = cell / 16, jj = cell % 16;
+        const float d = DF16ToF32(xb_cur[jj]->d) * act_stage[it_i * 16 + ii].d;
+        acc_f[it_i][c] += d * static_cast<float>(isum[c]);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int it_i = 0; it_i < ItGroup; ++it_i) {
+    if (it_base + it_i >= m_tiles) continue;
+    const int64_t i0 = (it_base + it_i) * 16;
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      const int cell = lane + c * 32;
+      const int ii = cell / 16, jj = cell % 16;
+      const int64_t oi = i0 + ii, oj = j0 + jj;
+      if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[it_i][c];
+      else out[oi * n + oj] = DF32ToBF16(acc_f[it_i][c]);
+    }
   }
 #endif  // VT_ROCM_QUANT_WMMA_OK
 }
@@ -799,6 +1127,297 @@ __global__ void KQuantGemmKWmmaQ4K(OutT* __restrict__ out, const uint8_t* __rest
     const int64_t oi = i0 + ii, oj = j0 + jj;
     if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[c];
     else out[oi * n + oj] = DF32ToBF16(acc_f[c]);
+  }
+#endif  // VT_ROCM_QUANT_WMMA_OK
+}
+
+// --- Cooperative-activation-share arm of KQuantGemmKWmmaQ4K (issue #3034).
+// Same mechanism as `KQuantGemmKWmmaQ6KShared` above: the shared `it`'s
+// BlockQ8_K bytes for the current superblock, staged once per block
+// instead of once per warp. Q4_K reads the shared copy in two places the
+// Q6_K arm does not: the min-correction's `bsums` read, and its own
+// `d`/`dmin` scale read — same fields, same values, different source.
+template <typename OutT, int WarpsPerBlock>
+__global__ void KQuantGemmKWmmaQ4KShared(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                                         const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
+                                         int64_t nsb, int64_t n_tiles) {
+#if !defined(VT_ROCM_QUANT_WMMA_OK)
+  (void)out; (void)weight; (void)act; (void)m; (void)n; (void)nsb; (void)n_tiles;
+  return;
+#else
+  using namespace rocwmma;
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock +
+                       static_cast<int64_t>(threadIdx.y);
+  const int64_t m_tiles = m / 16;
+  if (tile >= m_tiles * n_tiles) return;
+  const int64_t it = tile / n_tiles;
+  const int64_t jt = tile % n_tiles;
+  const int64_t i0 = it * 16;
+  const int64_t j0 = jt * 16;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int wy = static_cast<int>(threadIdx.y);
+  const int block_tid = wy * 32 + lane;
+
+  __shared__ int8_t w_stage[WarpsPerBlock][16][16][16];
+  __shared__ int32_t raw_tile[WarpsPerBlock][kGroupGemmBatch][16][16];
+  __shared__ uint8_t row_scales[WarpsPerBlock][16][8];
+  __shared__ uint8_t row_mins[WarpsPerBlock][16][8];
+  // ONE shared copy of the current superblock's 16 activation rows, for
+  // the whole block; see `KQuantGemmKWmmaQ6KShared`'s own comment.
+  __shared__ BlockQ8_K act_stage[16];
+
+  const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ4_K);
+  const BlockQ4_K* w_row_base[16];
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    w_row_base[r] =
+        reinterpret_cast<const BlockQ4_K*>(weight + static_cast<size_t>(j0 + r) * row_stride);
+  }
+  const BlockQ8_K* a_row0 = act + i0 * nsb;
+
+  float acc_f[8];
+#pragma unroll
+  for (int c = 0; c < 8; ++c) acc_f[c] = 0.0f;
+
+  for (int64_t sb = 0; sb < nsb; ++sb) {
+    const BlockQ4_K* xb_cur[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) xb_cur[r] = w_row_base[r] + sb;
+
+    if (lane < 16) UnpackQ4KScalesMins(xb_cur[lane], row_scales[wy][lane], row_mins[wy][lane]);
+
+    int32_t isum[8];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) isum[c] = 0;
+
+    for (int t = lane; t < 16 * 16; t += 32) {
+      const int row = t / 16;
+      const int tile16 = t % 16;
+      DequantQ4KTile16(xb_cur[row], tile16, w_stage[wy][tile16][row]);
+    }
+    {
+      // Word-sized (int) copy, one FLAT loop over all 1168 words so every
+      // one of WarpsPerBlock*32 threads is active on every iteration
+      // (~4.6 iterations/thread at 8 warps). The first cut split this into
+      // an outer per-row loop, which only kept ~73 of 256 threads busy per
+      // row and measured barely better than a naive byte-at-a-time copy
+      // (see issue #3034's own result table) -- the division this
+      // rewrite still does (`idx / kWordsPerRow`) is by the compile-time
+      // constant 73, which the compiler lowers to a multiply-shift
+      // sequence, not a genuine divide; the earlier version's real cost
+      // was under-parallelized threads, not the division it removed.
+      constexpr int kWordsPerRow = static_cast<int>(sizeof(BlockQ8_K) / sizeof(int));
+      constexpr int kTotalWords = 16 * kWordsPerRow;
+      constexpr int kBlockThreads = WarpsPerBlock * 32;
+      auto* act_dst_i = reinterpret_cast<int*>(&act_stage[0]);
+      const auto* act_base_i = reinterpret_cast<const int*>(a_row0);
+      const int64_t words_per_global_row = static_cast<int64_t>(nsb) * kWordsPerRow;
+      for (int idx = block_tid; idx < kTotalWords; idx += kBlockThreads) {
+        const int row = idx / kWordsPerRow;
+        const int w = idx % kWordsPerRow;
+        act_dst_i[idx] = act_base_i[row * words_per_global_row + sb * kWordsPerRow + w];
+      }
+    }
+    __syncthreads();
+
+    for (int gb = 0; gb < 16; gb += kGroupGemmBatch) {
+      const int qsb = gb / kGroupGemmBatch;  // one Q4_K sub-block of 32 (see header note)
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+        const int grp = gb + gi;
+        fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+        fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
+        fragment<accumulator, 16, 16, 16, int32_t> acc;
+        fill_fragment(acc, 0);
+        const int8_t* a_ptr = act_stage[0].qs + grp * 16;
+        const long a_ld = static_cast<long>(sizeof(BlockQ8_K));
+        load_matrix_sync(a_frag, a_ptr, a_ld);
+        load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
+        mma_sync(acc, a_frag, b_frag, acc);
+        store_matrix_sync(&raw_tile[wy][gi][0][0], acc, 16, mem_row_major);
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          const int cell = lane + c * 32;
+          const int ii = cell / 16, jj = cell % 16;
+          isum[c] += raw_tile[wy][gi][ii][jj] * static_cast<int32_t>(row_scales[wy][jj][qsb]);
+        }
+      }
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      const int cell = lane + c * 32;
+      const int ii = cell / 16, jj = cell % 16;
+      int32_t sumi = 0;
+#pragma unroll
+      for (int g = 0; g < 16; ++g) {
+        sumi += static_cast<int32_t>(act_stage[ii].bsums[g]) *
+                static_cast<int32_t>(row_mins[wy][jj][g / 2]);
+      }
+      const float d = DF16ToF32(xb_cur[jj]->d) * act_stage[ii].d;
+      const float dmin = DF16ToF32(xb_cur[jj]->dmin) * act_stage[ii].d;
+      acc_f[c] += d * static_cast<float>(isum[c]) - dmin * static_cast<float>(sumi);
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < 8; ++c) {
+    const int cell = lane + c * 32;
+    const int ii = cell / 16, jj = cell % 16;
+    const int64_t oi = i0 + ii, oj = j0 + jj;
+    if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[c];
+    else out[oi * n + oj] = DF32ToBF16(acc_f[c]);
+  }
+#endif  // VT_ROCM_QUANT_WMMA_OK
+}
+
+// --- Bigger-cooperative-tile arm of KQuantGemmKWmmaQ4K (issue #3034, second
+// cut). Same mechanism as `KQuantGemmKWmmaQ6KBigTile` above -- see its own
+// comment for why ItGroup=3 (48 activation rows) rather than llama.cpp's
+// full 128. `row_scales`/`row_mins` are weight-side (keyed on the fixed
+// `jt`, not on `it`), so like the weight dequant fill they are computed
+// ONCE per superblock and reused across all ItGroup iterations, the same
+// reuse `KQuantGemmKWmmaQ4KShared` did not have either.
+template <typename OutT, int WarpsPerBlock, int ItGroup>
+__global__ void KQuantGemmKWmmaQ4KBigTile(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                                          const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
+                                          int64_t nsb, int64_t n_tiles, int64_t m_tiles) {
+#if !defined(VT_ROCM_QUANT_WMMA_OK)
+  (void)out; (void)weight; (void)act; (void)m; (void)n; (void)nsb; (void)n_tiles; (void)m_tiles;
+  return;
+#else
+  (void)m;  // superseded by the precomputed m_tiles below
+  using namespace rocwmma;
+  const int64_t jt = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock +
+                     static_cast<int64_t>(threadIdx.y);
+  if (jt >= n_tiles) return;
+  const int64_t it_base = static_cast<int64_t>(blockIdx.y) * ItGroup;
+  const int64_t j0 = jt * 16;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int wy = static_cast<int>(threadIdx.y);
+  const int block_tid = wy * 32 + lane;
+
+  __shared__ int8_t w_stage[WarpsPerBlock][16][16][16];
+  __shared__ int32_t raw_tile[WarpsPerBlock][kGroupGemmBatch][16][16];
+  __shared__ uint8_t row_scales[WarpsPerBlock][16][8];
+  __shared__ uint8_t row_mins[WarpsPerBlock][16][8];
+  __shared__ BlockQ8_K act_stage[ItGroup * 16];
+
+  const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ4_K);
+  const BlockQ4_K* w_row_base[16];
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    w_row_base[r] =
+        reinterpret_cast<const BlockQ4_K*>(weight + static_cast<size_t>(j0 + r) * row_stride);
+  }
+  const BlockQ8_K* a_row0 = act + it_base * 16 * nsb;
+
+  float acc_f[ItGroup][8];
+#pragma unroll
+  for (int g = 0; g < ItGroup; ++g)
+#pragma unroll
+    for (int c = 0; c < 8; ++c) acc_f[g][c] = 0.0f;
+
+  for (int64_t sb = 0; sb < nsb; ++sb) {
+    const BlockQ4_K* xb_cur[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) xb_cur[r] = w_row_base[r] + sb;
+
+    if (lane < 16) UnpackQ4KScalesMins(xb_cur[lane], row_scales[wy][lane], row_mins[wy][lane]);
+
+    for (int t = lane; t < 16 * 16; t += 32) {
+      const int row = t / 16;
+      const int tile16 = t % 16;
+      DequantQ4KTile16(xb_cur[row], tile16, w_stage[wy][tile16][row]);
+    }
+    {
+      constexpr int kWordsPerRow = static_cast<int>(sizeof(BlockQ8_K) / sizeof(int));
+      constexpr int kTotalWords = ItGroup * 16 * kWordsPerRow;
+      constexpr int kBlockThreads = WarpsPerBlock * 32;
+      auto* act_dst_i = reinterpret_cast<int*>(&act_stage[0]);
+      const auto* act_base_i = reinterpret_cast<const int*>(a_row0);
+      const int64_t words_per_global_row = static_cast<int64_t>(nsb) * kWordsPerRow;
+      for (int idx = block_tid; idx < kTotalWords; idx += kBlockThreads) {
+        const int row = idx / kWordsPerRow;
+        const int w = idx % kWordsPerRow;
+        act_dst_i[idx] = act_base_i[row * words_per_global_row + sb * kWordsPerRow + w];
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int it_i = 0; it_i < ItGroup; ++it_i) {
+      if (it_base + it_i >= m_tiles) continue;
+
+      int32_t isum[8];
+#pragma unroll
+      for (int c = 0; c < 8; ++c) isum[c] = 0;
+
+      for (int gb = 0; gb < 16; gb += kGroupGemmBatch) {
+        const int qsb = gb / kGroupGemmBatch;
+#pragma unroll
+        for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+          const int grp = gb + gi;
+          fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+          fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
+          fragment<accumulator, 16, 16, 16, int32_t> acc;
+          fill_fragment(acc, 0);
+          const int8_t* a_ptr = act_stage[it_i * 16].qs + grp * 16;
+          const long a_ld = static_cast<long>(sizeof(BlockQ8_K));
+          load_matrix_sync(a_frag, a_ptr, a_ld);
+          load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
+          mma_sync(acc, a_frag, b_frag, acc);
+          store_matrix_sync(&raw_tile[wy][gi][0][0], acc, 16, mem_row_major);
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+#pragma unroll
+          for (int c = 0; c < 8; ++c) {
+            const int cell = lane + c * 32;
+            const int ii = cell / 16, jj = cell % 16;
+            isum[c] += raw_tile[wy][gi][ii][jj] * static_cast<int32_t>(row_scales[wy][jj][qsb]);
+          }
+        }
+        __syncthreads();
+      }
+
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        const int cell = lane + c * 32;
+        const int ii = cell / 16, jj = cell % 16;
+        int32_t sumi = 0;
+#pragma unroll
+        for (int g = 0; g < 16; ++g) {
+          sumi += static_cast<int32_t>(act_stage[it_i * 16 + ii].bsums[g]) *
+                  static_cast<int32_t>(row_mins[wy][jj][g / 2]);
+        }
+        const float d = DF16ToF32(xb_cur[jj]->d) * act_stage[it_i * 16 + ii].d;
+        const float dmin = DF16ToF32(xb_cur[jj]->dmin) * act_stage[it_i * 16 + ii].d;
+        acc_f[it_i][c] += d * static_cast<float>(isum[c]) - dmin * static_cast<float>(sumi);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int it_i = 0; it_i < ItGroup; ++it_i) {
+    if (it_base + it_i >= m_tiles) continue;
+    const int64_t i0 = (it_base + it_i) * 16;
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      const int cell = lane + c * 32;
+      const int ii = cell / 16, jj = cell % 16;
+      const int64_t oi = i0 + ii, oj = j0 + jj;
+      if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[it_i][c];
+      else out[oi * n + oj] = DF32ToBF16(acc_f[it_i][c]);
+    }
   }
 #endif  // VT_ROCM_QUANT_WMMA_OK
 }
@@ -1246,6 +1865,19 @@ std::atomic<uint64_t> g_kq_wmma_dispatches{0};
 // site is reached independently, not infer Q4_K's from Q6_K's.
 std::atomic<uint64_t> g_kq_wmma_q4k_dispatches{0};
 
+// Per-variant witnesses (issue #3034): g_kq_wmma_dispatches/q4k above
+// increment for EVERY internal variant (plain, wide, Shared, BigTile)
+// alike, so they cannot prove any ONE of those variants specifically ran
+// -- and did not, for either format's existing WMMA test case (N=48,
+// n_tiles=3, never a multiple of WarpsPerBlock=8, so both fall back to
+// the plain kernel silently). These four exist so a test can prove the
+// SPECIFIC internal kernel it means to exercise actually launched, not
+// infer it from shapes alone.
+std::atomic<uint64_t> g_kq_wmma_share_dispatches{0};
+std::atomic<uint64_t> g_kq_wmma_share_q4k_dispatches{0};
+std::atomic<uint64_t> g_kq_wmma_bigtile_dispatches{0};
+std::atomic<uint64_t> g_kq_wmma_bigtile_q4k_dispatches{0};
+
 // VT_ROCM_QUANT_WMMA=0 forces the scalar arm even on gfx1200/gfx1201 — the
 // A/B escape hatch every WMMA arm in this tree ships with
 // (VT_ATTN_PREFILL_SHAREDK_WMMA is the paged-attention precedent). Default
@@ -1298,6 +1930,34 @@ bool QuantWmmaWideBlockEnabled() {
   return on;
 }
 
+// VT_ROCM_QUANT_WMMA_SHARE_ACT=1 — the A/B arm for issue #3034. Always
+// paired with the 8-warp block (`kQuantWmmaWideWarpsPerBlock`): the
+// cooperative activation staging this enables only has redundancy to
+// remove because 8 warps in one block already share the same `it`.
+// Default OFF until `examples/quant-gemm-bench` says whether sharing
+// closes any of the gap the wider-block-alone experiment could not.
+bool QuantWmmaShareActEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_ROCM_QUANT_WMMA_SHARE_ACT");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
+// VT_ROCM_QUANT_WMMA_BIGTILE=1 — the A/B arm for issue #3034's second cut
+// (`KQuantGemmKWmmaQ6KBigTile`/`Q4KBigTile`, `kQuantWmmaBigTileItGroup`
+// activation-row groups reused per staged load instead of 1). Mutually
+// exclusive with `VT_ROCM_QUANT_WMMA_SHARE_ACT` at the call site below --
+// this is a different grid/loop shape, not an addition to it. Default
+// OFF pending `examples/quant-gemm-bench`.
+bool QuantWmmaBigTileEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
 }  // namespace
 
 // Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects
@@ -1334,6 +1994,22 @@ uint64_t KQuantWmmaDispatchCount() {
 
 uint64_t KQuantWmmaQ4KDispatchCount() {
   return g_kq_wmma_q4k_dispatches.load(std::memory_order_relaxed);
+}
+
+uint64_t KQuantWmmaShareDispatchCount() {
+  return g_kq_wmma_share_dispatches.load(std::memory_order_relaxed);
+}
+
+uint64_t KQuantWmmaShareQ4KDispatchCount() {
+  return g_kq_wmma_share_q4k_dispatches.load(std::memory_order_relaxed);
+}
+
+uint64_t KQuantWmmaBigTileDispatchCount() {
+  return g_kq_wmma_bigtile_dispatches.load(std::memory_order_relaxed);
+}
+
+uint64_t KQuantWmmaBigTileQ4KDispatchCount() {
+  return g_kq_wmma_bigtile_q4k_dispatches.load(std::memory_order_relaxed);
 }
 
 void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
@@ -1447,7 +2123,38 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
         const int wpb = QuantWmmaWideBlockEnabled() ? kQuantWmmaWideWarpsPerBlock
                                                     : kQuantWmmaWarpsPerBlock;
         const int64_t grid_wmma = (m_tiles * n_tiles + wpb - 1) / wpb;
-        if (wpb == kQuantWmmaWideWarpsPerBlock) {
+        // Cooperative activation share (issue #3034) needs every warp in a
+        // block to land on the same `it`, which only holds when `n_tiles`
+        // is an exact multiple of `wpb` -- see the Shared kernel's own
+        // comment. A shape that does not divide evenly falls back to the
+        // plain (correct, unshared) kernel rather than staging the wrong
+        // rows for a block that straddles an `it` boundary.
+        if (wpb == kQuantWmmaWideWarpsPerBlock && QuantWmmaBigTileEnabled() &&
+            n_tiles % wpb == 0) {
+          // BigTile's grid is 2D and its jt dimension is sized EXACTLY to
+          // n_tiles/wpb (no remainder block) -- the same precondition
+          // Shared uses, and for the same reason: a warp whose jt would
+          // fall outside n_tiles must never exist in a launched block,
+          // because its early `return` would desync the block's later
+          // __syncthreads() calls from warps that keep running. The `it`
+          // (M) direction needs no such precondition: its raggedness is
+          // handled by a block-uniform `continue` inside the loop, not a
+          // per-warp early return.
+          g_kq_wmma_bigtile_dispatches.fetch_add(1, std::memory_order_relaxed);
+          const int64_t grid_x = n_tiles / kQuantWmmaWideWarpsPerBlock;
+          const int64_t grid_y =
+              (m_tiles + kQuantWmmaBigTileItGroup - 1) / kQuantWmmaBigTileItGroup;
+          KQuantGemmKWmmaQ6KBigTile<OutT, kQuantWmmaWideWarpsPerBlock, kQuantWmmaBigTileItGroup>
+              <<<dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y)),
+                 dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
+                  o, w, qact, m, n, nsb, n_tiles, m_tiles);
+        } else if (wpb == kQuantWmmaWideWarpsPerBlock && QuantWmmaShareActEnabled() &&
+            n_tiles % wpb == 0) {
+          g_kq_wmma_share_dispatches.fetch_add(1, std::memory_order_relaxed);
+          KQuantGemmKWmmaQ6KShared<OutT, kQuantWmmaWideWarpsPerBlock>
+              <<<static_cast<unsigned>(grid_wmma), dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
+                  o, w, qact, m, n, nsb, n_tiles);
+        } else if (wpb == kQuantWmmaWideWarpsPerBlock) {
           KQuantGemmKWmmaQ6K<OutT, kQuantWmmaWideWarpsPerBlock>
               <<<static_cast<unsigned>(grid_wmma), dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
                   o, w, qact, m, n, nsb, n_tiles);
@@ -1476,7 +2183,23 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
         const int wpb = QuantWmmaWideBlockEnabled() ? kQuantWmmaWideWarpsPerBlock
                                                     : kQuantWmmaWarpsPerBlock;
         const int64_t grid_wmma = (m_tiles * n_tiles + wpb - 1) / wpb;
-        if (wpb == kQuantWmmaWideWarpsPerBlock) {
+        if (wpb == kQuantWmmaWideWarpsPerBlock && QuantWmmaBigTileEnabled() &&
+            n_tiles % wpb == 0) {
+          g_kq_wmma_bigtile_q4k_dispatches.fetch_add(1, std::memory_order_relaxed);
+          const int64_t grid_x = n_tiles / kQuantWmmaWideWarpsPerBlock;
+          const int64_t grid_y =
+              (m_tiles + kQuantWmmaBigTileItGroup - 1) / kQuantWmmaBigTileItGroup;
+          KQuantGemmKWmmaQ4KBigTile<OutT, kQuantWmmaWideWarpsPerBlock, kQuantWmmaBigTileItGroup>
+              <<<dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y)),
+                 dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
+                  o, w, qact, m, n, nsb, n_tiles, m_tiles);
+        } else if (wpb == kQuantWmmaWideWarpsPerBlock && QuantWmmaShareActEnabled() &&
+            n_tiles % wpb == 0) {
+          g_kq_wmma_share_q4k_dispatches.fetch_add(1, std::memory_order_relaxed);
+          KQuantGemmKWmmaQ4KShared<OutT, kQuantWmmaWideWarpsPerBlock>
+              <<<static_cast<unsigned>(grid_wmma), dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
+                  o, w, qact, m, n, nsb, n_tiles);
+        } else if (wpb == kQuantWmmaWideWarpsPerBlock) {
           KQuantGemmKWmmaQ4K<OutT, kQuantWmmaWideWarpsPerBlock>
               <<<static_cast<unsigned>(grid_wmma), dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
                   o, w, qact, m, n, nsb, n_tiles);

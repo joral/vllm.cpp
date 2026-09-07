@@ -338,6 +338,23 @@ recorded, not assumed.
   the block-width experiment, and is the next traceable step — not attempted
   in this row.
 
+  **UPDATE: partially done.** `KQuantGemmKWmmaQ6KBigTile`/`Q4KBigTile`
+  (below) implement exactly this at `ItGroup=3` (48 rows) instead of
+  llama.cpp's 128, measured a real +16.8% geomean / -14% real-model win,
+  and are correctness-verified. The scope was deliberately narrower than
+  full parity: this row's kernels still stage one full 256-wide
+  superblock at a time for BOTH operands, where llama.cpp stages 32
+  (weight) and 128 (activation) K-elements at a time (confirmed by
+  reading `ggml_cuda_mmq_get_nbytes_shared_x`, `mmq.cuh:415-419`, and
+  `ggml_cuda_mmq_get_sram_stride`, `mmq.cuh:132-153` — not a smaller
+  encoding, nearly identical bytes/element, just a narrower chunk staged
+  more often). Finer K-chunking on our side — the next traceable step —
+  would shrink both operands' per-load footprint and could afford a much
+  wider `ItGroup` (closer to llama.cpp's 8) within the same 64 KiB
+  budget, at the cost of more frequent, smaller syncs; this is a bigger
+  change than BigTile was (it touches the weight-side staging every wave
+  of this row has left untouched) and is not attempted here.
+
 ## Stop conditions
 
 - `NEEDS_DECISION`: any request to extend this row's scope to gfx1100 or
@@ -666,3 +683,185 @@ sharper, still-open hypothesis this measurement points at — cross-warp data
 reuse llama.cpp's kernel may have that this one's per-warp-independent
 design does not — is recorded in `## Owed` above, unread and unconfirmed,
 not assumed.
+
+**Cooperative activation share (issue #3034): MEASURED AND REJECTED, and
+worse than the wider-block-alone result above.** Implemented
+`KQuantGemmKWmmaQ6KShared`/`KQuantGemmKWmmaQ4KShared` per the `## Design:
+cooperative activation share` section: the 8-warp block cooperatively
+stages the shared `it`'s 16-row `BlockQ8_K` bytes into shared memory once
+per superblock, gated on `n_tiles % 8 == 0` (falls back to the plain
+per-warp kernel otherwise) behind `VT_ROCM_QUANT_WMMA_SHARE_ACT=1`
+(default off). Hardware-verified correct: `ctest -R rocm|cross_device`,
+46/46 cases, 84066/84066 assertions, zero regression, both configs.
+
+Two copy implementations were tried, in order, because the first one's
+result was ambiguous enough to check rather than trust:
+
+1. A byte-at-a-time copy computing `row = byte / sizeof(BlockQ8_K)` per
+   byte. Best-of-4 geomean across the six shapes: -18.7% vs the plain
+   8-warp arm.
+2. Suspecting the per-byte division, rewrote as an outer loop over the 16
+   rows (unrolled) with an inner word-sized (`int`, `sizeof(BlockQ8_K)` is
+   exactly 73 words) copy, division-free. Barely moved: -10.9% vs the
+   plain 8-warp arm, because the real cost of that version was ~73-of-256
+   threads active per row-step, not the division it removed.
+3. Rewrote again as ONE flat loop over all 1168 words (16 rows'
+   worth), keeping every thread active every iteration: still `idx /
+   kWordsPerRow` and `idx % kWordsPerRow`, but by the compile-time
+   constant 73, which the compiler lowers to a multiply-shift rather than
+   a genuine divide.
+
+Op-level A/B (`examples/quant-gemm-bench`, RX 9060 XT, best-of-4, idle
+host), version 3 (the fully-parallel, division-by-constant copy) against
+both prior arms:
+
+| Shape | 4-warp default | 8-warp, no share (#3033) | 8-warp + share |
+|---|---:|---:|---:|
+| Q4_K N=3072 K=2048 | 1964.7 | 1830.4 | 1620.4 |
+| Q4_K N=12288 K=2048 | 2247.0 | 2015.4 | 1772.8 |
+| Q4_K N=2048 K=6144 | 1949.9 | 1953.9 | 1726.3 |
+| Q6_K N=3072 K=2048 | 1883.1 | 1769.0 | 1564.8 |
+| Q6_K N=12288 K=2048 | 2174.1 | 1973.3 | 1757.0 |
+| Q6_K N=2048 K=6144 | 1876.8 | 1930.1 | 1704.4 |
+
+Geomean: -16.0% vs the 4-warp default, **-11.5% vs the already-rejected
+8-warp-no-share arm** — sharing did not just fail to help, it cost more
+than the 8-warp width regression by itself. The result held essentially
+unchanged (within noise) across all three copy implementations once the
+worst inefficiency was fixed, which is itself evidence: this is not a
+copy-implementation artifact, it is the cost of the cooperative-staging
+mechanism itself (the extra shared-memory round trip and its
+`__syncthreads()`, once per superblock, `nsb` times per kernel call)
+outweighing whatever redundant-global-read cost it removes.
+
+**What this settles and what it does not.** The confirmed redundancy
+(every warp in a block independently re-reading the same activation rows)
+is real and traced precisely in `## Owed` above — but removing it this
+way costs more than it saves, which is itself evidence that those
+redundant reads were likely already well-served by cache (this card's
+Infinity Cache) rather than costing real DRAM bandwidth. Two of the three
+axes this row has now measured (block width, activation sharing) are
+closed as net negatives. `VT_ROCM_QUANT_WMMA_SHARE_ACT` stays in the tree,
+default off, for the same reason `VT_ROCM_QUANT_WMMA_WIDE` does: a
+ready-made, already-correct A/B for different hardware or a future
+toolchain, not an open question to re-litigate here. The remaining
+untested hypothesis is llama.cpp's own per-kernel efficiency at the
+instruction/ISA level (WMMA throughput, register allocation, shared-memory
+bank-conflict patterns in its actual generated code) rather than tiling or
+data reuse — not confirmed, not assumed, the next traceable step if this
+row continues.
+
+**Test-coverage gap found and fixed.** Both this row's existing WMMA
+correctness tests ("keep-quant Q6_K/Q4_K WMMA tile arm...") use N=48
+(`n_tiles=3`), which never satisfies `n_tiles % WarpsPerBlock(8) == 0` --
+the precondition Shared (and BigTile, below) both require. Every "green"
+result reported for Shared above was real (the assertions did pass), but
+the kernel under test was silently the plain fallback, not Shared itself,
+because the existing tests structurally never reach it. Added
+per-variant dispatch counters (`g_kq_wmma_share_dispatches`/
+`_share_q4k_`/`_bigtile_`/`_bigtile_q4k_`, distinct from the generic ones
+the old tests use, which cannot tell variants apart) and two new test
+cases at N=128/M=80 (n_tiles=8 satisfies the precondition; m_tiles=5 is
+deliberately not a multiple of ItGroup=3, exercising BigTile's ragged
+last-block skip) that prove the SPECIFIC kernel launched via
+`CHECK(after > before)` on its own counter, not inferred from shapes.
+Re-ran Shared under this real test: still correct (NMSE clean), so its
+rejection above stands on genuine evidence, just not the evidence
+originally cited for it.
+
+**ISA-level check (the ratified next step above): CONFIRMED to rule out
+register allocation, not to explain the gap.** Read the actual compiled
+GCN assembly on both sides (`-save-temps` for ours; llama.cpp's own
+`.so` unbundled per-`ggml_type` via `clang-offload-bundler` and read
+through `llvm-readobj --notes` for the AMDGPU kernel metadata) rather
+than inferring from source:
+
+| Kernel | VGPRs | Spill |
+|---|---:|---|
+| Ours `KQuantGemmKWmmaQ4K` (shipping default) | 192 | 60 B, one-time setup/epilogue only (traced: outside the per-superblock loop, not a recurring cost) |
+| Ours `KQuantGemmKWmmaQ6K` (shipping default) | 142 | none |
+| llama.cpp `mul_mat_q<Q4_K, I=128, J=128>` | 247 | none |
+| llama.cpp `mul_mat_q<Q6_K, I=128, J=128>` | 202 | none |
+
+llama.cpp uses MORE registers than us in both formats and still wins by a
+wide margin -- ruling out "fewer registers, more occupancy" as their
+advantage. Our one real spill is confirmed cosmetic (one-time, not
+per-iteration). This corroborates the structural (tile-size/reuse) story
+rather than pointing at a codegen defect on either side.
+
+**BigTile (second cut, issue #3034): MEASURED AND ACCEPTED.** Reading
+llama.cpp's actual shared-memory formula
+(`ggml_cuda_mmq_get_nbytes_shared_x`, `mmq.cuh:415-419`) resolved why its
+128x128 tile fits this card's 64 KiB LDS budget when a naive scale-up of
+our own approach does not (86.5 KiB, see the Shared section above): it is
+NOT a smaller encoding -- their `block_q8_1_mmq` (144 B / 128 K-elements
+~= 1.125 B/element) and our `BlockQ8_K` (292 B / 256 K-elements ~= 1.14
+B/element) have essentially identical density. The difference is
+granularity: their weight tile stages only `MMQ_TILE_NE_K=32`
+K-elements/row at a time (`mmq.cuh:132-136`) and their activation tile
+stages only 128 K-elements/row at a time, against our 256-wide
+superblock-at-once staging for both operands -- computed exactly for
+I=128/J=128/Q4_K: `nbs_x` (38.9 KiB) + `nbs_y` (18.0 KiB, padded) +
+`nbs_ids` (0.5 KiB) = 56.5 KiB, comfortably under budget with 7.5 KiB to
+spare. They pay the staging/sync cost up to 8x more often per unit of K
+depth than we do, in exchange for a peak footprint small enough to afford
+a much wider tile.
+
+Implemented `KQuantGemmKWmmaQ6KBigTile`/`Q4KBigTile<OutT, WarpsPerBlock,
+ItGroup>`, keeping this row's existing 256-wide superblock staging
+granularity (unlike llama.cpp, not chunked finer -- see `## Owed`) and
+choosing the largest `ItGroup` (activation-row groups reused per staged
+load) that still fits: `ItGroup=3` (48 rows, ~14 KiB) alongside the
+existing ~50 KiB per-warp weight-side footprint at 8 warps. Grid is 2D
+(`blockIdx.x` gives each warp a fixed `jt`, matching the existing design;
+`blockIdx.y` gives the whole block a shared `it_base` spanning `ItGroup`
+groups, looped inside each warp) rather than the previous flat 1D `tile`
+encoding, because a 2D grid needs no `n_tiles % WarpsPerBlock == 0`
+precondition on its OWN axis-mixing (removed for the `it`/M direction;
+kept for `jt`/N, because a warp whose `jt` falls outside `n_tiles` must
+never exist in a launched block -- its early `return` would desync the
+block's later `__syncthreads()` calls from warps that keep running).
+Weight dequant (and, for Q4_K, `UnpackQ4KScalesMins`) now execute ONCE
+per superblock per warp and serve all `ItGroup` iterations, not just
+one -- weight-side reuse Shared did not have either.
+
+Hardware-verified correct via the new dedicated tests above (not the
+stale N=48 ones): `ctest -R rocm|cross_device`, 48/48 cases, 84084/84084
+assertions, zero regression, both configs.
+
+Op-level A/B (`examples/quant-gemm-bench`, RX 9060 XT, best-of-4, idle
+host), BigTile vs the shipping 4-warp default:
+
+| Shape | Default | BigTile | ratio |
+|---|---:|---:|---:|
+| Q4_K N=3072 K=2048 | 1964.7 | 1996.6 | +1.6% |
+| Q4_K N=12288 K=2048 | 2247.0 | 2766.2 | +23.1% |
+| Q4_K N=2048 K=6144 | 1949.9 | 2377.6 | +21.9% |
+| Q6_K N=3072 K=2048 | 1883.1 | 2158.0 | +14.6% |
+| Q6_K N=12288 K=2048 | 2174.1 | 2775.2 | +27.6% |
+| Q6_K N=2048 K=6144 | 1876.8 | 2130.9 | +13.5% |
+
+Geomean **+16.8%**, and +22.9%/+38.9% against the two rejected arms
+(wider-block-alone, activation-share-alone) respectively -- consistent
+with the diagnosis that neither axis alone cleared the staging cost, and
+this row's own ragged "tail" shape (M=132, not 16-aligned) shows the same
+order of improvement (+19.1%/+19.9%), so this is not an artifact of
+perfectly-aligned synthetic shapes.
+
+**Real-model confirmation**, same isolated-prefill recipe as gate (c)
+above (`Ornith-1.5-9B-Q4_K_M.gguf`, 512-token prompt, `rocprofv3`,
+isravale, idle, 3 reps):
+
+| | Default (4-warp) | BigTile | ratio |
+|---|---:|---:|---:|
+| Prefill total kernel time (whole forward pass) | 3012.9 ms | 2590.9 ms | -14.0% |
+| ...vs oracle pp512 (274.3 ms) | 10.98x slower | 9.45x slower | |
+| Quant-GEMM kernels only (Q4_K+Q6_K) | 1982.7 ms | 1552.0 ms | -21.7% |
+| ...vs llama.cpp `mul_mat_q` (222.3 ms) | 8.92x slower | 6.98x slower | |
+
+The synthetic op-level win survives contact with the real checkpoint,
+diluted by the other kernels in the forward pass (`GdnScanK`, attention,
+the dense bf16 GEMM) exactly as expected -- not inflated, not an
+artifact. Still default OFF behind `VT_ROCM_QUANT_WMMA_WIDE=1
+VT_ROCM_QUANT_WMMA_BIGTILE=1`; whether to flip the default is a decision
+for after review, not made in this wave.
