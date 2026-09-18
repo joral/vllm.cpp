@@ -186,6 +186,11 @@ vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 # VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads `Conv1dTimeBlock` so
 # it asserts the geometry it claims. Same reach as test_vocoder1d.
 target_include_directories(test_minimax_h3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ROAD-V1-DIT-LORA: H3-specific contract name rewriting (model.diffusion_model.
+# prefix) and load-time fusion through the shared dit_lora seam.
+vllm_cpp_add_test(test_h3_lora vllm/models/test_h3_lora.cpp)
+# ROAD-V1-LORA-RUNTIME: prompt tag parsing and name resolution for runtime LoRA.
+vllm_cpp_add_test(test_dit_runtime_lora vllm/models/test_dit_runtime_lora.cpp)
 # MiniMax-Music3 W1 (#672): the six-component diffusers-arm loader, gated against
 # the REAL checkpoint's headers (minimax_music3_manifest.inc, 1012 tensors, no
 # weight bytes) so CI never needs the 28.5 GB asset.
@@ -783,6 +788,20 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
 target_include_directories(test_deepseek_v4_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# DeepSeek-V4.1-Flash (DeepseekV41ForCausalLM) W1 scaffolding gate: the arch
+# RESOLVES through the registry, the REAL published config.json descends and
+# validates through ParseDeepseekV41Params (nested text_config/vision_config ->
+# flat, the vision_* lift and the expert_dtype lift out of quantization_config),
+# and every unimplemented arm -- load, forward, KV-cache spec and the GGUF
+# `deepseek41` container -- refuses BY NAME. No checkpoint / GPU: W1 claims no
+# load and no forward (.agents/specs/deepseek-v4-1-flash.md `## Work breakdown`).
+vllm_cpp_add_test(test_deepseek_v4_1_scaffold vllm/models/test_deepseek_v4_1_scaffold.cpp)
+target_compile_definitions(test_deepseek_v4_1_scaffold PRIVATE
+  DEEPSEEK_V4_1_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/deepseek_v4_1")
+target_include_directories(test_deepseek_v4_1_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# `gguf_builder.h` is the shared in-memory GGUF fixture builder under tests/vllm.
+target_include_directories(test_deepseek_v4_1_scaffold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
+
 # DeepSeek-V4-Pro shape-generality gate (#504): the Pro config descends through
 # the SAME ParseDeepseekV4Params with zero new keys, and compress_ratios alone
 # reproduces the compressor/indexer layer counts of BOTH real checkpoints
@@ -886,6 +905,13 @@ target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # kernels match the references. NOT a real-checkpoint token gate (W8, multi-Spark).
 vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 target_include_directories(test_cuda_deepseek_v4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# O34: the ROCm/HIP arm of the DeepSeek-V4 MHC device-kernel family. A 1:1 mirror
+# of the CUDA MHC cases above, run against the ROCm provider registered in
+# rocm_deepseek_v4.hip. The device cases SKIP on a build without a ROCm backend
+# (exit 77 — "assertions: 0 ... SUCCESS!" is not a pass, tests/CMakeLists.txt:30-38).
+vllm_cpp_add_test(test_rocm_deepseek_v4_mhc vt/test_rocm_deepseek_v4_mhc.cpp)
+target_include_directories(test_rocm_deepseek_v4_mhc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_rocm_deepseek_v4_mhc PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
@@ -2671,6 +2697,13 @@ set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
 # AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
 vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+# The pure half of the ROCm pinned H2D bounce ring (chunk plan, cross-call slot
+# reuse, the five-term predicate). UNCONDITIONAL for exactly the reason
+# test_rocm_arch is: include/vt/rocm/rocm_pinned_h2d.h carries no HIP header, and
+# a ring that silently never engages produces identical bytes -- only the host
+# residency differs -- so the decision has to be gated on a runner with no AMD
+# GPU. The reachability half is in test_backend_cross_device.
+vllm_cpp_add_test(test_rocm_pinned_h2d vt/test_rocm_pinned_h2d.cpp)
 vllm_cpp_add_test(test_rocm_f16_contract vt/test_rocm_f16_contract.cpp)
 # The grow-only per-stream device scratch pool (#2712). UNCONDITIONAL for the
 # same reason test_rocm_arch is: src/vt/grow_only_stream_scratch.h is free of
@@ -2881,6 +2914,9 @@ target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # rank-sliced DeepSeek-V4 expert linear (skips when the shard is not mounted).
 vllm_cpp_add_test(test_exl3_dequant vt/test_exl3_dequant.cpp)
 vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
+# ISSUE-LOCAL-01M2BYPW7YTC2B2MY023ETTKQ2: the M > 144 reconstruct dispatch through
+# dense_attn::Exl3MatmulD must fall back to Exl3Gemm where no reconstruct kernel exists.
+vllm_cpp_add_test(test_exl3_matmul_dispatch vt/test_exl3_matmul_dispatch.cpp)
 # MODEL-DSV4-EXL3 W2c: the m<=8 GEMV selection envelope, gated host-side because
 # the sentence this row inherited about it describes a guard exl3_gemv.cu:53 has
 # commented out. W2d: the fused MoE mgemm, its host-side token sort, and the
@@ -2952,6 +2988,8 @@ vllm_cpp_add_test(test_cuda_embedding_quant vt/test_cuda_embedding_quant.cpp)
 target_include_directories(test_cuda_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # BACKEND-ROCM-QUANT-GATHER: the production gate starts at the public loader.
 vllm_cpp_add_test(test_capi_rocm_embedding_quant capi/test_rocm_embedding_quant.cpp)
+# Quantized WMMA reaches both formats through the public completion API.
+vllm_cpp_add_test(test_capi_rocm_quant_wmma capi/test_rocm_quant_wmma.cpp)
 vllm_cpp_add_test(test_rocm_embedding_quant vt/test_rocm_embedding_quant.cpp)
 target_include_directories(test_rocm_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_HIP)
@@ -2963,6 +3001,8 @@ endif()
 add_executable(rocm_quant_gather_capture ../tools/rocm_quant_gather/capture.cpp)
 target_link_libraries(rocm_quant_gather_capture PRIVATE vllm)
 target_include_directories(rocm_quant_gather_capture PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+add_executable(rocm_quant_wmma_capture ../tools/rocm_quant_wmma/capture.cpp)
+target_link_libraries(rocm_quant_wmma_capture PRIVATE vllm)
 # CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
 # gate is BYTE-IDENTITY against an independent scalar reference across every
 # dtype combination, both weight orientations, ragged K/N, row-strided
@@ -3445,6 +3485,12 @@ vllm_cpp_add_test(test_paged_attn_route vt/test_paged_attn_route.cpp)
 # switch, memcmp over every dtype the switch handled (spec §3, issue #391).
 vllm_cpp_add_test(test_ops_paged_attn_dtype vt/test_ops_paged_attn_dtype.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)
+if(UNIX)
+  add_test(NAME test_rocm_sample_scratch
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tests/scripts/test_rocm_sample_scratch.py")
+  set_tests_properties(test_rocm_sample_scratch PROPERTIES
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
+endif()
 vllm_cpp_add_test(test_gemma4_rocm_fp8_seams vt/test_gemma4_rocm_fp8_seams.cpp)
 vllm_cpp_add_test(test_ops_getblas_dualslot vt/test_ops_getblas_dualslot.cpp)
 target_compile_definitions(test_ops_getblas_dualslot PRIVATE
@@ -4020,6 +4066,54 @@ add_test(NAME test_qwen4_exp_moe_sel_fp COMMAND test_qwen4_exp_moe)
 set_tests_properties(test_qwen4_exp_moe_sel_fp PROPERTIES
   ENVIRONMENT "VT_MOE_SEL_FP=4096")
 
+# QUANT-CUDA-GATES W8: the device-resident keep-quant MoE arm. NOT CUDA-only --
+# the arm asks the op table rather than naming a device, so it is default-ON on
+# every backend the three ops are registered on, and the suite has a CPU, a CUDA
+# and a ROCm case. The CPU cases run unconditionally and gate arm SELECTION on a
+# box with no GPU at all; each device case prints a LOUD [SKIP] where its backend
+# is absent, because a device arm that silently vanishes from the gate is the
+# failure this suite exists to stop. It reaches only the public seam header
+# (qwen3_5_moe_block.h) plus the one probe symbol `vllm::MoeKqDeviceCalls()`, so
+# it needs no src/ grant.
+vllm_cpp_add_test(test_qwen35_moe_kq_device vllm/models/test_qwen35_moe_kq_device.cpp)
+# The same binary on the REFERENCE arm, so the fallback the row promises is a
+# gated route and not a claim. The suite forces the variable per case, so this
+# registration proves the process-level default does not change the verdict.
+add_test(NAME test_qwen35_moe_kq_device_ref COMMAND test_qwen35_moe_kq_device)
+set_tests_properties(test_qwen35_moe_kq_device_ref PROPERTIES
+  ENVIRONMENT "VT_MOE_KQ_FAST=0")
+# The same binary with the VT_MOE_SEL_FP TAP ARMED, which is the only way to gate
+# the `MoeSelFpCalls() == 0` term of the arm's predicate. That term is
+# load-bearing: `MoeSelFp` is called only inside the reference path, so without
+# it an operator who arms the tap gets the fast arm and a silently empty tap.
+# It cannot be a case in the suite -- `MoeSelFpCalls()` caches its read in a
+# process-static on first use, so arming it from inside the binary either comes
+# first and disarms every other case or comes later and is ignored. With the tap
+# armed every arm-selection expectation in the suite flips to "must not run", so
+# deleting the term reddens THIS registration while the two above stay green.
+# DELIBERATELY UNFILTERED, for the reason test_qwen4_exp_moe_sel_fp gives above.
+add_test(NAME test_qwen35_moe_kq_device_sel_fp COMMAND test_qwen35_moe_kq_device)
+set_tests_properties(test_qwen35_moe_kq_device_sel_fp PROPERTIES
+  ENVIRONMENT "VT_MOE_SEL_FP=4096")
+# THE ROCm LANE, BECAUSE THE DOCUMENTED ROCm GATE IS A NAME FILTER. `docs/ROCM.md:24`
+# runs `ctest --test-dir build-hip -R 'rocm|cross_device'`, and none of the three
+# registrations above carries either token -- so this suite's ROCm cases never ran in
+# the lane a ROCm operator is told to run, on an arm that is DEFAULT-ON on ROCm with
+# `strix:gpu0` (gfx1151) a live fleet device. Registering the same binary under a name
+# that carries `rocm`, filtered to its ROCm cases, puts them in that lane.
+#
+# A doctest filter that matches NOTHING exits 0, so a renamed case would turn this
+# registration into a green that measured nothing -- the trap
+# `scripts/run-doctest-selected.sh` exists for. ctest cannot run that wrapper on every
+# platform this file is configured on, so the zero-selection case is made RED by the
+# summary line instead: doctest prints `test cases: 0 | ...` when the filter selects
+# none. It is a FAIL_REGULAR_EXPRESSION and NOT a PASS_REGULAR_EXPRESSION, because
+# CMake ignores the exit status of a test that has the latter, which would swap one
+# silent green for another.
+add_test(NAME test_rocm_qwen35_moe_kq_device COMMAND test_qwen35_moe_kq_device "-tc=*(ROCm)*")
+set_tests_properties(test_rocm_qwen35_moe_kq_device PROPERTIES
+  FAIL_REGULAR_EXPRESSION "test cases: +0 [|]")
+
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
 # ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would
@@ -4096,6 +4190,20 @@ vllm_cpp_add_test(test_qwen4_exp_cuda vllm/models/test_qwen4_exp_cuda.cpp)
 # vt:: surface and its own fixture directory.
 vllm_cpp_add_test(test_qwen4_exp_cuda_reductions
                   vllm/models/test_qwen4_exp_cuda_reductions.cpp)
+
+# MODEL-MM-QWEN4-EXP, issue ISSUE-LOCAL-01M2CJXQMV9R9JGRSKZMW4W21F, spec
+# `.agents/specs/qwen4-exp-rocm-hc-norm.md` -- the ROCm twin of the `CUDA W7:`
+# battery above, for the grouped hyper-connection norm inside
+# `vt::Qwen4ExpGatedResidual`. It exists because until it did, the ONLY committed
+# test reaching that ROCm arm was `test_backend_cross_device.cpp:5580` at
+# `hidden_size = 7`, a width at which one thread does the whole group and no
+# reduction SHAPE is expressible. The two files share one fixture and one derived
+# bound through `vllm/models/qwen4_exp_hc_synth.h` rather than carrying a copy
+# each. Skips LOUDLY on a box with no ROCm backend, and names the OP as well as
+# the backend, because a built-but-unregistered arm and an absent backend are
+# different failures. No src/ grant: it reaches only the public vt:: surface.
+vllm_cpp_add_test(test_qwen4_exp_rocm_reductions
+                  vllm/models/test_qwen4_exp_rocm_reductions.cpp)
 
 # MODEL-MM-QWEN4-EXP W5e-2 (#2336) — `RunQwen4ExpPleBlock`, the PLE layer as ONE
 # production composition and the LAST of the three block seams. Gated end to end

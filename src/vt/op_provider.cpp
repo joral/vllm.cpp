@@ -416,6 +416,8 @@ const char* OpNameImpl(OpId op) {
       return "MoeSiluMul";
     case OpId::kMoeRelu2:
       return "MoeRelu2";
+    case OpId::kClampedSwiGLU:
+      return "ClampedSwiGLU";
     case OpId::kCastBf16:
       return "CastBf16";
     case OpId::kCastF16:
@@ -591,6 +593,8 @@ const char* OpNameImpl(OpId op) {
       return "Exl3HadR128";
     case OpId::kExl3Gemm:
       return "Exl3Gemm";
+    case OpId::kExl3ReconstructGemm:
+      return "Exl3ReconstructGemm";
     case OpId::kExl3MoeMlp:
       return "Exl3MoeMlp";
     case OpId::kKeepQuantDecode:

@@ -8,6 +8,7 @@
 
 #include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/device_placement.h"
+#include "vllm/platforms/interface.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
 
@@ -98,6 +99,20 @@ bool QuantRepackForDevice(bool keep_quant, bool cpu_ref,
          dev == vt::DeviceType::kCPU;
 }
 
+// See the header. The ORDER of the terms is the contract: an explicit knob is
+// answered before the device is consulted, so the same-binary A/B still reaches
+// a staging device.
+bool GgufPrefaultForDevice(vt::DeviceType dev) {
+  if (!ResolveGgufPrefault()) return false;
+  if (GgufPrefaultIsExplicit()) return true;
+  if (dev == vt::DeviceType::kCPU) return true;
+  // A device with no registered platform cannot be asked, and this function is
+  // not the place to refuse a load. Answering ON leaves such a caller with
+  // exactly the behaviour it had before this term existed.
+  if (!vllm::platforms::HasPlatform(dev)) return true;
+  return vllm::platforms::GetPlatform(dev).host_memory_is_device_addressable();
+}
+
 const char* Name(GgufTensorRole role) {
   switch (role) {
     case GgufTensorRole::kMatmulWeight: return "matmul_weight";
@@ -166,13 +181,35 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       // (the q4km artifact: token_embd Q6_K, attn_qkv/ssm_out Q5_K,
       // ssm_alpha/ssm_beta Q8_0) is what pulled Q5_K/Q6_K/Q8_0 from W4 into
       // W3 — kernels and predicate widened IN THE SAME CHANGE. kQ4_0 has no
-      // TT arm at all and kQ2_K/kQ3_K stay owed; admitting an encoding
+      // TT arm at all and kQ2_K stays owed (Q3_K joined in
+      // QUANT-GGUF-IQ-TENSTORRENT wave 3); admitting an encoding
       // without its kernel throws at first forward with the model resident,
       // the exact failure this predicate exists to prevent.
+      // QUANT-GGUF-IQ-TENSTORRENT wave 1: kIQ3_XXS joins the set — its
+      // on-core decode is the int8-dot kernel's enc_sel 4
+      // (kq_vec_dot_iq3_xxs_q8_K, keepquant_kernel_code.h), staged as the
+      // same resident i32 word shadow (32 words = 98 B zero-padded to
+      // 128 B), and dispatched on the DEFAULT path (no env gate — the
+      // grouped arm has no IQ3_XXS decode to fall through to). The APEX
+      // I-Nano vehicle's 164 IQ3_XXS tensors are the artifact this admits.
       // tests/vllm/test_gguf_keep_quant.cpp pins the set; widening the arm
       // without widening the kernel reds it.
+      // QUANT-GGUF-IQ-TENSTORRENT wave 2: kIQ2_XXS (enc_sel 5) and kIQ2_S
+      // (enc_sel 6) join the set the same way — on-core decodes
+      // kq_vec_dot_iq2_xxs_q8_K / kq_vec_dot_iq2_s_q8_K
+      // (keepquant_kernel_code.h), staged as the same resident i32 word
+      // shadow (32 words = 66 B / 82 B zero-padded to 128 B), dispatched on
+      // the DEFAULT path. The APEX I-Nano vehicle's 44 IQ2_XXS + 89 IQ2_S
+      // tensors are the artifacts this admits.
+      // QUANT-GGUF-IQ-TENSTORRENT wave 3: kQ3_K (enc_sel 7) closes the
+      // census — kq_vec_dot_q3_k_q8_K (keepquant_kernel_code.h), 32 words
+      // = 110 B zero-padded to 128 B, dispatched on the DEFAULT path. The
+      // vehicle's 78 Q3_K tensors are the artifact this admits, and no
+      // named missing arm remains in the census.
       return dt == vt::DType::kQ4_K || dt == vt::DType::kQ5_K ||
-             dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0;
+             dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0 ||
+             dt == vt::DType::kIQ3_XXS || dt == vt::DType::kIQ2_XXS ||
+             dt == vt::DType::kIQ2_S || dt == vt::DType::kQ3_K;
     default:
       // CUDA falls back to the CPU kernel for anything it lacks
       // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.
@@ -431,6 +468,11 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(
   // rather than called there.
   p.quant_repack = QuantRepackForDevice(p.keep_quant, p.cpu_ref,
                                         vt::cpu::QuantRepackActive(), dev);
+  // The load-time prefault, with the SAME device term and for a reason of the
+  // same shape: the transform is worth paying for only where the forward reads
+  // the borrowed pages. See `GgufPrefaultForDevice`. `VT_GGUF_PREFAULT` and
+  // `vllm_cpp.mmap.prefault` still win over the device.
+  p.prefault = GgufPrefaultForDevice(dev);
   // KERNEL-GEMM-CPU-TILED lever 2, elementwise [N,K] -> [K,N] repack-at-load.
   // OPT-IN ONLY (default false) because the repacked bytes are transposed and
   // only the CPU MatmulBTKernel honours Tensor.elem_kn_repacked today; see the
