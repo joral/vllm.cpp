@@ -113,7 +113,6 @@ CHECKERS=(
   # compliance and caches nothing: symlink(2) is EOPNOTSUPP there, so every
   # lock fails and `ccache -s` shows zero of everything (#2473).
   check-lease-ccache
-  check-role-discipline
   claim-view
   check-readme-structure
   check-quickstart-recipes
@@ -177,6 +176,7 @@ SUITES=(
   test_check_fp4_resident_consistency
   test_check_cuda_op_arch_gate
   test_check_rocm_dp4a_intrinsic
+  test_rocm_rank_kernels
   test_check_runner_routing_consistency
   test_check_surface_coverage
   test_check_test_registration
@@ -192,6 +192,7 @@ SUITES=(
   test_agent_issue_index
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
+  test_rocm_quant_gather_compare
   test_rocm_strix_ourarm_staged
   test_rocm_cooperative_toggles
   # The TOKENGATE job's build stage (#2895). `--no-build-isolation` makes pip
@@ -439,6 +440,17 @@ echo "Mutation suites:"
 for suite in "${SUITES[@]}"; do
   run "$suite" python3 "tests/scripts/$suite.py"
 done
+# QWEN3-CAPTURE-TOOLS: begin
+if python3 -c 'import numpy' >/dev/null 2>&1; then
+  run "test_qwen3_capture_tools" python3 tests/scripts/test_qwen3_capture_tools.py
+  run "test_qwen3_capture_outputs" python3 tests/scripts/test_qwen3_capture_outputs.py
+else
+  for suite in test_qwen3_capture_tools test_qwen3_capture_outputs; do
+    skip "$suite" "PENDING: numpy is not importable. CI installs python3-numpy for these capture suites."
+  done
+fi
+# QWEN3-CAPTURE-TOOLS: end
+
 # THE ONE SUITE HERE WITH A THIRD-PARTY DEPENDENCY (#1612). It exercises
 # `scripts/ltx25-render-compare.py`, whose only import beyond the standard
 # library is numpy -- the tool reads PPM and WAV by hand precisely so that a

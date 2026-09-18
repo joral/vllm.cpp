@@ -28,7 +28,7 @@ ctest --test-dir build
 ```
 
 The server is ON by default. Example binaries land under `build/examples/`:
-`vllm-cli`, `server`, `vllm-bench`, and `tokenize`.
+`vllm-cli`, `vllm-server`, `vllm-bench`, and `tokenize`.
 
 ## CUDA build (NVIDIA GB10 / DGX Spark)
 
@@ -141,53 +141,71 @@ cmake --build build-tenstorrent -j
 The Blackhole lane is correctness-focused. OPT-125m passes its strict 6/6
 end-to-end gate. Qwen3-0.6B is selected by the platform and has a device-aware
 near-tie gate plus committed goldens, but the full 16x16 rerun is still pending.
-There is no binding speed result.
+The [capture A/B](benchmarks/tt-capture-default-decode.md) measures Qwen3-0.6B
+against this engine's capture-disabled path. It does not compare reference engines.
 
-## ROCm build (AMD GPUs) — community-verified W0, blind F6 fix
+### Quantized Qwen smoke runs
 
-> The W0 HIP sources compiled clean and passed `ctest -R 'rocm|cross_device'`
-> on four community boards — gfx1151, gfx1103, gfx1100, gfx1201
-> ([issue #41](https://github.com/mudler/vllm.cpp/issues/41)). The
-> unified-memory fix on top of them (approach (b),
-> [ROCm guide §3.1](ROCM.md)) was again written with **no AMD GPU or ROCm
-> toolchain on any maintainer machine**, so a compile error in it is expected,
-> useful, and belongs on #41.
+Qwen3.8-27B and Qwen3.5-0.8B Q4_K_M completed two prompts each on a Blackhole
+P150. These runs use the opt-in int8-dot path, which computes from compressed
+weights. Set `VT_TT_KEEPQUANT_INT8DOT=1` to select it. An unset, empty, or `0`
+value leaves that path disabled.
+
+After configuring the TT-Metal runtime environment, run this smoke workload
+with a local checkpoint:
 
 ```sh
-cmake -S . -B build-hip -DVLLM_CPP_HIP=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-hip -j
-ctest --test-dir build-hip -R 'rocm|cross_device'
+VT_TT_KEEPQUANT_INT8DOT=1 build-tenstorrent/examples/vllm-bench \
+  --model /path/to/Qwen3.8-27B-Q4_K_M.gguf \
+  --num-prompts 2 --input-len 128 --output-len 32 --concurrency 2 \
+  --num-blocks 64 --max-num-batched-tokens 64 --seed 0
 ```
 
-`VLLM_CPP_HIP_ARCHITECTURES` is optional: leave it empty and hipcc targets the
-installed GPU, which is what you want when building on the machine you will run
-on. The validated names are upstream vLLM's `HIP_SUPPORTED_ARCHS`; anything else
-configures with a warning and is passed to hipcc anyway. If ROCm lives outside
-`/opt/rocm`, point at it with `-DROCM_PATH=<prefix>`. When `ROCM_PATH` names a
-real install, the configure now derives the compiler hints from it
-(`CMAKE_HIP_COMPILER_ROCM_ROOT`, `--rocm-path` in `CMAKE_HIP_FLAGS`, the
-`ROCM_PATH` environment variable — each only if you have not set it), which is
-what makes Arch and TheRock dist-tarball layouts configure without the manual
-flags issue #41's gfx1151 report needed.
+The [smoke measurements](benchmarks/tt-keepquant-27b-decode.md) establish
+completion only, without a token comparison or reference-engine speed result.
+The [keep-quant record](../.agents/specs/tenstorrent-keepquant.md) describes the
+separate correctness gates and remaining work.
 
-A build with no `CMAKE_BUILD_TYPE` now floors **HIP device code** at `-O1`
-automatically, and says so at configure time. At `-O0` hipcc marks the kernels
-as dynamic-stack users, which makes the ROCm runtime start a hostcall listener
-the kernels never use, and its teardown handshake can deadlock at process exit —
-the tests all pass and then the process never returns
-([#132](https://github.com/mudler/vllm.cpp/issues/132)). Setting a build type,
-or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides this and is respected
-as-is.
+## ROCm build (AMD GPUs)
 
-`-DVLLM_CPP_HIP=ON` **fails the configure** when no HIP compiler is found rather
-than quietly producing a CPU-only build, for the same reason the CUTLASS note
-above exists: a silent downgrade is indistinguishable from success.
+Enable ROCm explicitly and use a release build:
 
-What exists today is the W0 skeleton — the `vt::Backend`, the `Platform`, one
-registered kernel (RmsNorm), and the tests that gate them — plus the approach-(b)
-unified-memory branch for integrated APUs. What that does and
-does not get you, and where to start on your specific board, is
-[ROCm guide](ROCM.md).
+```sh
+cmake -S . -B build-hip \
+  -DVLLM_CPP_HIP=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DROCM_PATH=/opt/rocm
+cmake --build build-hip -j
+ctest --test-dir build-hip -R 'rocm|cross_device' --output-on-failure
+```
+
+Set `ROCM_PATH` to your ROCm or TheRock installation prefix. When that directory
+exists, CMake derives the compiler root, HIP flags, and environment hint from it.
+Explicit `CMAKE_HIP_COMPILER_ROCM_ROOT`, `CMAKE_HIP_FLAGS`, `HIPFLAGS`, and
+`ROCM_PATH` environment settings take precedence over the corresponding hints.
+Configuration fails if `VLLM_CPP_HIP=ON` cannot find a HIP compiler.
+
+Set `VLLM_CPP_HIP_ARCHITECTURES` to select targets, for example
+`-DVLLM_CPP_HIP_ARCHITECTURES=gfx1100`. Leave it empty to use the compiler's
+default target selection. CMake warns about unlisted architectures but passes
+them to the compiler.
+
+For an empty build type or `Debug`, CMake adds `-O1` to HIP device compilation
+unless `CMAKE_HIP_FLAGS` contains an explicit `-O` option. This avoids the
+unoptimized kernel path associated with a ROCm teardown deadlock
+([#132](https://github.com/mudler/vllm.cpp/issues/132)). Other build types keep
+their own optimization settings.
+
+The backend includes native dense, attention, GDN, sampling, and EXL3 operations.
+Llama-3.2-1B-Instruct EXL3 generated on gfx1151 with zero CPU fallbacks.
+That result does not establish discrete AMD coverage or competitive performance.
+The [EXL3 evidence](../.agents/specs/backend-rocm-exl3.md#evidence) records the
+workload and remaining gates.
+
+CPU fallback depends on the device's memory attributes. By default, gfx1151 and
+gfx1103 use plain `hipMalloc` and require native coverage for every model operation.
+See the [ROCm guide](ROCM.md) for allocation behavior, device selection, tested
+models, and unresolved correctness gates.
 
 ## Nix shells
 
@@ -225,8 +243,8 @@ defaults.
 | `VLLM_CPP_METAL` | `AUTO` | Build the Metal backend: `ON`, `OFF`, or `AUTO` (on for an Apple host with an ObjC++ compiler) |
 | `VLLM_CPP_VULKAN` | `AUTO` (= `OFF`) | Build the Vulkan backend. Opt-in with `-DVLLM_CPP_VULKAN=ON`; headers are vendored and SPIR-V is committed |
 | `VLLM_CPP_TENSTORRENT` | `AUTO` (= `OFF`) | Build the Tenstorrent backend. Opt-in with `-DVLLM_CPP_TENSTORRENT=ON`; requires TT-Metalium and TT-NN and fails configure if either package is missing |
-| `VLLM_CPP_HIP` | `AUTO` (= `OFF`) | Build the ROCm/HIP backend. Opt-in with `-DVLLM_CPP_HIP=ON`, which fails loudly if no `hipcc` is found. Community W0 builds cover four `gfx` targets; model gates remain open |
-| `VLLM_CPP_HIP_ARCHITECTURES` | (empty) | Target `gfx` arch(es), e.g. `gfx1100` or `gfx1100;gfx1151`. Empty means hipcc targets the installed GPU |
+| `VLLM_CPP_HIP` | `AUTO` (= `OFF`) | Build the ROCm backend. Opt-in with `-DVLLM_CPP_HIP=ON`. Configuration fails without a HIP compiler. See [ROCm coverage](ROCM.md) |
+| `VLLM_CPP_HIP_ARCHITECTURES` | (empty) | Target `gfx` architectures, for example `gfx1100` or `gfx1100;gfx1151`. Empty uses compiler defaults |
 | `ROCM_PATH` | `/opt/rocm` | ROCm installation prefix, for a nightly/TheRock install elsewhere |
 | `VLLM_CPP_MLX` | `OFF` | Build the optional MLX GEMM provider for Metal (needs `-DMLX_ROOT=<mlx install>`) |
 | `MLX_ROOT` | (empty) | Root of an MLX install (`include/` + `lib/`) for `VLLM_CPP_MLX` |

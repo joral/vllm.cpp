@@ -240,7 +240,9 @@ ran at 4 Hz beside every leg.
 `reference_tier_lines` read **0 on every one of the eight legs**, so no host
 fallback ran and every op resolved on the device.
 
-Per-leg readings, warm repetitions only, with the clock window over each leg:
+The completion timings below retain warm repetitions only. The clock and busy
+means use the whole leg, including model loading, the cold completion, warm
+completions, and teardown. Those columns do not share the timing window.
 
 | leg | median secs | whole-completion tok/s | sclk MHz mean | busy % mean |
 |---|---|---|---|---|
@@ -253,11 +255,39 @@ Per-leg readings, warm repetitions only, with the clock window over each leg:
 | n128-r3 | 23.917 | 5.352 | 2350.7 | 76.8 |
 | n128-r4 | 23.942 | 5.346 | 2360.2 | 77.4 |
 
-Pooled over all 3,216 clock samples the board read **2228 MHz mean at 71.3
-percent busy**. The 64-token legs sit near 2045 MHz and 63 percent and the
-128-token legs near 2340 MHz and 76 percent, so the longer leg holds the board
-in a higher state for a larger share of its own wall time. No single number
-describes both.
+Pooled over all 3,216 whole-leg clock samples the board read **2228 MHz mean at
+71.3 percent busy**. The 64-token whole-leg means sit near 2045 MHz and 63
+percent and the 128-token means near 2340 MHz and 76 percent. These historical
+values include time outside generation and do not establish different clock
+states during warm generation.
+
+Joining the same samples to the recorded `generate_start_unix` and
+`generate_end_unix` timestamps gives the warm windows below. Retain each
+sample whose timestamp falls inside the inclusive bounds of generation 2, 3,
+or 4. These windows include prefill and generation, not decode alone.
+
+| leg | warm samples | warm sclk MHz mean | warm busy % mean |
+|---|---|---|---|
+| n64-r1 | 143 | 2888.6 | 100.0 |
+| n64-r2 | 144 | 2874.9 | 100.0 |
+| n64-r3 | 144 | 2869.8 | 100.0 |
+| n64-r4 | 143 | 2871.3 | 100.0 |
+| n128-r1 | 285 | 2877.4 | 100.0 |
+| n128-r2 | 281 | 2871.5 | 100.0 |
+| n128-r3 | 279 | 2870.0 | 100.0 |
+| n128-r4 | 284 | 2865.5 | 100.0 |
+
+The 1,703 warm samples pool to **2872.8 MHz mean and 100.0 percent busy**.
+Busy percentage reports sampled GPU activity. It is not occupancy and gives
+no quantitative bound on host idle time between samples. `TOKEN_GATE=FAIL`
+remains carried from the survey. This clock correction changes no historical
+throughput or correctness result.
+
+Reproduce both windows and each generation from the committed captures:
+
+```sh
+python3 docs/bench-evidence/qwen38-27b-q4km-gfx1151-ourarm-head-20260905/clock_windows.py
+```
 
 The completions themselves are byte-identical across all four legs at each
 token count, and the 128-token completion continues the 64-token one exactly,
@@ -388,7 +418,9 @@ agree. The landed figure stands; nothing here supersedes it.
 - llama.cpp's custody chain has one open link, carried forward: the source is
   pinned by content manifest and the binaries are pinned as bytes, but no
   compiler ran in this lease.
-- Clock sampling on AMD is ad-hoc. No in-tree harness samples AMD clock state.
+- This historical survey used an ad-hoc AMD clock sampler. The subsequent
+  [#3015 worker](../../tools/bench/strix_kernel_trace/worker.py) samples AMD
+  clock state and folds it into recorded warm generation windows.
 
 ## Evidence
 
@@ -405,13 +437,15 @@ return codes, the gzipped clock samples, and `rederive.py` with its
 `rederivation.txt`. The `.log` captures carry a `.txt` suffix because
 `.gitignore` excludes `*.log`.
 
-`rederive.py` re-derives every published lease-2 figure from the raw per-leg
+`rederive.py` re-derives the original lease-2 figures from the raw per-leg
 `.err` and `.jsonl` records alone and then compares the result with the fold's
 `RESULT.json`: **16 checks, 0 mismatches**. It runs against the share when the
 share is reachable and against the committed copies in its own directory when
 it is not, and `rederivation.txt` records that the two runs agree line for
-line. Every figure on this page for lease 2 is therefore reproducible from the
-committed evidence alone.
+line. The adjacent `clock_windows.py` reproduces the warm clock correction
+from the committed captures, without selecting an external share. It also
+prints the original whole-leg clock means and each generation's window.
+Both commands preserve the original `RESULT.json` comparison contract.
 
 Raw per-leg artefacts, including the 24 GB `llama-cli` captures which are not
 committed, remain at `/mnt/nas_share/rc/strix-survey-2497/out/survey-20260904/`

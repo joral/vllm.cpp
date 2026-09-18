@@ -94,11 +94,14 @@ namespace vllm {
 // artifact off disk to populate pages nothing will ever look at. Measured: the
 // GLM-5.3 `UD-IQ1_S` load's RSS grew past 48 GiB against a 18.99 GiB resident
 // class, linearly, at the filesystem's read rate, with no plateau.
+// The default role requires a dot kernel. An embedding role requires only a
+// row decoder and refuses matrix repacks. The caller sets embedding metadata.
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset = 0,
                                const GgufFile* mmap_src = nullptr,
                                bool repack = false, bool cuda_align = false,
-                               bool prefault = true);
+                               bool prefault = true,
+                               GgufTensorRole role = GgufTensorRole::kMatmulWeight);
 
 // L6 (keep-f16 residency). Take `n` rows of `k` F16 elements of `tensor`'s raw
 // bytes — starting at row `row_offset` (how a stacked [E, out, in] expert tensor
@@ -124,7 +127,8 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
 OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
                        int64_t row_offset = 0,
                        const GgufFile* mmap_src = nullptr, bool nk = true,
-                       bool elem_kn_repack = false, bool prefault = true);
+                       bool elem_kn_repack = false, bool prefault = true,
+                       std::optional<vt::DType> weight_value_dtype = std::nullopt);
 
 // Build the HfConfig from a GGUF file's metadata (arch prefix qwen35moe /
 // qwen3next / qwen35 [dense]). vocab_size is taken from token_embd's shape
@@ -254,5 +258,54 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(
 void LoadGgufSharedEmbedAndHeadBf16(const GgufFile& gguf, OwnedTensor* embed,
                                     OwnedTensor* head,
                                     bool* head_was_quantized = nullptr);
+
+// KEEPQUANT W4a wave-3b-2 (issue #3030): the MTP drafter head a TRUNK-ONLY
+// load leaves unread.
+//
+// A Qwen3.5-family GGUF converted WITH the head folds it into the ordinary
+// block list (`<arch>.block_count` counts it; `<arch>.nextn_predict_layers`
+// announces it), and `LoadQwen3_5DenseFromGguf` / `LoadQwen3_5MoeFromGguf`
+// read the trunk only — `config.num_hidden_layers` blocks. The head tensors
+// (`blk.{L}.nextn.*` plus the head block's own attn/ffn set) are therefore
+// loaded ONLY when speculative decoding is configured, and on every spec-off
+// run — the production default, and the shape the pinned llama.cpp `b10451`
+// oracle runs too (it loads 64 of this family's 65 blocks and ignores all 15
+// `blk.64` tensors; .agents/oracles/llama-cpp.md) — they stay in the file
+// unread. Before wave-3b-2 that skip was SILENT, which is the worst way for a
+// gate to be honest about its denominator.
+struct Qwen3_5GgufMtpHeadSkip {
+  // True when the config declares a head AND the file carries at least one of
+  // its tensors.
+  bool present = false;
+  int64_t tensor_count = 0;
+  int64_t bytes = 0;
+  // The exact names, in file order. The loud skip line prints them all: a
+  // skipped set the reader cannot see is a silent one.
+  std::vector<std::string> names;
+};
+
+// Enumerates the head tensors `LoadQwen3_5{Dense,Moe}FromGguf` will NOT read,
+// with their file byte sizes. Kept in lockstep with the head block of
+// `Qwen3_5GgufExpectedTensors`, whose accounting is what refuses a tensor the
+// enumeration forgets.
+Qwen3_5GgufMtpHeadSkip Qwen3_5GgufMtpHeadSkipTensors(const GgufFile& gguf,
+                                                     const HfConfig& config);
+
+// The loud version: one stderr line naming every skipped tensor, the byte
+// total, the trunk/head arithmetic, the speculative-config condition that
+// would load them, and the llama.cpp `b10451` denominator-parity note. Inert
+// (prints nothing) when `Qwen3_5GgufMtpHeadSkip` reports nothing skipped.
+void LogQwen3_5GgufMtpHeadSkip(const GgufFile& gguf, const HfConfig& config);
+
+
+// W4d W4 focused-test hook: the byte-level twin of the element-level
+// ReorderVRows — permute whole row BYTE-ranges of a PACKED block buffer
+// with the same grouped->tiled V-head permutation. `row_bytes` is the
+// packed byte size of one weight row (whole blocks: the caller checks
+// K % block_elems == 0). Exists so the packed reorder's equivalence to the
+// element reorder is testable across TU boundaries.
+void ReorderVPackedForTest(std::vector<uint8_t>& packed, int64_t row_bytes,
+                           int64_t row_off, int64_t num_k,
+                           int64_t num_v_per_k, int64_t head_rows);
 
 }  // namespace vllm

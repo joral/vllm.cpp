@@ -35,8 +35,10 @@ unchanged. Out of scope, and not attempted:
   WMMA/row-packing/MoE work `## Owed`. This row is the GEMM/n>1 (prefill) arm
   only.
 - **MFMA and hipBLASLt.** Neither is reachable on this hardware; see below.
-- **Q4_0/Q2_K/Q3_K/IQ2_\*/IQ3_\*/MXFP4 keep-quant formats.** Unrelated gap
-  (#1940), untouched by this row.
+- **Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/MXFP4 keep-quant formats.** The GFX1100
+  reconstruction lands Q2_K, Q3_K, IQ2_XXS, IQ3_XXS, IQ2_S, IQ1_S, and
+  IQ1_XXXS. The remaining formats are an unrelated gap (#1940), untouched by
+  this row.
 - **`GFX1100-TG200`'s campaign** (external fork `ghazni101/vllm.cpp`, its own
   GPU lock). That campaign targets gfx1100 and already owns the correctness
   half of this kernel (`kROCM` provider registration, landed via its F1
@@ -366,8 +368,8 @@ hardware policy. Report unavailable device evidence as `PENDING`.
 
 ## Owed
 
-- gfx1100 (RDNA3) WMMA tile: `VikashLoomba`'s audit on #2109, a separate row
-  and spec.
+- gfx1100 (RDNA3) WMMA admission: measured and completed by this change in
+  [KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3](rocm-rdna3-quant-wmma.md).
 - gfx1151 (RDNA3.5) WMMA tile: needs Strix Halo hardware to verify; a
   separate row and spec.
 - hipBLASLt per-superblock scale support: unmeasured; recorded as an open

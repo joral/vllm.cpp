@@ -12,8 +12,10 @@ different member of the same seam, for the reason §3 gives.
 ## Now
 
 **DONE.** The `(B * strength) @ A` product in
-`src/vllm/model_executor/models/ltx2_lora.cpp::Ltx2FuseLoraIntoTensor` is
-`vt::Matmul`, the shared row-major GEMM seam. At the shipped DiT's projection
+`src/vllm/model_executor/models/dit_lora.cpp::DitFuseLoraIntoTensor` is
+`vt::Matmul`, the shared row-major GEMM seam. (Row ROAD-V1-DIT-LORA extracted
+this function from ltx2_lora.cpp as Ltx2FuseLoraIntoTensor into the shared
+dit_lora seam; the arithmetic is unchanged.) At the shipped DiT's projection
 width and the shipped distilled adapter's rank one fused tensor went from
 **17.7761 s to 0.1242 s, 143.1x**, and the whole fused buffer is **byte-identical
 across the two builds** — the same FNV-1a digest `a23e7f876694c537` on every one
@@ -349,7 +351,7 @@ Recorded in `.agents/benchmark-record.md` under this row.
 
 | Issue | Lever | State |
 |---|---|---|
-| [#1254](https://github.com/mudler/vllm.cpp/issues/1254) | the bf16 add-back loop, now 59% of a fused tensor; `vt::Add` has the contract, the f32 branch does not fit it | owed, MEASURED at 0.0733 s of a 0.1242 s call |
+| ISSUE-GH-1254 | the bf16 add-back loop, now 59% of a fused tensor; `vt::Add` has the contract, the f32 branch does not fit it | owed, MEASURED at 0.0733 s of a 0.1242 s call |
 | [#1210](https://github.com/mudler/vllm.cpp/issues/1210) | the two-stage rebind still fuses, un-fuses and re-fuses; this row shrinks the constant and leaves the round trip | owed by [`ltx25-decode-speed.md`](ltx25-decode-speed.md), restated here because this row is why the constant changed |
 
 Not owed here, and named so a reader does not go looking: the GB10-to-x86

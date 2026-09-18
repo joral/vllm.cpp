@@ -1,5 +1,10 @@
 # `Glm5NextForConditionalGeneration` (GLM-5.3-Flash)
 
+Current reference: vLLM registered this model on 3 September 2026. The
+[upstream reconciliation](glm5-next-upstream-reconciliation.md) supersedes the
+original no-vLLM premise and port-source priority below. Historical evidence
+remains intact. See `## Now` for the current continuation.
+
 **SCOPING ONLY. NO PRODUCT CODE LANDS UNDER THIS PULL REQUEST.** This document
 and its records are the whole deliverable of the pull request that introduces
 it. Implementation follows in separate `row/MODEL-MM-GLM53-FLASH-W<n>` branches
@@ -42,9 +47,9 @@ IN scope for the campaign this spec plans:
 
 OUT of scope, explicitly:
 
-- Advancing the vLLM parity pin. `555967922` does not reach this architecture
-  and neither does vLLM `main`; see §Oracles. Nothing in this campaign may move
-  `.agents/upstream-sync.md`.
+- Advancing the vLLM parity pin. The current pin `e126687a9a` predates the
+  model's registration at `98ed0856f3`. Nothing in this campaign moves
+  `.agents/upstream-sync.md`. The original `555967922` search remains below.
 - The MTP speculative head (`num_nextn_predict_layers = 1`). It is recorded
   under §Owed and gets its own row when the backbone runs.
 - Any claim of speed parity. There is no denominator: no oracle runs this model
@@ -83,7 +88,25 @@ generates plausible text and is never checked. §Gates decides it.
 
 ## Oracles
 
-Everything in this section was read live on **2026-08-26**.
+### Current reference on 7 September 2026
+
+vLLM [PR #53906](https://github.com/vllm-project/vllm/pull/53906) merged at
+`98ed0856f31fa3aaf5e27464e2b4ef5a8ee6b2f5` on 3 September 2026.
+The campaign's registration stop condition fired. vLLM defines the algorithm,
+defaults, and errors wherever it implements them. The transformers algorithm
+exception expired. Its old evidence remains useful component evidence.
+
+The [reconciliation spec](glm5-next-upstream-reconciliation.md) records exact
+source and test anchors and the next implementation obligations.
+The global pin remains `e126687a9a828d513c01a07cd69f025f27d63280`.
+It lacks this registration. The merged revision is a fixed forward source
+reference, not a gateable model oracle or an accepted parity denominator.
+The real-model build and run remain `PENDING` under #1998.
+
+### Historical oracle survey on 26 August 2026
+
+The rest of this section preserves the original survey. Its statements about
+upstream absence, open pull requests, and available hardware describe that date.
 
 ### vLLM at the parity pin `555967922` — implements NOTHING
 
@@ -143,7 +166,34 @@ That is the same four-family split this spec independently derives from the
 transformers reference, which raises confidence in the decomposition without
 being usable as its source.
 
-### transformers — the ONLY admissible reference, and it needs a lane pin
+### transformers — the algorithm reference until 2026-09-03, and it needs a lane pin
+
+**This heading read "the ONLY admissible reference" until 2026-09-12, and vLLM
+falsified that on 2026-09-03.** The file's head-level banner at `:3-6` already
+records the supersession — it names the 3 September registration and points at
+[the upstream reconciliation](glm5-next-upstream-reconciliation.md), row
+`MODEL-MM-GLM53-FLASH`, issue
+[#3045](https://github.com/mudler/vllm.cpp/issues/3045) — so what this note does
+is carry that banner DOWN to the one section that still asserted the
+pre-registration reading in its own heading. The banner is the authority; this
+paragraph is its local application, and it adds no new verdict.
+`Glm5NextForConditionalGeneration` is registered
+on vLLM `main` at `model_executor/models/registry.py:429` (also `:123` and
+`:693`), landed by `98ed0856f3` = `[Model] add GLM-5.3-Flash support (#53906)`,
+which lands on **2026-09-03**. Its two stamps are the SAME INSTANT,
+`2026-09-03T16:40:35Z` for both author and committer
+(`gh api repos/vllm-project/vllm/commits/98ed0856f3…` → `.commit.author.date`
+and `.commit.committer.date`, both `2026-09-03T16:40:35Z`); locally they render
+as `2026-09-04T00:40:35+08:00` and `2026-09-03T09:40:35-07:00`
+(`git log -1 --format='%aI %cI' 98ed0856f3`), so the `+0800` rendering crosses
+midnight and reads 2026-09-04 while nothing about the commit moved. The date
+recorded here is the UTC one. [`../oracles/transformers.md`](../oracles/transformers.md)
+records the lane as `expired_on = 2026-09-03`, `expired_by = 98ed0856f3`, on its
+own stated condition `expires = when vLLM registers glm5_next` — registration
+fires it, our pin advancing does not. vLLM now defines the algorithm, and
+transformers is retained at its lane pin for component evidence, preprocessing
+and checkpoint interpretation only. The paragraph below is the 2026-08-26
+reading, kept because a lane that vanishes cannot be audited.
 
 `glm5_next` exists in `huggingface/transformers`. The implementing commit is
 `eb4d9e2a64` (2026-08-26T14:26:40Z, PR
@@ -223,6 +273,10 @@ That is a statement about the full model. It is NOT a statement that this
 campaign is ungateable; §Gates constructs the gate that is actually reachable.
 
 ## Upstream chain
+
+The following transformers map records the original component implementation.
+Use the [vLLM reconciliation](glm5-next-upstream-reconciliation.md) for new
+ports and reconcile each reached primitive before accepting equivalence.
 
 `transformers` `v5.16.1`, `src/transformers/models/glm5_next/`. The modular file
 is the source of truth and every port-map cell below cites
@@ -2386,8 +2440,14 @@ the honest count is four rather than "a campaign":
   `input.gather_logits` dispatch predicate with a residency clause
   (`deepseek_v4_registry.cpp:106`), RMSNorm / the embedding gather / the lm_head
   chunk onto `vt::RmsNorm`, `vt::Embedding` and `vt::MatmulBT`, and the mHC
-  sites. This is the wave that deletes the refusal at
-  `glm5_next_forward.cpp:231-238`. NOT started.
+  sites. W9c-3a already deleted the refusal at
+  `glm5_next_forward.cpp:231-238` and built the queue split, op-table probe, fit
+  guard, `Dev` construction and opt-in latch. W9c-2 put KDA recurrence and MoE
+  router topk on device. W9c-3b made the KV binding device-resident. W9c-3 is
+  SPEC'D ([#3174](https://github.com/mudler/vllm.cpp/issues/3174)): the compose
+  that grows `glm5_next_device.cpp` from a 16-line stub to a full device forward
+  in the `kimi_linear_device.cpp` single-queue shape, moving six arms to the
+  device and leaving two (MLA, mHC) as host-fallback islands. Not started.
 
 **mHC is the ONE family with a real gap, and it is small.** `glm5_next_mhc.cpp`
 (89 lines) calls `deepseek_v4_mhc.cpp`'s host functions directly
@@ -2802,55 +2862,47 @@ spec records both rather than the convenient one.
 | mHC manifold | all | **NOTHING.** `kDeepseekV4Mhc` (294) is CUDA-only (`cuda_deepseek_v4.cu:2102`) with **no CPU provider** (O34) | zero `vt::` calls; `glm5_next_mhc.cpp:22-88` delegating to `deepseek_v4_mhc.cpp:72-165`, per-token, `std::vector` slabs allocated inside the loop | everything, and O34's inverted gap bites here too |
 | MoE 288+1 | 43 blocks | 3 of 4 ops native (`rocm_ops.hip:170,206,213`); `kMoeGateUpSwiGLUGrouped` NONE | 4 vt ops; router-logits GEMM, shared expert and dense MLP hand-rolled (`glm5_next_moe.cpp:200-210, 291-325`) | one provider; **best-served arm by far** |
 | ViT | 24 | n/a | **does not exist.** No vision forward file; `glm5_next_loader.cpp:519-526` refuses any config declaring `vision_config` | the whole tower (W6), on every backend |
-| keep-quant residency | — | Q8_0/Q4_K/Q5_K/Q6_K only | this artifact is IQ2_XS/IQ3_XXS/IQ4_XS/Q2_K/Q3_K | see below — **the exact blocker** |
+| keep-quant residency | — | 11 formats, including IQ3_XXS/Q2_K/Q3_K | this artifact also uses IQ2_XS/IQ4_XS | those two formats still expand; see below |
 
-#### `rocm_grouped_gemm.hip` serves exactly what the predicate claims — do NOT widen it
+#### The ROCm wrapper serves 11 formats; two artifact formats remain closed
 
-The obvious cheap slice was to widen `DeviceKeepQuantSupported`'s ROCm arm
-(`gguf_keep_quant.cpp:128-140`). **Measured, and refused.** The kernel
-implements four dot products and no more: `DotQ8_0`
-(`rocm_grouped_gemm.hip:182`), `DotQ4K` (`:191`), `DotQ5K` (`:225`), `DotQ6K`
-(`:261`), dispatched at `:641,:657` (non-grouped) and `:712,:734` (grouped),
-with everything else falling to a `throw` at `:692` and `:761`. There is no
-IQ2_XS, IQ3_XXS, IQ4_XS, Q2_K or Q3_K path of any kind. **The predicate is
-exactly as wide as the kernel**, and widening it would make the loader keep
-blocks it cannot execute and throw at first forward with the model resident —
-which is precisely the regression `.agents/specs/rocm-gg-keep-quant.md` was
-written to repair. A predicate that claims more than the kernel does is worse
-than a narrow one, so this wave leaves it alone and records why.
+The internal GDN provider still owns `DotQ8_0`, `DotQ4K`, `DotQ5K`, and
+`DotQ6K`. The ROCm wrapper now adds Q2_K, Q3_K, IQ2_XXS, IQ3_XXS, IQ2_S,
+IQ1_S, and IQ1_XXXS through `rocm_quant_dot.hip`. The loader admits that exact
+11-format union. This artifact's IQ2_XS and IQ4_XS formats remain unsupported.
+Admitting either before its provider exists would reproduce the load-then-throw
+regression that `.agents/specs/rocm-gg-keep-quant.md` repaired.
 
 The cost of that honesty, by the census in §W9a, is exact and total:
 
 | encoding | tensors | on disk | ROCm keep-quant |
 |---|---:|---:|---|
 | IQ2_XS | 82 | 53.3320 GiB | **no** |
-| IQ3_XXS | 41 | 35.3145 GiB | **no** |
+| IQ3_XXS | 41 | 35.3145 GiB | yes |
 | IQ4_XS | 3 | 3.5859 GiB | **no** |
-| Q2_K | 2 | 1.4766 GiB | **no** |
-| Q3_K | 1 | 0.9668 GiB | **no** |
+| Q2_K | 2 | 1.4766 GiB | yes |
+| Q3_K | 1 | 0.9668 GiB | yes |
 | Q5_K | 181 | 3.0286 GiB | yes |
 | Q6_K | 117 | 2.1966 GiB | yes |
 | Q8_0 | 346 | 0.8013 GiB | yes |
 | Q4_K | 1 | 0.3323 GiB | yes |
 
-The five unservable encodings sum to **94.6758 GiB**, which is to four decimal
-places the routed-expert total §W9a measured independently (94.6758 GiB). That
-is not a coincidence worth glossing: **every byte ROCm cannot keep quantized is
-a routed expert, and every routed expert is a byte ROCm cannot keep
-quantized.** ROCm can keep 6.3588 GiB of 101.0346 GiB quantized — **6.29%**.
-The other 94.6758 GiB takes its pre-existing `expand_bf16` residency, 580.50
-GiB, for a total of 587.07 GiB — **10.1x the measured 58 GiB ceiling.**
+The two unservable encodings sum to **56.9179 GiB**. ROCm can now keep
+44.1167 GiB of the 101.0346 GiB table above quantized. The prior 587.07 GiB
+resident estimate and its 10.1x ratio are obsolete. No run has measured the
+new mixed-residency footprint, so that number is `PENDING`. The packed
+101.2535 GiB artifact already exceeds the measured 58 GiB device ceiling.
 
 #### Scope and price of what is NOT done here
 
 Priced so the option is a decision rather than a vague debt. None is started.
 
-1. **Five i-quant/k-quant ROCm dot kernels** (IQ2_XS, IQ3_XXS, IQ4_XS, Q2_K,
-   Q3_K) on both the grouped and non-grouped arms, against the CPU keep-quant
+1. **Two I-quant ROCm dot kernels** (IQ2_XS and IQ4_XS) on both the grouped
+   and non-grouped arms, against the CPU keep-quant
    oracle at the NMSE<=5e-4 bar `rocm-gg-keep-quant.md` already sets. This is
    `rocm-gg-keep-quant.md`'s owed list and it is that row's to take, not this
-   one's. It is a prerequisite for any ROCm arm of this model and it is **not
-   sufficient**, because of the residency ceiling above.
+   one's. They are not sufficient for a ROCm arm because the packed artifact
+   already exceeds the residency ceiling above.
 2. **A ROCm MLA/DSA family** — seven op ids, none registered. Not a wave.
 3. **A ROCm k-pool**, which needs a CPU provider first if the reference tier is
    ever to answer for it.
@@ -3378,6 +3430,223 @@ and they are not the reachability proof, which is why both are kept.
 * If a fifth arm of this model turns out to host-dereference engine device
   memory, that is a wider residency question than this wave, and it goes back as
   `NEEDS_DECISION` rather than being absorbed here.
+
+### W9c-3 — the compose: `glm5_next_device.cpp` and the remaining eight arms (GPU, large)
+
+Issue: [#3174](https://github.com/mudler/vllm.cpp/issues/3174). Also
+[#2410](https://github.com/mudler/vllm.cpp/issues/2410), which owns the broader
+device-forward track this wave closes.
+Claim: (unclaimed). Base: (unpinned).
+
+**Three of eleven compute arms are on the device; the other eight are on the
+interposed CPU queue.** W9c-3a put the routed-expert keep-quant GEMM on the
+device queue (`glm5_next_moe.cpp:223-258`) and built the queue split
+(`glm5_next_forward.cpp:288`), the op-table probe (`:307-310`), the fit guard,
+the `Dev` construction (`:404`) and the opt-in latch (`:49-55`). W9c-2 put the
+KDA delta recurrence (`glm5_next_kda.cpp:304`) and the MoE router topk
+(`glm5_next_moe.cpp:372`) on the device queue behind the same `Dev`. W9c-3b
+made the KV binding device-resident through `Backend::Copy`
+(`glm5_next_kv.cpp`). The remaining eight arms — RMSNorm, the embedding gather,
+the chunked `lm_head`, the DSA k-pool indexer, the MoE combine, the dense and
+shared MLPs, the eager MLA attention, and the mHC sites — all still run on the
+CPU queue `Glm5NextHostForward` constructs at `:288`. O43 discloses that as a
+staged slice, and this wave is the compose that closes it.
+
+**The wave briefing at line 2438 said this wave "deletes the refusal at
+`glm5_next_forward.cpp:231-238`". W9c-3a already did that.** The refusal is now
+the op-table probe + opt-in gate (`:307-341`), and a CUDA queue is admitted.
+What W9c-3a did NOT do is route the remaining arms through the device queue.
+That is this wave.
+
+**The pattern is `kimi_linear_device.cpp`, not `nemotron_h_device.cpp`.** Both
+siblings are MLA + linear-attention hybrids. `nemotron_h_device.cpp` (2,144
+lines) is an explicit two-queue hybrid: six attention blocks are
+device-resident on a `dev_queue`, and 46 mixer layers bounce to a `host_queue`
+in a per-layer round-trip. `kimi_linear_device.cpp` (2,539 lines) is a single
+queue: fully device-resident with named host-fallback "islands" — the KDA
+recurrence downloads to host f64 and re-uploads, and the MLA softmax core does
+the same. GLM-5.3 has kimi's shape, not nemotron_h's: one `Dev`, one device
+queue, and two individual ops inside an otherwise device-resident layer that
+cannot run on the device today. The two-queue bounce is wrong because the arms
+that stay on the host are not full layers; they are single ops. The kimi
+island pattern — upload the operand, run what can run on the device, download
+the result for the island op, re-upload — is the one this port follows.
+
+**Per-arm device op map, with provider availability on both backends:**
+
+| # | Arm | Host location | Device op | CUDA | ROCm | This wave |
+|---|-----|---------------|-----------|------|------|-----------|
+| 1 | Routed-expert GEMM | `moe.cpp:223-258` | `kMoeGateUpSwiGLuGrouped`+`kMatmulBTQuantGrouped` | yes | yes | ON DEVICE (W9c-3a) |
+| 2 | KDA recurrence | `kda.cpp:304` | `kKdaGatedDeltaRule` | yes | yes | ON DEVICE (W9c-2) |
+| 3 | MoE router topk | `moe.cpp:372` | `kMoeRouterTopK` | yes | yes | ON DEVICE (W9c-2) |
+| 4 | RMSNorm | `layer.cpp:154`, `forward.cpp:387` | `kRmsNorm` | yes | yes | MOVES |
+| 5 | Embedding gather | `forward.cpp:358-378` | `kEmbedding`/`kEmbeddingQuant` | yes | yes | MOVES |
+| 6 | Chunked lm_head | `forward.cpp:433-473` | `kMatmul` | yes | yes | MOVES |
+| 7 | DSA k-pool indexer | `dsa.cpp:168,365` | `kGlm5NextKpoolCompress`/`Select` | yes | yes | MOVES (closes O36) |
+| 8 | MoE combine | `moe.cpp:694` | `kMoeCombine` | yes | yes | MOVES |
+| 9 | Dense + shared MLP | `moe.cpp:473,672` | `kMatmul`+`kClampedSwiGLU` | yes | yes | ON DEVICE (post-O55, #3203) |
+| 10 | Eager MLA attention | `attn.cpp:276` | `kMlaPrefillAttention`/`kMlaDecodeAttention` | yes | yes | HOST ISLAND (W9c-1) |
+| 11 | mHC sites | `mhc.cpp:21,53` | `kDeepseekV4Mhc` | yes | yes | HOST ISLAND (O34 discharged, arm not rewired) |
+
+Arms 1-3 were already on the device. Arms 4-8 moved to the device in W9c-3.
+Arm 9 moved to the device in post-O55 (#3203) after O55 (#3197) added
+`vt::ClampedSwiGLU`. Arms 10-11 stay as host-fallback islands: arm 10 because
+W9c-1 is REFUSED, and arm 11 because the device forward has not been rewired
+to call the device mHC kernels (O34 discharged the ROCm provider debt, but
+the arm still runs on the interposed CPU queue).
+
+**Arm 10 stays because W9c-1 is REFUSED, not because the provider is missing.**
+`kMlaPrefillAttention` and `kMlaDecodeAttention` are registered on both CUDA
+(`cuda_mla_prefill.cu:457`, `cuda_mla_attn.cu:806`) and ROCm
+(`rocm_ops.hip:393-396`). What is missing is the loader absorb step:
+`MlaBlockWeights` wants `w_uk_t` and `w_uv` as bf16 tensors absorbed at LOAD,
+which `glm_moe_dsa_loader.cpp:223-272` produces and `glm5_next_loader.cpp` has
+no analogue of (W9c-3a re-priced this at `839ea1ced`). Routing onto
+`mla::ForwardMlaAttentionBlock` owes a loader absorb, a `BuildMlaStep`
+equivalent, a sparse per-token block table, and a `TritonMLAImpl`. That is
+W9c-1's port, not a call-site change, and it is out of scope here. The island
+runs the current host MLA on the interposed CPU queue.
+
+**Arm 11 stays because `kDeepseekV4Mhc` has NO ROCm provider** — CUDA only
+(`cuda_deepseek_v4.cu:2102`). O34 owns the gap. On a CUDA device the op IS
+registered and could run, but this wave does not wire it, because a CUDA-only
+path is a mirror image of the CPU-only half this row already carries, and O34
+is the debt that owns the decision. The island runs the current host mHC on
+the interposed CPU queue on both backends.
+
+#### Scope
+
+`src/vllm/model_executor/models/glm5_next_device.cpp` grows from a 16-line stub
+(`KpoolDeviceOpsAvailable()` only) to a full device forward in the
+`kimi_linear_device.cpp` shape. The shared glue — `Dev`, `DBuf`, `MakeTensor`,
+`ResidentWeight` — is already in `dense_device_glue.h` and
+`dense_attn_block.h`, and W9c-3a already proved them against this model's
+expert GEMM. This wave extends their use to the remaining six arms.
+
+In the specific:
+
+1. **`glm5_next_device.cpp`** gains the device-resident layer forward. Each
+   layer uploads its weights through `ResidentWeight` (lazy upload-once,
+   `dense_attn_block.h:181`), dispatches RMSNorm, the attention arm, the mHC
+   sites, and the MLP arm on the device queue, and uses `DBuf`
+   (`dense_device_glue.h:109`) for activations. The two island ops (MLA, mHC)
+   download their operands, run on the interposed CPU queue, and re-upload.
+
+2. **RMSNorm** (`glm5_next_layer.cpp:154`, `glm5_next_forward.cpp:387`):
+   `ResidentWeight` for the norm weight, `DBuf` for the f32 input, dispatch
+   `vt::RmsNorm` on the device queue, one download of the normalized output.
+
+3. **Embedding gather** (`glm5_next_forward.cpp:358-378`): `ResidentWeight` for
+   `token_embd.weight` (device-resident, uploaded once), `DBuf` for the token
+   id buffer, dispatch `vt::Embedding` (or `vt::EmbeddingQuant` for a quantized
+   table) on the device queue, one download of `[T, H]`.
+
+4. **Chunked lm_head** (`glm5_next_forward.cpp:433-473`): `ResidentWeight` for
+   the head weight, `DBuf` for the hidden states, dispatch `vt::Matmul` on the
+   device queue in row chunks, one download of the logits slice. The chunking
+   is preserved because the head is 2.36 GiB in f32; a device-resident
+   `ResidentWeight` uploads it once, and the chunking is over the OUTPUT rows,
+   not the weight.
+
+5. **DSA k-pool indexer** (`glm5_next_dsa.cpp:168,365`): this closes O36. The
+   two ops `vt::Glm5NextKpoolCompress` and `vt::Glm5NextKpoolSelect` are
+   registered on CUDA (`cuda_glm5_next.cu:561-564`) and ROCm
+   (`rocm_ops.hip:345-348`) but UNREACHED — `KpoolDeviceOpsAvailable()`
+   (`glm5_next_device.cpp:11`) probes them and nothing consults the probe.
+   This wave wires the probe into the DSA arm's device dispatch: when the ops
+   are registered on the device, the k-pool runs on the device queue; when they
+   are not, the arm falls back to the host `SelectIndexerTopkFromPacked`.
+
+6. **MoE combine** (`glm5_next_moe.cpp:694`): `DBuf` for the expert outputs
+   and weights, dispatch `vt::MoeCombine` on the device queue, one download of
+   the combined output.
+
+7. **Dense and shared MLPs** (`glm5_next_moe.cpp:473,672`): DEFERRED. The dense
+   MLP's `ExpertGate` calls `deepseek_v4::ClampedSwiGLU` —
+   `silu(clamp(gate, max=limit)) * clamp(up, -limit, limit)` — and no `vt::`
+   device op for clamped SwiGLU exists. The `vt::MoeSiluMul` op is plain
+   `silu(gate)*up` without clamping, so it is not a substitute. The arm stays on
+   the host until a `vt::ClampedSwiGLU` op is added. The shared MLP runs the same
+   path and is deferred for the same reason.
+
+8. **The opt-in gate** evolves. `VT_GLM5_NEXT_DEVICE_EXPERTS=1`
+   (`glm5_next_forward.cpp:49-55`) currently enables the expert GEMM only.
+   This wave adds `VT_GLM5_NEXT_DEVICE=1` as the full device forward: when
+   set, the forward routes through `glm5_next_device.cpp` and all nine
+   device-capable arms run on the device queue.
+   `VT_GLM5_NEXT_DEVICE_EXPERTS=1` is preserved for the W9c-3a slice, so a
+   device that can run the expert GEMM but not the full forward (e.g.
+   insufficient VRAM for all resident weights) still has a path. The `1` and
+   nothing-else polarity is kept, because both gates enable paths MEASURED to
+   crash on the one artifact they have been driven against.
+
+9. **The fit guard** extends. W9c-3a's guard over `Backend::DeviceMemoryInfo`
+   covers the expert bank set. This wave extends it to cover all
+   device-resident weights — the embedding table (2.36 GiB), the lm_head (2.36
+   GiB or tied), and the per-layer projection weights. A set that will not fit
+   falls back to the host forward by name, not by OOM. The guard's message
+   names the weight and the device's free memory, the same shape W9c-3a used
+   for the bank set.
+
+#### Not in scope
+
+* **W9c-1 (MLA attention onto `mla::ForwardMlaAttentionBlock`)** — REFUSED at
+  W9c-3a and re-priced there. The loader absorb, the `BuildMlaStep` equivalent,
+  the sparse per-token block table, and the `TritonMLAImpl` are a port of
+  `glm_moe_dsa_forward.cpp`'s machinery, not a call-site change. The MLA arm
+  stays a host island.
+
+* **O34 (`kDeepseekV4Mhc` ROCm provider)** — the op is CUDA-only. The mHC arm
+  stays a host island on both backends. Wiring it on CUDA only would create a
+  backend-specific forward, which is the failure this row's shared-seam rules
+  forbid.
+
+* **The vision tower (W6)** — unchanged.
+
+* **Speed** — O6 is unchanged. This wave is a correctness and reachability
+  wave. No throughput number is claimed, and no denominator exists.
+
+#### Gates
+
+* `scripts/agent-preflight.sh --fail-on-skip`, and the CPU suites by hand:
+  `test_glm5_next_moe`, `test_glm5_next_forward`, `test_glm5_next_layer`,
+  `test_glm5_next_kda`, `test_glm5_next_dsa`, `test_glm5_next_bridge`.
+* Sibling inertness, because `glm5_next_*` files and the forward's signature
+  are this row's but `dense_attn_block.h`, `dense_device_glue.h`, and the
+  shared ops are not: `test_kimi_linear*`, `test_nemotron_h*`,
+  `test_glm_moe_dsa*`, `test_cuda_deepseek_v4`, `test_mla_attention_block`.
+* A DEVICE gate on `dgx:gpu0` (`sm_121a`) and `strix:gpu0` (gfx1151): the
+  device cases agree with the host arm at NMSE < 1e-10, and the assertion
+  `nmse > 0` proves the GPU executed. The ROCm gate is the one that makes
+  this wave matter for this row, because GLM-5.3-Flash is the Strix Halo
+  target.
+* The reachability mutation `.agents/reachability.md` asks for: delete the
+  production call site in a scratch copy and show the device gate reds. This
+  proves the gate measures the device path and not a host fallback.
+* `scripts/check-device-leakage.py` — no new device name in a
+  device-agnostic layer. The op-table probe is the shape, not a device list.
+
+#### Stop conditions
+
+* If a device-resident weight set does not fit on `dgx:gpu0` (40 GiB) or
+  `strix:gpu0` (16 GiB unified), the fit guard falls back to the host forward
+  by name. The guard's message names the weight and the device's free memory,
+  and the wave ships with the guard rather than without it. A device that
+  cannot hold the weights is not a blocker; it is the guard's reason for
+  existing.
+* If the k-pool device ops produce a different selection than the host
+  `SelectIndexerTopkFromPacked` on the same input, that is a correctness defect
+  and not a tolerance question. The DSA arm falls back to the host path until
+  the device op agrees, and O36 stays open with the divergence named.
+* If the MLA island's host execution on the interposed CPU queue produces a
+  different attention pattern than the current `--device cpu` run, that is a
+  regression in the island pattern and not a tolerance. The island must be
+  byte-identical to the current host path, because it IS the current host path
+  on a different queue.
+* If the mHC island requires a `kDeepseekV4Mhc` CPU registration to run
+  correctly on the interposed CPU queue, that is O34's decision and not this
+  wave's. The island uses the existing host functions
+  (`glm5_next_mhc.cpp:21,53` -> `deepseek_v4::MhcPre/Post`) unchanged.
 
 ## Tests to port
 
@@ -5351,11 +5620,11 @@ Debts this row carries, each visible rather than waived:
   started. `--device cuda` on this model still refuses by name, and O30's
   ` Paris.` on `--device cpu` at 195.5 s/token remains the only generation this
   row has ever observed. Owned by row `MODEL-MM-GLM53-FLASH-CUDA` and tracked by
-  [#2410](https://github.com/mudler/vllm.cpp/issues/2410), which is a REAL issue
+  ISSUE-GH-2410, which is a REAL issue
   filed by this wave rather than an inherited number. **The `#1998` and `#2241`
   this row cites throughout resolve to neither an issue nor a pull request
   today** (`gh issue view` and `gh pr view` both 404 while `gh issue view 2409`
-  serves, and a `--state all` listing spanning #41..#2409 does not contain
+  serves, and a `--state all` listing spanning #41..ISSUE-GH-2409 does not contain
   them). That observation is recorded and NOT acted on: this exact 404 pattern
   once got read as mass deletion and written into AGENTS.md as a falsehood, so
   the correct response is a re-measurement by someone with the forge in front of
@@ -5374,18 +5643,13 @@ Debts this row carries, each visible rather than waived:
   W9c-1's whole scope, it changes the numerics of 11 of 45 layers, and the host
   reference has to survive below the fold as the parity operand — which is a
   wave with its own red-first gate, not a small clear fix. W9c-1 owns it.
-- **O34 — the mHC family has a CUDA kernel and NO CPU op registration, which is
-  the mirror image of every other family on this row.**
-  `vt::OpId::kDeepseekV4Mhc` (`ops.h:294`) is registered on CUDA only
-  (`cuda_deepseek_v4.cu:2102`), declares no free-function wrapper in `ops.h`, and
-  is reached only through `vt::GetOp(kDeepseekV4Mhc, kCUDA)` behind an
-  `OpRegistered` probe (`deepseek_v4_device.cpp:15,31`). `glm5_next_mhc.cpp` (89
-  lines) bypasses the op table entirely and calls `deepseek_v4_mhc.cpp`'s host
-  functions directly (`glm5_next_mhc.h:20-24`). So this row's mHC sites have no
-  device path and the tree's mHC kernel has no CPU golden to be gated against
-  from here. W9c-3 owns the decision between reaching the CUDA op through the
-  same probe and growing the seam a CPU registration; this entry records that
-  neither has been chosen and that the choice is not free.
+- **O34 — DISCHARGED (ROCm provider).** The mHC family had a CUDA kernel and NO
+  ROCm provider, which was the mirror image of every other family on this row.
+  [#3199](https://github.com/mudler/vllm.cpp/pull/3199) added the ROCm/HIP
+  provider for all seven MHC device kernels and fixed the device resolver to
+  fall back to kROCm. The mHC arm itself still runs on the interposed CPU queue
+  because the device forward has not been rewired to call the device mHC kernels
+  through the probe; that wiring is a separate change.
 - **O35 — TWO ANCHORS IN THIS ROW'S OWN DISPATCH BRIEFING WERE WRONG, and they
   were caught by re-reading rather than by a checker.** `dense_device_glue.h:146`
   was cited as `DBuf`; `DBuf` is declared at `:109` and `:146` is a line inside
@@ -5481,34 +5745,25 @@ Debts this row carries, each visible rather than waived:
   shared header belongs to ENG-MULTIKV-BYNAME's row, and reverting the accessor
   rather than the comment would change three models' seam. Tracked by
   [#2459](https://github.com/mudler/vllm.cpp/issues/2459).
-- **O40 — THE ROCm ARM IS BLOCKED ON DEVICE FIT, NOT ON KERNELS, and the fleet's
+- **O40 — THE ROCm ARM REMAINS BLOCKED ON DEVICE FIT, and the fleet's
   only AMD device was measured rather than assumed.** `strix:gpu0` (`gfx1151`,
   ROCm 7.2.4) holds at most **58.000 GiB** of `hipMallocManaged` memory —
   measured twice, at 2 GiB and 4 GiB granularity, jobs
   `e87ec9b6-4672-468d-9eaa-1b346a1f2af6` and
   `08b6baee-4ec8-41ff-a22e-cba6c018e0c4`. The artifact is 101.2535 GiB, so it
-  overshoots by 1.75x in its BEST case, in which every missing ROCm keep-quant
-  kernel has already been written. In the case that actually obtains today it
-  overshoots by 10.1x, because the five encodings ROCm cannot keep quantized are
-  exactly the 129 routed-expert tensors and they expand to 580.50 GiB. Owed
+  overshoots by 1.75x even if every format stays packed. The seven-format
+  provider changes the mixed-residency case, so the previous 10.1x value is no
+  longer current. Its replacement is `PENDING` an artifact rerun. Owed
   against an AMD device that can hold ~101 GiB, or against a published
   GLM-5.3-Flash artifact whose experts encode below ~1.2 bpw, and neither exists
   today. Tracked by [#2462](https://github.com/mudler/vllm.cpp/issues/2462).
-  **This entry is why no ROCm kernel was written**: on this fleet a ROCm MLA,
-  k-pool or i-quant kernel would land dead, with no device able to load the
-  weights that would reach it. W10 carries the arm-by-arm map and the price of
-  each piece.
-- **O41 — THE ROCm KEEP-QUANT PREDICATE MUST NOT BE WIDENED, and this entry
-  exists so the next reader does not repeat the attempt.**
-  `DeviceKeepQuantSupported`'s ROCm arm (`gguf_keep_quant.cpp:128-140`) admits
-  Q8_0/Q4_K/Q5_K/Q6_K, and `rocm_grouped_gemm.hip` implements exactly four dot
-  products — `DotQ8_0` (`:182`), `DotQ4K` (`:191`), `DotQ5K` (`:225`), `DotQ6K`
-  (`:261`) — dispatched at `:641,:657,:712,:734` and throwing at `:692,:761`
-  otherwise. The predicate is exactly as wide as the kernel. Widening it to
-  reach this artifact's IQ2_XS/IQ3_XXS/IQ4_XS/Q2_K/Q3_K would keep blocks the
-  device cannot execute and throw at first forward with the model resident,
-  reintroducing the regression `.agents/specs/rocm-gg-keep-quant.md` was written
-  to repair. The five kernels remain owed to THAT row, not to this one.
+  The new provider does not change this fit result. W10 carries the arm-by-arm
+  map and the price of each remaining piece.
+- **O41 — IQ2_XS AND IQ4_XS REMAIN OUTSIDE THE ROCm KEEP-QUANT PREDICATE.**
+  `DeviceKeepQuantSupported` now admits eleven formats. The new wrapper arms
+  cover IQ3_XXS, Q2_K, and Q3_K from this artifact. No ROCm provider implements
+  IQ2_XS or IQ4_XS, so both remain on `expand_bf16`. They stay owed to the
+  keep-quant row, not this one. Do not admit either before its provider exists.
 - **O42 — THE ROCm REFERENCE-TIER FALLBACK MAKES THIS MODEL'S TWO MISSING
   PROVIDERS INVISIBLE ON AN APU AND FATAL ON A dGPU, and a coverage claim must
   say which.** `kKdaGatedDeltaRule` and `kMoeGateUpSwiGLUGrouped` — 2 of the 5
@@ -5539,10 +5794,14 @@ Debts this row carries, each visible rather than waived:
   INTERPOSED CPU queue that `Glm5NextHostForward` constructs, which is a real
   host computation and not a device one. **The row that owns the wiring:**
   `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, waves W9c-1, W9c-2
-  and W9c-3. **The issue that tracks it:**
-  [#2410](https://github.com/mudler/vllm.cpp/issues/2410). Read
-  "`--device cuda` works" as "one arm of eleven is on the device", because that
-  is what was built.
+  and W9c-3. **The issues that track it:**
+  [#2410](https://github.com/mudler/vllm.cpp/issues/2410) (the broad
+  device-forward track) and
+  [#3174](https://github.com/mudler/vllm.cpp/issues/3174) (the compose wave
+  that closes this entry). Read "`--device cuda` works" as "three of eleven
+  arms are on the device" (W9c-3a + W9c-2), because that is what was built.
+  W9c-3 is spec'd and moves the remaining six device-capable arms; two stay as
+  host-fallback islands (MLA, mHC) until W9c-1 and O34 land.
 
   **One hand-off inside that arm is COMPILER-guarded and not assertion-gated on
   the host lane, and this is the part of O43 a reader should not round up.**
@@ -5875,7 +6134,49 @@ Debts this row carries, each visible rather than waived:
   does NOT by itself clear the arm, and whatever run 2 returns, the top-5 and
   the MARGIN are what settle it rather than the token string.
 
+- **O55 -- DISCHARGED.** `vt::ClampedSwiGLU` was added across CPU, CUDA, and
+  ROCm in [#3197](https://github.com/mudler/vllm.cpp/pull/3197), and the
+  dense+shared MLP arm was wired onto the device in
+  [#3203](https://github.com/mudler/vllm.cpp/pull/3203). The arm is no longer a
+  host island.
+
 ## Now
+
+`ACTIVE`, 16 September 2026. The vLLM registration stop condition fired on
+3 September. [Reconciliation #3045](glm5-next-upstream-reconciliation.md)
+expires the transformers algorithm exception and identifies the device-port
+source and tests. The global parity pin remains unchanged.
+
+W9c-3a (expert GEMM on device, [#2464]), W9c-2 (KDA recurrence + MoE router
+topk on device, [#3133]), W9c-3b (KV binding device-resident, [#2480]), and
+W9c-3 (the compose forward, [#3174](https://github.com/mudler/vllm.cpp/issues/3174),
+[#3175](https://github.com/mudler/vllm.cpp/pull/3175)) have landed. O55
+([#3197](https://github.com/mudler/vllm.cpp/pull/3197)) added `vt::ClampedSwiGLU`
+across CPU, CUDA, and ROCm. O34 ([#3199](https://github.com/mudler/vllm.cpp/pull/3199))
+added the ROCm/HIP provider for `kDeepseekV4Mhc`. Post-O55
+([#3203](https://github.com/mudler/vllm.cpp/pull/3203)) wired the dense+shared
+MLP onto the device via `vt::MatmulBT` + `vt::ClampedSwiGLU` + `vt::MatmulBT`.
+
+Eight of eleven compute arms are on the device (embedding, RMSNorm, KDA
+recurrence, MoE router topk, MoE routed experts, MoE combine, lm_head,
+dense+shared MLP); three run as host-fallback islands on the interposed CPU
+queue (k-pool indexer — CUDA-only ops, host on CPU; MLA attention — W9c-1
+REFUSED; mHC sites — O34 discharged but arm not rewired). The pattern is
+`kimi_linear_device.cpp`'s single-queue shape.
+
+The device forward is reached via `VT_GLM5_NEXT_DEVICE=1`, which delegates
+`Glm5NextHostForward` to `Glm5NextDeviceForward`. On a CPU queue the `vt::`
+kernels use float32 accumulation where the host reference uses double, so the
+output agrees within a float-vs-double envelope rather than byte-exact. The CPU
+test (device vs host, 1.0 max_abs tolerance, greedy-token agreement) passes:
+33/33 total. The GPU unit gate PASSED on both `dgx:gpu0` (`sm_121a`, CUDA) and
+`strix:gpu0` (gfx1151, ROCm): 33/33 tests both with and without
+`VT_GLM5_NEXT_DEVICE=1`.
+
+The real-model oracle gate remains `PENDING` under #1998. The 101 GiB artifact
+exceeds any single device on this fleet.
+
+### Status before the upstream reconciliation
 
 `ACTIVE`, 2026-09-01. **THE KERNEL THAT BLOCKED THIS MODEL'S DEVICE ARM LANDED
 EIGHT DAYS AGO IN ANOTHER ROW, AND NOTHING HERE READ IT.** O19 says the expert
@@ -5960,12 +6261,11 @@ to it.
 `hipMallocManaged` memory, measured twice on two separately compiled binaries
 (2 GiB granularity, job `e87ec9b6`; 4 GiB granularity, job `08b6baee`, which
 read 56.000 GiB — the last multiple of 4 below 58, so the two agree). The
-artifact is **101.2535 GiB**. It overshoots by **1.75x in the best imaginable
-case**, the one where every missing ROCm keep-quant kernel has already been
-written, and by **10.1x in the case that obtains today**. To fit, the experts
-would have to encode at ~1.2 bpw against the published 2.609. **So a ROCm MLA,
-k-pool or i-quant kernel written now would land dead**, and O40 records that as
-the reason none was written.
+artifact is **101.2535 GiB**. It overshoots by **1.75x in the best case**, where
+every format remains packed. The seven-format provider invalidates the old
+10.1x mixed-residency ratio. No artifact rerun has measured a replacement, so
+the current footprint is `PENDING`. The packed artifact still cannot fit on
+this device, and O40 records that blocker.
 
 **`hipMemGetInfo` fails toward a pass on this box and would have hidden it.** It
 reported `free = 63.703 GiB` unchanged from 2 GiB resident all the way to 58 GiB
@@ -5973,12 +6273,10 @@ resident, and was still reporting 63.703 GiB free at the call that returned
 out-of-memory. A budget computed from it would have been wrong by the entire
 measurement. The staircase is the instrument.
 
-**The cheap slice was refused on evidence.** W10 was scoped to widen
-`DeviceKeepQuantSupported`'s ROCm arm if the kernel supported it. It does not:
-`rocm_grouped_gemm.hip` implements exactly `DotQ8_0`/`DotQ4K`/`DotQ5K`/`DotQ6K`
-and throws on everything else, so the predicate is already exactly as wide as
-the kernel and widening it would be a lie that throws at first forward. O41
-records that so the attempt is not repeated.
+**The cheap slice partially landed through the GFX1100 reconstruction.** The
+ROCm wrapper now serves IQ3_XXS, Q2_K, and Q3_K from this artifact. IQ2_XS and
+IQ4_XS still have no provider, so the loader does not admit them. O41 records
+that surviving boundary.
 
 **Two findings the arm-by-arm map turned up that outlive this wave.** The model
 makes **exactly five `vt::` op calls across the 2,783 lines of its seven
